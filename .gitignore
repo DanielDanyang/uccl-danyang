@@ -112,3 +112,7 @@ thirdparty/gdrcopy/
 worktrees/
 *.csv
 *.egg-info/
+
+# Local reference material (kept in working tree, not tracked)
+nccl/
+2512.19849v2.pdf

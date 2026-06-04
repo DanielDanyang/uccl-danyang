@@ -65,8 +65,14 @@ static constexpr int kMaxMRChunks = 128;
 // imm for reordering buffer sequence tracking.
 #define kMaxInflightLowLatency 32
 #define kMaxInflightNormal 8
-#define kChannelPerProxy 8
-#define kNumProxyThs 4
+#ifndef UCCL_CHANNEL_PER_PROXY
+#define UCCL_CHANNEL_PER_PROXY 8
+#endif
+#ifndef UCCL_NUM_PROXY_THS
+#define UCCL_NUM_PROXY_THS 4
+#endif
+#define kChannelPerProxy UCCL_CHANNEL_PER_PROXY
+#define kNumProxyThs UCCL_NUM_PROXY_THS
 // NCCL EFA plugin default: 8 MB mimicing (512KB*16)
 // NCCL IB net.cc default: 2 MB (128KB*16)
 #define kMaxInflightBytes SIZE_MAX

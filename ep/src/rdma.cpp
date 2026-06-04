@@ -1092,8 +1092,17 @@ void create_per_thread_qp(ProxyCtx& S, void* gpu_buffer, size_t size,
             (size_t)local_info->atomic_buffer_len,
             local_info->atomic_buffer_rkey);
   } else {
-    // TODO(MaoZiming): Only for non-EFA case.
+#ifdef EFA
+    if (use_normal_mode) {
+      local_info->atomic_buffer_rkey = 0;
+      local_info->atomic_buffer_addr = 0;
+      local_info->atomic_buffer_len = 0;
+    } else {
+      assert(false && "Atomic buffer is not registered");
+    }
+#else
     assert(false && "Atomic buffer is not registered");
+#endif
   }
 
   fill_local_gid(S, local_info);
@@ -2903,7 +2912,28 @@ static void post_atomic_operations_normal_mode(
           std::abort();
         }
 
-        uint32_t imm = AtomicsImm::PackAtomic(v, offset).GetImmData();
+        uint32_t imm;
+        if (cmd.atomic_offset != 0) {
+          if (offset > AtomicsImm::kOFF_MASK) {
+            fprintf(stderr,
+                    "[EFA] ordered atomic offset=%u exceeds immediate field "
+                    "limit=%u\n",
+                    offset, AtomicsImm::kOFF_MASK);
+            std::abort();
+          }
+          size_t index = static_cast<size_t>(offset / sizeof(int64_t));
+          auto key = ctx->seq_key(dst_rank, index);
+          if (ctx->next_seq_per_index.find(key) == ctx->next_seq_per_index.end())
+            ctx->next_seq_per_index[key] = 0;
+          uint8_t seq = ctx->next_seq_per_index[key];
+          ctx->next_seq_per_index[key] =
+              (seq + 1) % kReorderingBufferSize;
+          imm = AtomicsImm::PackAtomicWithSeq(v, static_cast<uint16_t>(offset),
+                                              seq, true)
+                    .GetImmData();
+        } else {
+          imm = AtomicsImm::PackAtomic(v, offset).GetImmData();
+        }
 
         qpx->wr_id = kAtomicWrTag | (wr_id & kAtomicMask);
         qpx->comp_mask = 0;

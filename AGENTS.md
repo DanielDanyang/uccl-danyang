@@ -183,7 +183,16 @@ export NCCL_SOCKET_IFNAME=enp71s0
 ## 约束
 
 - 不污染别人环境：使用用户目录下专用 venv `/home/ubuntu/.venvs/deepep-danyang-cu13`。
-- 不打断别人任务：如果 `nvidia-smi` 或进程列表显示其他用户正在占用 GPU，立即停止所有服务器上的构建、测试、profiling、benchmark、采样和排查操作；不要继续跑轻量/重型实验，不要 kill、抢占或影响别人的训练/benchmark 进程。只允许在本地整理记录和等待用户下一步指示。
+- 不打断别人任务：在任何服务器上的构建、测试、profiling、benchmark、采样或排查操作之前，必须先确认
+  `p5en_0` 和 `p5en_1` 的 GPU 空闲。至少执行：
+  - `ssh p5en_0 nvidia-smi`
+  - `ssh p5en_1 nvidia-smi`
+  - 必要时补充 `ssh p5en_0 "ps -eo user,pid,ppid,stat,pcpu,pmem,cmd | grep -E 'python|torch|cuda|nccl|deepep|uccl' | grep -v grep"`，
+    `p5en_1` 同理。
+- 如果 `nvidia-smi` 或进程列表显示其他用户/未知任务正在占用 GPU，必须立即停止所有远端构建、测试、
+  profiling、benchmark、采样和排查操作；不要继续跑轻量/重型实验，不要 kill、抢占或影响别人的训练/
+  benchmark 进程。只允许在本地整理记录、分析代码、更新文档，并等待用户下一步指示。
+- 如果只看到自己刚启动的残留进程，应先确认来源；除非用户明确允许，不要 kill 任何可能属于他人的进程。
 - DeepEP JIT 默认写 `$HOME/.deep_ep`；如需长期多人共用，建议后续再切到专用 `EP_JIT_CACHE_DIR`。
 - 先跑最小正确性验证，确认构建、import、单机通信和 JIT 都通，再扩大到两机。
 - 多机阶段必须使用 aws-ofi-nccl master 的 GIN proxy 路径；禁用 Gin 只适合单机验证。

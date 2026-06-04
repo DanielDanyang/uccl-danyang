@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -138,14 +139,36 @@ inline V2EfaJitLaunchPlan build_v2_efa_native_hybrid_dispatch_jit_plan(
   plan.grid_dim_y = 1;
   plan.num_threads = num_threads;
   plan.smem_bytes = config.smem_bytes;
-  plan.cluster_dim = 2 - (config.num_sms % 2);
+  // Native V2 EFA dispatch still uses DeepEP V2 cooperative grid sync inside
+  // notify/forward barriers.  AWS CUDA 13 was crashing with the original
+  // clustered cooperative launch, so keep clusters disabled but preserve the
+  // cooperative launch required by cooperative_groups::this_grid().sync().
+  plan.cluster_dim = 1;
   plan.cooperative = true;
   plan.pdl_enabled = false;
   plan.num_notify_warps = num_notify_warps;
   plan.num_scaleout_warps = num_scaleout_warps;
   plan.num_forward_warps = num_forward_warps;
+  // Upstream DeepEP V2 uses 3 for IB/Gin streaming.  The AWS EFA path applies
+  // tail updates through CPU-proxy software atomics, so a coarser semantic batch
+  // is materially faster while preserving the same V2 channel/slot semantics.
+  int scaleout_update_interval = 32;
+  if (const char* env = std::getenv("UCCL_V2_SCALEOUT_UPDATE_INTERVAL");
+      env != nullptr && env[0] != '\0') {
+    scaleout_update_interval = std::atoi(env);
+    if (scaleout_update_interval <= 0) {
+      throw std::invalid_argument(
+          "UCCL_V2_SCALEOUT_UPDATE_INTERVAL must be positive");
+    }
+  }
 
   std::ostringstream source;
+  if (const char* debug_finish =
+          std::getenv("UCCL_V2_DEBUG_FINISH_PRINT");
+      debug_finish != nullptr && debug_finish[0] != '\0' &&
+      debug_finish[0] != '0') {
+    source << "#define UCCL_V2_DEBUG_FINISH_PRINT 1\n";
+  }
   source << "#include <deep_ep/common/comm.cuh>\n"
          << "#include <deep_ep/common/compiled.cuh>\n"
          << "#include <deep_ep/common/exception.cuh>\n"
@@ -170,6 +193,14 @@ inline V2EfaJitLaunchPlan build_v2_efa_native_hybrid_dispatch_jit_plan(
          << config.num_max_tokens_per_rank << ", " << config.num_experts
          << ", " << config.num_topk << ", " << config.expert_alignment
          << ", " << config.num_qps << ", " << config.num_timeout_cycles
+         << ", " << "deep_ep::elastic::math::constexpr_ceil_div("
+         << "static_cast<int>(" << config.num_scaleup_ranks << "), 32)"
+         << ", " << num_scaleout_warps << ", "
+         << (num_scaleout_warps * config.num_sms) << ", "
+         << "deep_ep::elastic::math::constexpr_ceil_div("
+         << config.num_max_tokens_per_rank << ", "
+         << (num_scaleout_warps * config.num_sms) << "), "
+         << scaleout_update_interval << ", " << scaleout_update_interval
          << ">);\n"
          << "}\n";
   plan.source = source.str();

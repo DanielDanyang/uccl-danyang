@@ -40,6 +40,13 @@ def init_deep_ep_jit(
     nccl_root_path: str | None = None,
 ) -> None:
     root = Path(library_root_path) if library_root_path is not None else _DEEPEP_V2_SUBMODULE_PKG
+    repo_root = Path(__file__).resolve().parents[3]
+    include_flags = f"-I{repo_root / 'ep' / 'include'} -I{repo_root / 'include'}"
+    extra_flags = os.environ.get("EP_JIT_EXTRA_FLAGS", "")
+    if include_flags not in extra_flags:
+        os.environ["EP_JIT_EXTRA_FLAGS"] = (
+            f"{extra_flags} {include_flags}".strip() if extra_flags else include_flags
+        )
     _ep.init_deep_ep_jit(
         str(root),
         cuda_home_path or find_cuda_home(),

@@ -104,6 +104,7 @@ class Proxy {
   void post_gpu_command(uint64_t& my_tail, size_t& seen);
   void post_gpu_commands_mixed(std::vector<uint64_t> const& wrs_to_post,
                                std::vector<TransferCmd> const& cmds_to_post);
+  void dump_command_profile() const;
   void post_barrier_msg(int dst_rank, bool ack, uint64_t seq);
   void send_barrier(uint64_t wr);
   void barrier_check();
@@ -123,6 +124,18 @@ class Proxy {
       wr_id_to_start_time_;
   uint64_t completion_count_ = 0;
   uint64_t wr_time_total_us_ = 0;
+
+  bool profile_commands_ = false;
+  std::chrono::steady_clock::time_point profile_start_;
+  std::chrono::steady_clock::time_point profile_end_;
+  uint64_t profile_post_batches_ = 0;
+  uint64_t profile_post_cmds_ = 0;
+  uint64_t profile_write_cmds_ = 0;
+  uint64_t profile_write_bytes_ = 0;
+  uint64_t profile_atomic_cmds_ = 0;
+  uint64_t profile_quiet_cmds_ = 0;
+  uint64_t profile_barrier_cmds_ = 0;
+  uint64_t profile_completed_wrs_ = 0;
 
   // Sender loop aggregates
   std::chrono::duration<double, std::micro> total_rdma_write_durations_ =

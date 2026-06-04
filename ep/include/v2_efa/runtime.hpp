@@ -49,7 +49,8 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
     std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
     std::uintptr_t mapped_host_workspace_ptr, int scaleout_rank,
     int scaleup_rank, std::uintptr_t d2h_queues_ptr, uint32_t num_queues,
-    std::uintptr_t signal_scratch_base, std::uintptr_t cuda_stream_ptr = 0);
+    std::uintptr_t signal_scratch_base, std::uintptr_t atomic_tail_base,
+    std::uintptr_t cuda_stream_ptr = 0);
 
 void launch_v2_efa_dispatch_copy_epilogue_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t buffer_ptr,
@@ -98,6 +99,7 @@ class V2EfaRuntime {
       std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
       std::uintptr_t mapped_host_workspace_ptr, std::uintptr_t d2h_queues_ptr,
       uint32_t num_queues, std::uintptr_t signal_scratch_base,
+      std::uintptr_t atomic_tail_base,
       const std::string& uccl_include_path = "",
       std::uintptr_t cuda_stream_ptr = 0) const;
   void launch_dispatch_copy_epilogue(

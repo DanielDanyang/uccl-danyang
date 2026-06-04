@@ -11,14 +11,7 @@
 // replaced by old 16B TransferCmd WRITEs pushed to host-pinned D2H queues and
 // drained by the UCCL proxy.  The scaleup (ncclTeamTagLsa) NVLink GIN path is
 // untouched.
-// NOTE: uccl headers are NOT on the JIT compiler's -I path (only deep_ep and
-// nccl are), so these must be spelled relative to THIS file's directory
-// (include/v2_efa/).  The JIT generator includes this header via an absolute
-// path, after which these relatives resolve against include/.
-// TODO(build): pulling the full ring_buffer.cuh drags <infiniband/verbs.h> +
-// host members into the device JIT TU; if NVCC chokes, factor a lean
-// device-only command-ABI header shared with ring_buffer.cuh.
-#include "../ring_buffer.cuh"
+#include "../d2h_queue_device.cuh"
 #include "workspace.hpp"
 
 namespace deep_ep::elastic {
@@ -39,36 +32,68 @@ __device__ __forceinline__ uint32_t v2_window_off(const void* ptr,
 // V2-local because only the native V2 signal path needs to bind a scratch word
 // lifetime to the exact ring slot used by its WRITE command; the shared V1 ring
 // ABI remains unchanged.
-__device__ __forceinline__ uint64_t v2_d2h_reserve_slot(DeviceToHostCmdBuffer* q) {
-    constexpr uint32_t kCapacity = DeviceToHostCmdBuffer::mask() + 1u;
+__device__ __forceinline__ d2hq::D2HHandle* v2_d2h_handle(
+    const uint64_t* d2h_channel_addrs, uint32_t num_d2h_queues, uint32_t idx) {
+    EP_DEVICE_ASSERT(num_d2h_queues > 0);
+    return reinterpret_cast<d2hq::D2HHandle*>(
+        static_cast<uintptr_t>(d2h_channel_addrs[idx % num_d2h_queues]));
+}
+
+__device__ __forceinline__ uint64_t v2_d2h_reserve_slot(d2hq::D2HHandle* q) {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+    auto& fifo = q->fifo;
+    const uint64_t slot = atomicAdd(
+        reinterpret_cast<unsigned long long*>(fifo.head),
+        static_cast<unsigned long long>(1));
+    if (slot >= static_cast<uint64_t>(fifo.size) + *fifo.tailCache)
+        fifo.sync(slot - static_cast<uint64_t>(fifo.size), /*maxSpinCount=*/-1);
+    return slot;
+#else
+    constexpr uint32_t kCapacity = kQueueSize;
     while (true) {
-        const uint64_t h = ld_volatile(&q->head);
-        const uint64_t t = ld_volatile(&q->tail);
+        const uint64_t h = ld_volatile(&q->ring->head);
+        const uint64_t t = ld_volatile(&q->ring->tail);
         if (h - t == kCapacity) {
             __nanosleep(64);
             continue;
         }
-        const auto prev = atomicCAS(reinterpret_cast<unsigned long long*>(&q->head),
+        const auto prev = atomicCAS(reinterpret_cast<unsigned long long*>(&q->ring->head),
                                     static_cast<unsigned long long>(h),
                                     static_cast<unsigned long long>(h + 1));
         if (prev == h)
             return h;
     }
+#endif
 }
 
-__device__ __forceinline__ void v2_d2h_commit_slot(DeviceToHostCmdBuffer* q,
+__device__ __forceinline__ void v2_d2h_commit_slot(d2hq::D2HHandle* q,
                                                    uint64_t slot,
                                                    TransferCmd cmd) {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+    uint64_t fst, snd;
+    d2hq::pack_transfer_cmd(cmd, fst, snd);
+    constexpr uint64_t flip_mask = uint64_t{1} << uint64_t{63};
+    snd ^= flip_mask;
+    auto* trigger_ptr = &(q->fifo.triggers[slot % static_cast<uint64_t>(q->fifo.size)]);
+#if defined(__CUDA_ARCH__)
+    asm volatile("st.global.release.sys.v2.u64 [%0], {%1,%2};" ::"l"(trigger_ptr),
+                 "l"(fst), "l"(snd));
+#else
+    trigger_ptr->snd = snd;
+    trigger_ptr->fst = fst;
+#endif
+#else
     const auto saved_cmd_type = cmd.cmd_type;
     cmd.cmd_type = CmdType::EMPTY;
-    q->buf[slot & DeviceToHostCmdBuffer::mask()] = cmd;
+    q->ring->buf[slot & kQueueMask] = cmd;
     __threadfence_system();
-    q->buf[slot & DeviceToHostCmdBuffer::mask()].cmd_type = saved_cmd_type;
+    q->ring->buf[slot & kQueueMask].cmd_type = saved_cmd_type;
+#endif
 }
 
 // Push a single-shot WRITE command (no scratch staging needed: the source data
 // already lives in registered window memory).
-__device__ __forceinline__ void v2_d2h_write(DeviceToHostCmdBuffer* q,
+__device__ __forceinline__ void v2_d2h_write(d2hq::D2HHandle* q,
                                              int dst_rank, uint32_t bytes,
                                              uint32_t local_off,
                                              uint32_t remote_off) {
@@ -78,6 +103,38 @@ __device__ __forceinline__ void v2_d2h_write(DeviceToHostCmdBuffer* q,
     cmd.bytes = bytes;
     cmd.req_lptr = local_off;
     cmd.req_rptr = remote_off;
+    q->atomic_set_and_commit(cmd);
+}
+
+template <int kNumScaleoutRanks>
+__device__ __forceinline__ int64_t* v2_atomic_tail_ptr(
+    const uint64_t atomic_tail_base, const int channel_idx,
+    const int scaleout_rank_idx) {
+    return reinterpret_cast<int64_t*>(atomic_tail_base) +
+           (channel_idx * kNumScaleoutRanks + scaleout_rank_idx);
+}
+
+template <int kNumScaleoutRanks>
+__device__ __forceinline__ uint32_t v2_atomic_tail_offset(
+    const int channel_idx, const int scaleout_rank_idx) {
+    return static_cast<uint32_t>(
+        (channel_idx * kNumScaleoutRanks + scaleout_rank_idx) *
+        sizeof(int64_t));
+}
+
+__device__ __forceinline__ void v2_d2h_atomic_add(d2hq::D2HHandle* q,
+                                                  int dst_rank,
+                                                  uint32_t remote_off,
+                                                  int value,
+                                                  bool ordered = false) {
+    if (value == 0)
+        return;
+    TransferCmd cmd{};
+    cmd.cmd_type = make_cmd_type(CmdType::ATOMIC, false, false);
+    cmd.dst_rank = static_cast<uint8_t>(dst_rank);
+    cmd.req_rptr = remote_off;
+    cmd.value = value;
+    cmd.atomic_offset = ordered ? 1 : 0;
     q->atomic_set_and_commit(cmd);
 }
 
@@ -118,8 +175,8 @@ hybrid_dispatch_impl(
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx,
     // Native UCCL EFA transport resources (replace the scaleout GIN path)
-    DeviceToHostCmdBuffer** d2h_queues, const uint32_t num_d2h_queues,
-    const uint64_t signal_scratch_base) {
+    const uint64_t* d2h_channel_addrs, const uint32_t num_d2h_queues,
+    const uint64_t signal_scratch_base, const uint64_t atomic_tail_base) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -138,7 +195,16 @@ hybrid_dispatch_impl(
 
     // Native EFA window: offset origin for all TransferCmd req_lptr/req_rptr.
     const uint64_t window_base = reinterpret_cast<uint64_t>(workspace);
-    constexpr uint32_t kSignalScratchSlotsPerQueue = DeviceToHostCmdBuffer::mask() + 1u;
+    constexpr uint32_t kSignalScratchSlotsPerQueue = kQueueSize;
+    constexpr int kV2TailFinishDelta = kNumMaxTokensPerChannel + 1;
+    EP_STATIC_ASSERT(kV2TailFinishDelta + kScaleoutUpdateInterval <= 16383,
+                     "V2 EFA tail immediate delta does not fit in AtomicsImm::v15");
+    // Ordered EFA software atomics carry a 4-bit sequence number.  Keep the
+    // maximum number of updates for a single (channel, source) tail word within
+    // that reorder window, otherwise sequence aliasing could silently corrupt
+    // the receiver-side packed tail.
+    EP_STATIC_ASSERT(math::constexpr_ceil_div(kNumMaxTokensPerChannel, kScaleoutUpdateInterval) + 1 <= kReorderingBufferSize,
+                     "V2 EFA tail updates per word exceed the software-atomic reorder window");
 
     // The kernel uses a fixed space of dynamic shared memory (no static shared memory)
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
@@ -271,7 +337,8 @@ hybrid_dispatch_impl(
                     // Remote scale-out rank: enqueue D2H TransferCmd WRITEs.  The
                     // proxy peer table is indexed by GLOBAL rank; the peer at our
                     // scaleup position is dst_scaleout*kNumScaleupRanks+scaleup.
-                    auto* q = d2h_queues[dst_scaleout_rank_idx % num_d2h_queues];
+                    auto* q = v2_d2h_handle(
+                        d2h_channel_addrs, num_d2h_queues, dst_scaleout_rank_idx);
                     const int dst_global = dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                     v2_d2h_write(
                         q, dst_global, kNumScaleupRanks * sizeof(int),
@@ -431,38 +498,31 @@ hybrid_dispatch_impl(
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx < kNumScaleoutRanks and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
-                // EFA has no remote atomic add: write the ABSOLUTE packed tail
-                // word.  Each (channel, sender-rank) slot has a single writer, so
-                // an absolute write is equivalent to the original delta add.  The
-                // value is staged into a scratch slot bound to the reserved D2H
-                // ring slot (so it survives until the proxy drains the command),
-                // then a WRITE copies it to the peer's tail slot.
-                const int64_t signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
-                auto* local_tail_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
+                const int tail_delta = stored_scaleout_tail - stored_old_scaleout_tail;
+                const int packed_tail_delta = tail_delta + (finish_flag ? kV2TailFinishDelta : 0);
                 if (lane_idx == scaleout_rank_idx) {
-                    // Local scale-out rank: the proxy rejects self / intra-node
-                    // commands, so publish the tail word directly (release so the
-                    // forward warp's ld_acquire_sys sees it after the payload).
-                    ptx::st_release_sys(local_tail_ptr, signaled_tail);
+                    // Local scale-out rank: mirror the original packed tail
+                    // update in one word.  The high "finish delta" is larger
+                    // than any per-channel token count, so forwarders can
+                    // recover (finish, count) from this additive scalar.
+                    ptx::red_add_rel_sys(
+                        v2_atomic_tail_ptr<kNumScaleoutRanks>(
+                            atomic_tail_base, channel_idx, scaleout_rank_idx),
+                        static_cast<int64_t>(packed_tail_delta));
                 } else {
-                    // Remote scale-out rank: stage the tail word in a scratch slot
-                    // bound to the reserved D2H ring slot, then enqueue the WRITE.
+                    // Remote scale-out rank: restore the original red_add_rel
+                    // semantics through UCCL's EFA software-atomic path.  Count
+                    // and finish share one ordered immediate stream per tail
+                    // word, so finish cannot become visible before earlier
+                    // count deltas have been applied by the receiver proxy.
                     const uint32_t q_idx = channel_idx % num_d2h_queues;
-                    auto* q = d2h_queues[q_idx];
-                    const uint64_t slot = v2_d2h_reserve_slot(q);
-                    int64_t* scratch = uccl::v2_efa::signal_scratch_slot_for(
-                        signal_scratch_base, q_idx,
-                        static_cast<uint32_t>(slot) & (kSignalScratchSlotsPerQueue - 1u),
-                        kSignalScratchSlotsPerQueue);
-                    *scratch = signaled_tail;
-                    TransferCmd cmd{};
-                    cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
-                    // lane_idx is the destination scaleout rank; map to global.
-                    cmd.dst_rank = static_cast<uint8_t>(lane_idx * kNumScaleupRanks + scaleup_rank_idx);
-                    cmd.bytes = sizeof(int64_t);
-                    cmd.req_lptr = v2_window_off(scratch, window_base);
-                    cmd.req_rptr = v2_window_off(local_tail_ptr, window_base);
-                    v2_d2h_commit_slot(q, slot, cmd);
+                    auto* q = v2_d2h_handle(d2h_channel_addrs, num_d2h_queues, q_idx);
+                    const int dst_rank = lane_idx * kNumScaleupRanks + scaleup_rank_idx;
+                    v2_d2h_atomic_add(
+                        q, dst_rank,
+                        v2_atomic_tail_offset<kNumScaleoutRanks>(
+                            channel_idx, scaleout_rank_idx),
+                        packed_tail_delta, true);
                 }
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
@@ -568,7 +628,7 @@ hybrid_dispatch_impl(
             // for this channel, so the proxy posts them on one QP and the tail
             // is guaranteed visible only after the payload.
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
-                auto* q = d2h_queues[channel_idx % num_d2h_queues];
+                auto* q = v2_d2h_handle(d2h_channel_addrs, num_d2h_queues, channel_idx);
                 v2_d2h_write(
                     q, stored_dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx,
                     tma_buffer.get_num_bytes<false>(),
@@ -582,6 +642,23 @@ hybrid_dispatch_impl(
         }
 
         // Flush unflushed tails
+#ifdef UCCL_V2_DEBUG_FINISH_PRINT
+        if (lane_idx < kNumScaleoutRanks) {
+            const uint32_t q_idx = channel_idx % num_d2h_queues;
+            auto* q = v2_d2h_handle(d2h_channel_addrs, num_d2h_queues, q_idx);
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+            const unsigned long long q_head = 0;
+            const unsigned long long q_tail = 0;
+#else
+            const unsigned long long q_head = static_cast<unsigned long long>(q->ring->head);
+            const unsigned long long q_tail = static_cast<unsigned long long>(q->ring->tail);
+#endif
+            printf("UCCL_V2_FINISH_EXIT rank=%d so=%d su=%d ch=%d lane=%d count=%d q=%u head=%llu tail=%llu\n",
+                   rank_idx, scaleout_rank_idx, scaleup_rank_idx, channel_idx,
+                   lane_idx, stored_scaleout_tail, q_idx, q_head, q_tail);
+        }
+        __syncwarp();
+#endif
         update_scaleout_tail(true);
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -639,9 +716,12 @@ hybrid_dispatch_impl(
 
                 // Read new signaled tails
                 if (lane_idx < kNumScaleoutRanks) {
-                    const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
-                        workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
-                    math::unpack2<int, int64_t>(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
+                    const auto packed_tail = static_cast<int>(
+                        ptx::ld_acquire_sys<int64_t>(
+                            v2_atomic_tail_ptr<kNumScaleoutRanks>(
+                                atomic_tail_base, channel_idx, lane_idx)));
+                    stored_finish_flag = packed_tail / kV2TailFinishDelta;
+                    stored_scaleout_tail_idx = packed_tail - stored_finish_flag * kV2TailFinishDelta;
                 }
                 __syncwarp();
                 return false;
@@ -775,8 +855,9 @@ hybrid_dispatch_impl(
         __syncwarp();
 
         // Clean tails for next usages
-        if (lane_idx < kNumScaleoutRanks)
-            *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
+        if (lane_idx < kNumScaleoutRanks) {
+            *v2_atomic_tail_ptr<kNumScaleoutRanks>(atomic_tail_base, channel_idx, lane_idx) = 0;
+        }
         __syncwarp();
     }
 

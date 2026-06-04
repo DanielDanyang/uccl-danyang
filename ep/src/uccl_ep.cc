@@ -2397,13 +2397,14 @@ NB_MODULE(ep, m) {
   nb::class_<Stats>(m, "Stats");
   nb::class_<UcclProxy>(m, "Proxy")
       .def(nb::init<int, uintptr_t, size_t, int, int, int, int, int, int, bool,
-                    bool, bool>(),
-           nb::arg("thread_idx"), nb::arg("gpu_buffer_addr"),
-           nb::arg("total_size"), nb::arg("rank") = 0, nb::arg("node_idx") = -1,
-           nb::arg("local_rank") = 0, nb::arg("num_experts") = -1,
-           nb::arg("num_ranks") = -1, nb::arg("num_nodes") = 0,
-           nb::arg("use_normal_mode") = false, nb::arg("is_intranode") = false,
-           nb::arg("gpu_buffer_is_host_allocated") = false)
+                    bool, bool, bool>(),
+	           nb::arg("thread_idx"), nb::arg("gpu_buffer_addr"),
+	           nb::arg("total_size"), nb::arg("rank") = 0, nb::arg("node_idx") = -1,
+	           nb::arg("local_rank") = 0, nb::arg("num_experts") = -1,
+	           nb::arg("num_ranks") = -1, nb::arg("num_nodes") = 0,
+	           nb::arg("use_normal_mode") = false, nb::arg("is_intranode") = false,
+	           nb::arg("gpu_buffer_is_host_allocated") = false,
+	           nb::arg("owns_gpu_buffer") = true)
       .def("start_sender", &UcclProxy::start_sender)
       .def("start_remote", &UcclProxy::start_remote)
       .def("start_local", &UcclProxy::start_local)
@@ -2412,12 +2413,20 @@ NB_MODULE(ep, m) {
       .def("get_listen_port", &UcclProxy::get_listen_port)
       .def("get_atomic_buffer_ptr", &UcclProxy::get_atomic_buffer_ptr)
       .def("set_atomic_buffer_ptr", &UcclProxy::set_atomic_buffer_ptr)
+      .def("get_atomic_buffer_addr", &UcclProxy::get_atomic_buffer_addr)
+      .def("get_atomic_buffer_bytes", &UcclProxy::get_atomic_buffer_bytes)
+      .def("set_atomic_buffer_addr", &UcclProxy::set_atomic_buffer_addr,
+           nb::arg("addr"))
       .def("set_dispatch_recv_data_offset",
            &UcclProxy::set_dispatch_recv_data_offset, nb::arg("offset"))
       .def("calculate_and_set_dispatch_recv_data_offset",
            &UcclProxy::calculate_and_set_dispatch_recv_data_offset,
            nb::arg("num_tokens"), nb::arg("hidden"), nb::arg("num_experts"))
       .def("get_d2h_channel_addrs", &UcclProxy::get_d2h_channel_addrs)
+      .def("get_d2h_channel_device_addrs",
+           &UcclProxy::get_d2h_channel_device_addrs)
+      .def("get_d2h_channel_handle_addrs",
+           &UcclProxy::get_d2h_channel_handle_addrs)
       .def("use_normal_mode", &UcclProxy::use_normal_mode)
       .def_prop_ro("thread_idx", &UcclProxy::thread_idx)
       .def_prop_ro("gpu_buffer_addr", &UcclProxy::gpu_buffer_addr)

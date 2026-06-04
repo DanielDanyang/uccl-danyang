@@ -88,6 +88,9 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
+  profile_commands_ = std::getenv("UCCL_PROXY_PROFILE_COMMANDS") != nullptr;
+  profile_start_ = std::chrono::steady_clock::now();
+  profile_end_ = profile_start_;
 #ifndef USE_MSCCLPP_FIFO_BACKEND
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
   ring_seen_.resize(cfg_.d2h_queues.size(), 0);
@@ -194,10 +197,15 @@ void Proxy::init_common() {
     (void)create_per_thread_cq(ctx_);
   }
 
-  // Register atomic_buffer_ptr as a separate RDMA memory region if it was set
-  // This must be done after PD is initialized by per_thread_rdma_init
-  // TODO(MaoZiming): Skip registering for EFA.
-  if (atomic_buffer_ptr_ && !ctx_.atomic_buffer_mr) {
+  // Register atomic_buffer_ptr as a separate RDMA memory region if it was set.
+  // This must be done after PD is initialized by per_thread_rdma_init.  The EFA
+  // normal WRITE path does not use native RDMA atomics, and registering the
+  // cudaHostAllocMapped atomic buffer is not required for V2/UCCL dispatch.
+  bool should_register_atomic_buffer = atomic_buffer_ptr_ != nullptr;
+#ifdef EFA
+  if (cfg_.use_normal_mode) should_register_atomic_buffer = false;
+#endif
+  if (should_register_atomic_buffer && !ctx_.atomic_buffer_mr) {
     ctx_.atomic_buffer_mr =
         ibv_reg_mr(ctx_.pd, atomic_buffer_ptr_, kAtomicBufferSize,
                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
@@ -426,18 +434,27 @@ void Proxy::init_common() {
     c.remote_atomic_buffer_len = remote_infos_[peer].atomic_buffer_len;
     c.remote_atomic_buffer_rkey = remote_infos_[peer].atomic_buffer_rkey;
 
+    const bool debug_atomic_buffer =
+        std::getenv("UCCL_PROXY_DEBUG_ATOMIC_BUFFER") != nullptr;
     if (c.remote_atomic_buffer_addr == 0) {
-      fprintf(
-          stderr,
-          "[Proxy] WARNING: Remote atomic buffer not registered for peer %d "
-          "(local atomic_buffer_ptr=%p, local atomic_buffer_mr=%p)\n",
-          peer, atomic_buffer_ptr_, (void*)ctx_.atomic_buffer_mr);
+      // EFA normal mode uses WRITE-with-imm software atomics: the receiver CPU
+      // proxy applies the update into its local atomic buffer, so no remote
+      // hardware-atomic MR is required. Keep the warning for LL/non-normal paths
+      // and for explicit debugging only.
+      if (!cfg_.use_normal_mode || debug_atomic_buffer) {
+        fprintf(stderr,
+                "[Proxy] WARNING: Remote atomic buffer not registered for peer "
+                "%d (local atomic_buffer_ptr=%p, local atomic_buffer_mr=%p)\n",
+                peer, atomic_buffer_ptr_, (void*)ctx_.atomic_buffer_mr);
+      }
     } else {
-      fprintf(stderr,
-              "[Proxy] Remote atomic buffer info for peer %d: addr=0x%llx, "
-              "len=%zu, rkey=0x%x\n",
-              peer, (unsigned long long)c.remote_atomic_buffer_addr,
-              (size_t)c.remote_atomic_buffer_len, c.remote_atomic_buffer_rkey);
+      if (debug_atomic_buffer) {
+        fprintf(stderr,
+                "[Proxy] Remote atomic buffer info for peer %d: addr=0x%llx, "
+                "len=%zu, rkey=0x%x\n",
+                peer, (unsigned long long)c.remote_atomic_buffer_addr,
+                (size_t)c.remote_atomic_buffer_len, c.remote_atomic_buffer_rkey);
+      }
     }
   }
   usleep(50 * 1000);
@@ -532,6 +549,7 @@ void Proxy::run_sender() {
     notify_gpu_completion(my_tail);
     post_gpu_command(my_tail, seen);
   }
+  dump_command_profile();
 }
 
 void Proxy::run_remote() {
@@ -607,9 +625,13 @@ void Proxy::run_dual() {
       barrier_check();
     }
   }
+  dump_command_profile();
 }
 
 void Proxy::notify_gpu_completion(uint64_t& my_tail) {
+  if (profile_commands_) {
+    profile_completed_wrs_ += acked_wrs_.size();
+  }
   if (acked_wrs_.empty()) return;
 
     // Mark all acked command slots in each ring's bitmask
@@ -757,16 +779,48 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
     size_t current_size = wrs_to_post.size();
     wrs_to_post.reserve(current_size + batch_size);
     cmds_to_post.reserve(current_size + batch_size);
+    auto maybe_dump_empty_gap = [&](size_t i, const char* reason) {
+      const char* debug_env = std::getenv("UCCL_V2_PROXY_RING_DEBUG");
+      if (debug_env == nullptr || debug_env[0] == '\0' ||
+          debug_env[0] == '0') {
+        return;
+      }
+      static thread_local std::vector<std::chrono::steady_clock::time_point>
+          last_log;
+      if (last_log.size() <= rb_idx)
+        last_log.resize(rb_idx + 1, std::chrono::steady_clock::time_point{});
+      auto const now = std::chrono::steady_clock::now();
+      if (last_log[rb_idx].time_since_epoch().count() != 0 &&
+          now - last_log[rb_idx] < std::chrono::milliseconds(500)) {
+        return;
+      }
+      last_log[rb_idx] = now;
+      size_t const slot = i % h->capacity();
+      fprintf(stderr,
+              "UCCL_V2_RING_GAP rank=%d thread=%d rb=%zu reason=%s "
+              "head=%llu ring_seen=%zu ring_tail=%llu i=%zu slot=%zu "
+              "acked_pending=%zu queued_wrs=%zu\n",
+              cfg_.rank, cfg_.thread_idx, rb_idx, reason,
+              static_cast<unsigned long long>(cur_head), ring_seen,
+              static_cast<unsigned long long>(ring_tail), i, slot,
+              acked_wrs_.size(), wrs_to_post.size());
+    };
 
     // Collect batch of commands from this ring buffer
     for (size_t i = ring_seen; i < cur_head; ++i) {
       CmdType cmd = h->volatile_load_cmd_type(i);
       // NOTE(MaoZiming): Non-blocking. prevent local and remote both while
       // loop.
-      if (cmd == CmdType::EMPTY) break;
+      if (cmd == CmdType::EMPTY) {
+        maybe_dump_empty_gap(i, "cmd_type_empty");
+        break;
+      }
 
       TransferCmd& cmd_entry = h->load_cmd_entry(i);
-      if (cmd_entry.cmd_type == CmdType::EMPTY) break;
+      if (cmd_entry.cmd_type == CmdType::EMPTY) {
+        maybe_dump_empty_gap(i, "entry_empty");
+        break;
+      }
 
       if (get_base_cmd(cmd_entry.cmd_type) == CmdType::WRITE ||
           get_base_cmd(cmd_entry.cmd_type) == CmdType::ATOMIC) {
@@ -1021,11 +1075,71 @@ void Proxy::post_gpu_commands_mixed(
       0) {
     return;
   }
+  if (profile_commands_) {
+    auto const now = std::chrono::steady_clock::now();
+    if (profile_post_batches_ == 0) profile_start_ = now;
+    profile_end_ = now;
+    uint64_t write_bytes = 0;
+    for (auto const& cmd : rdma_cmds) {
+      write_bytes += static_cast<uint64_t>(cmd.bytes);
+    }
+    ++profile_post_batches_;
+    profile_post_cmds_ += static_cast<uint64_t>(
+        rdma_wrs.size() + atomic_wrs.size() + quiet_wrs.size() +
+        barrier_wrs.size());
+    profile_write_cmds_ += static_cast<uint64_t>(rdma_wrs.size());
+    profile_write_bytes_ += write_bytes;
+    profile_atomic_cmds_ += static_cast<uint64_t>(atomic_wrs.size());
+    profile_quiet_cmds_ += static_cast<uint64_t>(quiet_wrs.size());
+    profile_barrier_cmds_ += static_cast<uint64_t>(barrier_wrs.size());
+  }
   // Handle regular RDMA writes
   if (!rdma_wrs.empty()) {
-    post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
-                            rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
-                            cfg_.thread_idx, cfg_.use_normal_mode);
+    const char* serialize_env = std::getenv("UCCL_V2_SERIALIZE_RDMA_WRITES");
+    const bool serialize_writes =
+        serialize_env != nullptr && std::atoi(serialize_env) != 0;
+    if (serialize_writes) {
+      std::set<PendingUpdate> pending_atomic_updates;
+      std::vector<uint64_t> one_wr;
+      std::vector<TransferCmd> one_cmd;
+      one_wr.reserve(1);
+      one_cmd.reserve(1);
+      for (size_t i = 0; i < rdma_wrs.size(); ++i) {
+        one_wr.assign(1, rdma_wrs[i]);
+        one_cmd.assign(1, rdma_cmds[i]);
+        post_rdma_async_batched(ctx_, cfg_.gpu_buffer, 1, one_wr, one_cmd,
+                                ctxs_for_all_ranks_, cfg_.rank,
+                                cfg_.thread_idx, cfg_.use_normal_mode);
+
+        auto const start = std::chrono::steady_clock::now();
+        for (;;) {
+          if (acked_wrs_.find(rdma_wrs[i]) != acked_wrs_.end()) {
+            uint64_t dummy_tail = 0;
+            notify_gpu_completion(dummy_tail);
+            break;
+          }
+          poll_cq_dual(ctx_, acked_wrs_, cfg_.thread_idx, ring, ctx_by_tag_,
+                       atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
+                       pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
+                       adaptive_sleeper_, cfg_.use_normal_mode);
+          if (std::chrono::steady_clock::now() - start >
+              std::chrono::seconds(10)) {
+            fprintf(stderr,
+                    "Timed out waiting for serialized RDMA WRITE completion, "
+                    "thread_idx=%d wr_id=%llu dst_rank=%u bytes=%u\n",
+                    cfg_.thread_idx,
+                    static_cast<unsigned long long>(rdma_wrs[i]),
+                    static_cast<unsigned>(rdma_cmds[i].dst_rank),
+                    static_cast<unsigned>(rdma_cmds[i].bytes));
+            std::abort();
+          }
+        }
+      }
+    } else {
+      post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
+                              rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
+                              cfg_.thread_idx, cfg_.use_normal_mode);
+    }
     rdma_wrs.clear();
     rdma_cmds.clear();
   }
@@ -1056,6 +1170,40 @@ void Proxy::post_gpu_commands_mixed(
     quiet(quiet_wrs, quiet_cmds);
     quiet_wrs.clear();
     quiet_cmds.clear();
+  }
+}
+
+void Proxy::dump_command_profile() const {
+  if (!profile_commands_) return;
+  double const seconds =
+      std::chrono::duration<double>(profile_end_ - profile_start_).count();
+  double const cmds_per_sec =
+      seconds > 0.0 ? static_cast<double>(profile_post_cmds_) / seconds : 0.0;
+  double const write_gbps =
+      seconds > 0.0
+          ? static_cast<double>(profile_write_bytes_) / seconds / 1.0e9
+          : 0.0;
+  char line[1024];
+  int const n = std::snprintf(
+      line, sizeof(line),
+      "UCCL_PROXY_PROFILE rank=%d thread=%d normal=%d rings=%zu "
+      "seconds=%.6f post_batches=%llu post_cmds=%llu write_cmds=%llu "
+      "write_bytes=%llu write_GBps=%.3f atomic_cmds=%llu quiet_cmds=%llu "
+      "barrier_cmds=%llu completed_wrs=%llu cmds_per_sec=%.3f\n",
+      cfg_.rank, cfg_.thread_idx, cfg_.use_normal_mode ? 1 : 0,
+      cfg_.d2h_queues.size(), seconds,
+      static_cast<unsigned long long>(profile_post_batches_),
+      static_cast<unsigned long long>(profile_post_cmds_),
+      static_cast<unsigned long long>(profile_write_cmds_),
+      static_cast<unsigned long long>(profile_write_bytes_), write_gbps,
+      static_cast<unsigned long long>(profile_atomic_cmds_),
+      static_cast<unsigned long long>(profile_quiet_cmds_),
+      static_cast<unsigned long long>(profile_barrier_cmds_),
+      static_cast<unsigned long long>(profile_completed_wrs_), cmds_per_sec);
+  if (n > 0) {
+    size_t const len =
+        static_cast<size_t>(std::min(n, static_cast<int>(sizeof(line) - 1)));
+    (void)::write(STDERR_FILENO, line, len);
   }
 }
 

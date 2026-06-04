@@ -90,6 +90,11 @@ INSTALL_DIR          := $(PYTHON_SITE_PACKAGES)/uccl
 DETECTED_SM := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')
 SM ?= $(DETECTED_SM)
 
+NUM_PROXY_THREADS ?= 4
+CHANNEL_PER_PROXY ?= 8
+PROXY_LAYOUT_CFLAGS := -DUCCL_NUM_PROXY_THS=$(NUM_PROXY_THREADS) -DUCCL_CHANNEL_PER_PROXY=$(CHANNEL_PER_PROXY)
+$(info UCCL proxy layout: NUM_PROXY_THREADS=$(NUM_PROXY_THREADS), CHANNEL_PER_PROXY=$(CHANNEL_PER_PROXY))
+
 CXXFLAGS  := -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI) -DNB_DOMAIN=uccl_ep
 LDFLAGS := -lpthread  -libverbs -lnl-3 -lnl-route-3 -lnuma -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
 NVCCFLAGS := -O3 -std=c++17 -Xcompiler "-Wall -pthread -fPIC -fvisibility=hidden" -ccbin /usr/bin/g++ --expt-relaxed-constexpr -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI)
@@ -112,8 +117,8 @@ ifeq ($(PER_EXPERT_BATCHING),1)
 endif
 
 
-CXXFLAGS  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
-NVCCFLAGS += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
+CXXFLAGS  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS) $(PROXY_LAYOUT_CFLAGS)
+NVCCFLAGS += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS) $(PROXY_LAYOUT_CFLAGS)
 LDFLAGS   += $(EFA_LDFLAGS)
 INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 
