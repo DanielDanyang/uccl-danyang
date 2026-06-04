@@ -767,3 +767,52 @@ write_bytes 11,299,461,120
   这个 per-token WR 形态。下一步更像是协议层优化：把 dispatch 里按 token 的 payload
   WRITE 变成 V2-native per-expert/per-peer semantic batching，减少 WR 数；这也更接近
   原 `uccl/ep` 在 EFA 上取得效果的方向。
+
+## 2026-06-04：决定转向 UCCL-GIN API + 冻结快照 + vendoring
+
+### 根因再定位(对比三处实现)
+
+- `ep/src/internode.cu`(V1 normal)和上游 `legacy/internode.cu` 都是
+  **staging buffer + 滑动窗口 + 一次 put 发连续 run**(`num_max_rdma_chunked_send_tokens`)。
+- 上游 V2 `hybrid_dispatch.cuh` **不在 kernel 里合并**:每 token 一次
+  `gin.put<ncclTeamTagRail>(..., ncclGinOptFlagsAggregateRequests)`,把聚合下放给
+  NCCL GIN 层。
+- 我们的 `hybrid_dispatch_native.cuh` fork 时把 `gin.put` 换成 per-token
+  `v2_d2h_write`,**连 `AggregateRequests` 的聚合也一起丢了,且没有替代** → 786K 条
+  per-token 14KB WRITE 砸到 CPU proxy → 卡在 ~30 GB/s 小消息区。
+
+### 设计决定:UCCL-GIN
+
+抽象边界其实就是 DeepEP 已有的 `handle::NCCLGin`。决定做一个同形状的
+`handle::UCCLGin`:`Lsa` 转发 NCCL/NVLink,`Rail` 走 UCCL D2H+proxy+EFA,把
+EFA 的硬骨头(无 atomic→有序软原子、小消息→coalescing、barrier→host/epoch)在后端
+解决一次,DeepEP V2 dispatch/combine/LL 以最小改动跟上。计划见
+`ep/docs/uccl_gin_plan.md`(含文件结构、thirdparty 极小 patch 策略、性能语义清单)。
+
+### 冻结当前 fork-based 代码(防丢)
+
+- 发现 submodule 里 4 个改动(buffer.hpp / api.cuh / compiler.hpp / kernel_runtime.hpp,
+  167 行)**只在工作区、不在父仓历史**,最脆弱。
+- 在 `deepepv2` 上 commit `e9f64b19` 冻结全部工作区改动 + worklog + docs;
+  submodule 改动另存为 `thirdparty/DeepEP-v2-d4f41e4.local-changes.patch`(gitlink 仍指
+  可 fetch 的 `d4f41e4`)。
+- `nccl/`(21M 参考克隆)+ `2512.19849v2.pdf` 加进 `.gitignore`,不进历史。
+- push 到 `origin/deepepv2` + tag `deepepv2-snapshot-20260604`(远端持久备份)。
+- 新开分支 `uccl-gin`,在其上重写。
+
+### DeepEP V2:submodule → vendored(in-tree 副本)
+
+- 在 `uccl-gin` 上把 `thirdparty/DeepEP-v2-d4f41e4` 从 git submodule 转成 vendored
+  普通目录(`git rm --cached` gitlink、删内层 `.git`/`.gitmodules`、`git add` 真实文件),
+  `third-party/fmt` 一并 vendored(option A,header-only,128 文件)。232 个文件纳入,
+  无 160000 gitlink、无构建产物;`figures/` README 图未纳入。
+- 新增 `thirdparty/DeepEP-v2-d4f41e4/VENDORED.md`(上游 commit + 改动清单 + re-vendor 说明)。
+- 更新 `AGENTS.md`(submodule → vendored)、`ep/docs/uccl_gin_plan.md`(文件结构 + vendoring)。
+- 新增根 `CLAUDE.md`,`@AGENTS.md` 引入项目规则。
+- 路径 `thirdparty/DeepEP-v2-d4f41e4` 不变 → Makefile/Python 零改动。
+
+### 下一步(uccl-gin)
+
+按 `uccl_gin_plan.md`:P0 抽 `uccl_gin_rail.cuh`(收纳现有 v2_d2h_* / PackAtomicWithSeq)→
+P1 `handle::UCCLGin` 骨架(Lsa 复用 NCCLGin、Rail 调 P0)→ P2 thirdparty 极小 patch
+(`DEEPEP_GIN_T` 可替换)接通 dispatch、删 800 行 fork → P3 proxy 侧 coalescing → P4 combine。

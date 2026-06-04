@@ -22,6 +22,3 @@
 [submodule "thirdparty/ThunderKittens"]
     path = thirdparty/ThunderKittens
     url = https://github.com/HazyResearch/ThunderKittens.git
-[submodule "thirdparty/DeepEP-v2-d4f41e4"]
-	path = thirdparty/DeepEP-v2-d4f41e4
-	url = https://github.com/deepseek-ai/DeepEP.git

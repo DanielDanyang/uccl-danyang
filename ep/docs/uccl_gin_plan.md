@@ -126,6 +126,67 @@ L0 大多已存在(V1 transport);L1 大多已存在(本项目这几轮写的);**
 
 ---
 
+## 3.5 文件结构 + DeepEP vendoring
+
+**DeepEP V2 已从 git submodule 改成 vendored 源码副本**(直接拷进仓库、可仓内修改;
+见 `thirdparty/DeepEP-v2-d4f41e4/VENDORED.md`)。这样"在 DeepEP 里做极小 patch"就是
+改我们自己的文件,不再有 submodule gitlink / `git submodule update` 的脆弱性。
+
+核心原则:**thirdparty 里只留极小、可 re-vendor 的 patch;UCCL 全部后端留在 `ep/`。**
+不再把整份 kernel fork 进 `ep/`(那是上一轮 800 行 `hybrid_dispatch_native.cuh` 的痛点)。
+
+```
+thirdparty/DeepEP-v2-d4f41e4/        ← vendored 副本 (不是 submodule), 只留极小 patch
+  VENDORED.md                        [新] 上游 commit + 改动清单 + re-vendor 说明
+  csrc/elastic/buffer.hpp            [已改] get_native_v2_resources()
+  csrc/kernels/backend/api.cuh       [已改] get_raw_window_ptr()
+  csrc/jit/{compiler,kernel_runtime}.hpp  [已改] JIT bridge
+  deep_ep/include/deep_ep/
+    common/handle.cuh                [小 patch] 让 gin 类型可替换 (DEEPEP_GIN_T)
+    impls/hybrid_dispatch.cuh        [小 patch] 用 DEEPEP_GIN_T 而非硬写 NCCLGin
+    impls/hybrid_combine.cuh         [小 patch] 同上
+  third-party/fmt/                   [vendored] header-only, 一并拷入
+thirdparty/DeepEP-v2-d4f41e4.local-changes.patch   [记录] 相对 pristine d4f41e4 的 diff
+
+ep/                                  ← UCCL 拥有的全部后端 (clean git)
+  include/v2_efa/
+    uccl_gin.cuh           [新] namespace deep_ep::elastic::handle { struct UCCLGin }
+                                镜像 NCCLGin 方法签名; Lsa 转发, Rail 调下面
+    uccl_gin_rail.cuh      [新] L1 device 后端: put(coalesce)/red_add_seq/put_value/offset
+                                (把现散在 hybrid_dispatch_native.cuh 的 v2_d2h_* 收进来)
+    transfer_cmd_device.cuh[已有] D2H ring ABI (lean, JIT 可编)
+    workspace.hpp          [已有] signal scratch / atomic tail 几何
+    jit_plan.hpp           [改] 生成 source: include 上游 hybrid_dispatch.cuh + uccl_gin.cuh,
+                                #define DEEPEP_GIN_T handle::UCCLGin 后实例化
+    runtime.hpp / topology.hpp ...   [已有]
+    hybrid_dispatch_native.cuh       [删] 800 行 fork → 由"上游 kernel + UCCLGin"取代
+  src/
+    proxy.cpp              [改] L0: 连续 WRITE coalescing (AggregateRequests 等价)
+    rdma.cpp               [已有] EFA verbs + PackAtomicWithSeq apply
+    v2_efa_deep_ep_jit.cc  [改] launch 资源喂给 UCCLGin 构造, 不再喂 fork kernel
+    uccl_ep.cc / uccl_proxy.cpp  [已有] binding
+  deep_ep_v2_wrapper/...   [已有] 生命周期 / dispatch 接线
+  docs/uccl_gin_plan.md    [本计划] / native_v2_efa.md [fork 版历史参考]
+```
+
+thirdparty 那个"极小 patch"(让 kernel 用 UCCLGin)长这样:
+
+```cpp
+// deep_ep/impls/hybrid_dispatch.cuh 顶部
+#ifndef DEEPEP_GIN_T
+#define DEEPEP_GIN_T ::deep_ep::elastic::handle::NCCLGin   // 默认上游行为
+#endif
+...
+const auto gin = DEEPEP_GIN_T(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+```
+JIT 生成 source 时 `#define DEEPEP_GIN_T handle::UCCLGin` + `#include "v2_efa/uccl_gin.cuh"`。
+re-vendor 时这种 ~3 行 patch 几乎不冲突,远好过维护 800 行 fork。
+
+> 路径 `thirdparty/DeepEP-v2-d4f41e4` 保持不变 → `ep/Makefile`(`DEEPEP_V2_ROOT`)和
+> Python `__init__` 零改动。`figures/`(README 图)未 vendored,无关构建。
+
+---
+
 ## 4. 逐方法后端设计
 
 ### 4.1 `put<Rail>` —— 必须做 coalescing(这是 30→? 的关键)

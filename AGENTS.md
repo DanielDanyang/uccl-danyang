@@ -2,7 +2,7 @@
 
 ## 目标
 
-在 AWS `p5en_0` 和 `p5en_1` 两台机器上，用隔离的 Python 虚拟环境开发和验证 `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/` 里的 `ep/` native DeepEP V2 on AWS EFA 路径。当前目标是像原 UCCL-EP V1 一样把 transport substrate 留在 UCCL 内部，同时把 DeepEP V2 依赖作为独立 submodule 固定在仓库里，避免依赖外部 DeepEP 工作区或安装态源码。
+在 AWS `p5en_0` 和 `p5en_1` 两台机器上，用隔离的 Python 虚拟环境开发和验证 `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/` 里的 `ep/` native DeepEP V2 on AWS EFA 路径。当前目标是像原 UCCL-EP V1 一样把 transport substrate 留在 UCCL 内部，同时把 DeepEP V2 依赖作为 vendored 源码副本（直接拷进仓库、可仓内修改）固定在仓库里，避免依赖外部 DeepEP 工作区或安装态源码。
 
 ## 远端主机
 
@@ -54,11 +54,16 @@
   - `ep/bench/test_low_latency.py`
   - 旧 V1 static kernel 和 binding：`internode.cu`、`intranode.cu`、`internode_ll.cu`、`layout.cu`、`ep_runtime.cu`、原 V1 Python binding。
   - 旧第三方库 `thirdparty/DeepEP/`。
-- DeepEP V2 依赖使用新增的独立 git submodule，不更新、不替换旧 `thirdparty/DeepEP/`：
-  - 路径: `thirdparty/DeepEP-v2-d4f41e4/`
+- DeepEP V2 依赖是 **vendored 源码副本**（直接拷进仓库、可仓内修改），不再是 git
+  submodule；不更新、不替换旧 `thirdparty/DeepEP/`：
+  - 路径: `thirdparty/DeepEP-v2-d4f41e4/`（普通目录，已纳入版本控制）
   - 上游: `https://github.com/deepseek-ai/DeepEP`
-  - 固定 commit: `d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb`
-  - 需要递归初始化它自己的上游 submodule `third-party/fmt`。
+  - vendored 自上游 commit: `d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb`
+  - `third-party/fmt` 也一并 vendored 进来（header-only），不需要 submodule init。
+  - 改动记录见 `thirdparty/DeepEP-v2-d4f41e4/VENDORED.md` 和
+    `thirdparty/DeepEP-v2-d4f41e4.local-changes.patch`。
+  - **直接改这个目录里的文件即可**（不再有 submodule gitlink / `git submodule update`）；
+    改动保持小而集中，方便日后从上游 re-vendor 时重新套用。
 - V2 wrapper 默认从 `thirdparty/DeepEP-v2-d4f41e4/deep_ep` 取 DeepEP V2 Python/JIT 资源。
 - V2 C++ JIT bridge 默认 include `thirdparty/DeepEP-v2-d4f41e4/csrc/jit/*`。
 - 服务器构建统一使用 `/usr/local/cuda-13.0`，不要依赖 `/usr/local/cuda` 软链。
