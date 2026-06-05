@@ -16,7 +16,6 @@
 #include "ring_buffer.cuh"
 #include "uccl_bench.hpp"
 #include "uccl_proxy.hpp"
-#include "v2_efa/runtime.hpp"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
@@ -1746,37 +1745,6 @@ class Buffer {
       nullptr};  // Device pointer to array of IPC base addresses
 };
 
-namespace {
-namespace v2 = uccl::v2_efa;
-
-nb::dict v2_jit_plan_to_dict(const v2::V2EfaJitLaunchPlan& p) {
-  nb::dict d;
-  d["name"] = p.name;
-  d["grid_dim_x"] = p.grid_dim_x;
-  d["grid_dim_y"] = p.grid_dim_y;
-  d["num_threads"] = p.num_threads;
-  d["smem_bytes"] = p.smem_bytes;
-  d["cluster_dim"] = p.cluster_dim;
-  d["cooperative"] = p.cooperative;
-  d["pdl_enabled"] = p.pdl_enabled;
-  d["num_notify_warps"] = p.num_notify_warps;
-  d["num_scaleout_warps"] = p.num_scaleout_warps;
-  d["num_forward_warps"] = p.num_forward_warps;
-  d["num_payload_warps"] = p.num_payload_warps;
-  return d;
-}
-
-nb::dict v2_route_to_dict(const v2::ExpertRoute& r) {
-  nb::dict d;
-  d["expert_id"] = r.expert_id;
-  d["owner_rank"] = r.owner_rank;
-  d["dst_scaleout_rank"] = r.dst_scaleout_rank;
-  d["dst_scaleup_lane"] = r.dst_scaleup_lane;
-  d["is_remote_scaleout"] = r.is_remote_scaleout;
-  return d;
-}
-}  // namespace
-
 NB_MODULE(ep, m) {
   m.doc() = "Minimal DeepEP-compatible shim with UCCL";
   m.def("d2h_queue_capacity",
@@ -2612,110 +2580,6 @@ NB_MODULE(ep, m) {
       .def("avg_wr_latency_us", &FifoProxy::avg_wr_latency_us)
       .def("processed_count", &FifoProxy::processed_count)
       .def_ro("thread_idx", &FifoProxy::thread_idx);
-
-  // ---- Native V2 EFA runtime bindings ----
-  m.def("init_deep_ep_jit", &v2::init_deep_ep_jit_bridge,
-        nb::arg("library_root_path"), nb::arg("cuda_home_path"),
-        nb::arg("nccl_root_path"));
-  m.def("is_deep_ep_jit_initialized", &v2::is_deep_ep_jit_bridge_initialized);
-
-  nb::class_<v2::RuntimeConfig>(m, "V2EfaRuntimeConfig")
-      .def(nb::init<>())
-      .def_rw("rank", &v2::RuntimeConfig::rank)
-      .def_rw("world_size", &v2::RuntimeConfig::world_size)
-      .def_rw("scaleout_rank", &v2::RuntimeConfig::scaleout_rank)
-      .def_rw("scaleup_rank", &v2::RuntimeConfig::scaleup_rank)
-      .def_rw("num_scaleout_ranks", &v2::RuntimeConfig::num_scaleout_ranks)
-      .def_rw("num_scaleup_ranks", &v2::RuntimeConfig::num_scaleup_ranks)
-      .def_rw("num_experts", &v2::RuntimeConfig::num_experts)
-      .def_rw("num_topk", &v2::RuntimeConfig::num_topk)
-      .def_rw("hidden", &v2::RuntimeConfig::hidden)
-      .def_rw("elem_bytes", &v2::RuntimeConfig::elem_bytes)
-      .def_rw("num_sms", &v2::RuntimeConfig::num_sms);
-
-  nb::class_<v2::V2EfaRuntime>(m, "V2EfaRuntime")
-      .def(nb::init<v2::RuntimeConfig>())
-      .def("status", &v2::V2EfaRuntime::status)
-      .def("route_expert",
-           [](const v2::V2EfaRuntime& self, int expert_id) {
-             return v2_route_to_dict(self.route_expert(expert_id));
-           })
-      .def(
-          "build_native_hybrid_dispatch_jit_plan",
-          [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-             int num_channels_per_sm, int num_sf_packs, int expert_alignment,
-             int num_qps, std::int64_t num_timeout_cycles, bool cached_mode,
-             bool deterministic, bool do_cpu_sync, int smem_bytes,
-             const std::string& uccl_include_path) {
-            return v2_jit_plan_to_dict(
-                self.build_native_hybrid_dispatch_jit_plan(
-                    num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
-                    expert_alignment, num_qps, num_timeout_cycles, cached_mode,
-                    deterministic, do_cpu_sync, smem_bytes, uccl_include_path));
-          },
-          nb::arg("num_max_tokens_per_rank"),
-          nb::arg("num_channels_per_sm") = 1, nb::arg("num_sf_packs") = 0,
-          nb::arg("expert_alignment") = 1, nb::arg("num_qps") = 1,
-          nb::arg("num_timeout_cycles") = 200000000000ll,
-          nb::arg("cached_mode") = false, nb::arg("deterministic") = false,
-          nb::arg("do_cpu_sync") = false, nb::arg("smem_bytes") = 228 * 1024,
-          nb::arg("uccl_include_path") = "")
-      .def(
-          "compile_native_hybrid_dispatch_jit",
-          [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-             int num_channels_per_sm, int num_sf_packs, int expert_alignment,
-             int num_qps, std::int64_t num_timeout_cycles, bool cached_mode,
-             bool deterministic, bool do_cpu_sync, int smem_bytes,
-             const std::string& uccl_include_path) {
-            const auto plan = self.build_native_hybrid_dispatch_jit_plan(
-                num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
-                expert_alignment, num_qps, num_timeout_cycles, cached_mode,
-                deterministic, do_cpu_sync, smem_bytes, uccl_include_path);
-            v2::compile_v2_efa_jit_plan(plan);
-            return v2_jit_plan_to_dict(plan);
-          },
-          nb::arg("num_max_tokens_per_rank"),
-          nb::arg("num_channels_per_sm") = 1, nb::arg("num_sf_packs") = 0,
-          nb::arg("expert_alignment") = 1, nb::arg("num_qps") = 1,
-          nb::arg("num_timeout_cycles") = 200000000000ll,
-          nb::arg("cached_mode") = false, nb::arg("deterministic") = false,
-          nb::arg("do_cpu_sync") = false, nb::arg("smem_bytes") = 228 * 1024,
-          nb::arg("uccl_include_path") = "")
-      .def(
-          "build_dispatch_copy_epilogue_jit_plan",
-          [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-             int num_channels, int num_sf_packs, bool do_expand,
-             bool cached_mode, int smem_bytes,
-             const std::string& uccl_include_path) {
-            return v2_jit_plan_to_dict(
-                self.build_dispatch_copy_epilogue_jit_plan(
-                    num_max_tokens_per_rank, num_channels, num_sf_packs,
-                    do_expand, cached_mode, smem_bytes, uccl_include_path));
-          },
-          nb::arg("num_max_tokens_per_rank"), nb::arg("num_channels"),
-          nb::arg("num_sf_packs") = 0, nb::arg("do_expand") = false,
-          nb::arg("cached_mode") = false, nb::arg("smem_bytes") = 228 * 1024,
-          nb::arg("uccl_include_path") = "")
-      .def(
-          "compile_dispatch_copy_epilogue_jit",
-          [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-             int num_channels, int num_sf_packs, bool do_expand,
-             bool cached_mode, int smem_bytes,
-             const std::string& uccl_include_path) {
-            const auto plan = self.build_dispatch_copy_epilogue_jit_plan(
-                num_max_tokens_per_rank, num_channels, num_sf_packs, do_expand,
-                cached_mode, smem_bytes, uccl_include_path);
-            v2::compile_v2_efa_jit_plan(plan);
-            return v2_jit_plan_to_dict(plan);
-          },
-          nb::arg("num_max_tokens_per_rank"), nb::arg("num_channels"),
-          nb::arg("num_sf_packs") = 0, nb::arg("do_expand") = false,
-          nb::arg("cached_mode") = false, nb::arg("smem_bytes") = 228 * 1024,
-          nb::arg("uccl_include_path") = "")
-      .def("launch_native_hybrid_dispatch",
-           &v2::V2EfaRuntime::launch_native_hybrid_dispatch)
-      .def("launch_dispatch_copy_epilogue",
-           &v2::V2EfaRuntime::launch_dispatch_copy_epilogue);
 
   nb::set_leak_warnings(false);
 }

@@ -14,9 +14,6 @@ through UCCL D2H + proxy, `Lsa` forwards to NCCL/NVLink).
 Key docs (read before working in `ep/`):
 - `ep/docs/uccl_gin_plan.md` — the UCCL-GIN plan (architecture, file structure,
   phases, thirdparty minimal-patch strategy). **Authoritative going forward.**
-- `ep/docs/native_v2_efa.md` — the earlier fork-based native V2 design (history /
-  reference; superseded by the UCCL-GIN approach).
-- `plan.md` — original V2-fork plan (history).
 - `worklog.md` — running log of experiments, results, and decisions; keep updating it.
 
 ## Repo facts that bite if forgotten
@@ -25,5 +22,5 @@ Key docs (read before working in `ep/`):
   `thirdparty/DeepEP-v2-d4f41e4/` — edit it directly. See its `VENDORED.md`
   (upstream commit `d4f41e4`, local change list, re-vendor steps).
 - `nccl/` (reference clone) and the paper PDF are git-ignored; don't commit them.
-- The fork-based snapshot is preserved on `origin/deepepv2` + tag
-  `deepepv2-snapshot-20260604`.
+- The deleted fork-based native V2 path is preserved in git history only; do not
+  restore `ep/include/v2_efa`, `ep/src/v2_efa_*.cc`, or `ep/deep_ep_v2_wrapper`.

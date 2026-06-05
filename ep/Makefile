@@ -68,20 +68,6 @@ TORCH_LIBDIR      := $(TORCH_ROOT)/lib
 TORCH_ABI          := $(shell $(PYTHON) -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))")
 TORCH_INCS := -I$(TORCH_INCLUDE) -I$(TORCH_INCLUDE_API)
 
-# DeepEP V2 submodule used only by the native V2 EFA JIT bridge.  Keep the
-# original UCCL-EP V1 wrapper/backend independent from this dependency.
-DEEPEP_V2_ROOT := ../thirdparty/DeepEP-v2-d4f41e4
-
-# NCCL device headers (for the native V2 EFA JIT bridge); resolved from the
-# nvidia-nccl-cuXX wheel installed in the active environment.
-NCCL_INC := $(shell $(PYTHON) -c "import nvidia.nccl, pathlib; print(pathlib.Path(nvidia.nccl.__path__[0]) / 'include')")
-ifeq ($(strip $(NCCL_INC)),)
-  $(error Could not resolve nvidia.nccl include path with PYTHON=$(PYTHON))
-endif
-ifeq ($(wildcard $(NCCL_INC)/nccl.h),)
-  $(error Could not find nccl.h under NCCL_INC=$(NCCL_INC))
-endif
-
 # Python installation path
 PYTHON_SITE_PACKAGES := $(shell $(PYTHON) -c "import site; print(site.getsitepackages()[0])")
 INSTALL_DIR          := $(PYTHON_SITE_PACKAGES)/uccl
@@ -98,10 +84,7 @@ $(info UCCL proxy layout: NUM_PROXY_THREADS=$(NUM_PROXY_THREADS), CHANNEL_PER_PR
 CXXFLAGS  := -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI) -DNB_DOMAIN=uccl_ep
 LDFLAGS := -lpthread  -libverbs -lnl-3 -lnl-route-3 -lnuma -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64
 NVCCFLAGS := -O3 -std=c++17 -Xcompiler "-Wall -pthread -fPIC -fvisibility=hidden" -ccbin /usr/bin/g++ --expt-relaxed-constexpr -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_ABI)
-INCLUDES := -Iinclude -I$(CUDA_PATH)/include -I/usr/include -I../include \
-            -I$(DEEPEP_V2_ROOT)/deep_ep/include \
-            -I$(DEEPEP_V2_ROOT)/third-party/fmt/include \
-            $(if $(NCCL_INC),-I$(NCCL_INC),)
+INCLUDES := -Iinclude -I$(CUDA_PATH)/include -I/usr/include -I../include
 
 # Add Intel RDMA NIC support if USE_INTEL_RDMA_NIC=1
 ifeq ($(USE_INTEL_RDMA_NIC),1)
@@ -125,9 +108,7 @@ INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 SRC_CPP := src/proxy.cpp src/rdma.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
 SRC_CU  := src/bench_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
 # Non-binding .cc translation units linked into the shared library.
-# The native V2 EFA layer (runtime + DeepEP JIT bridge) links in here; the
-# DeepEP V2 JIT infrastructure under $(DEEPEP_V2_ROOT)/csrc/jit is header-only.
-SRC_CC_LIB := src/adaptive_sleeper.cc src/v2_efa_runtime.cc src/v2_efa_deep_ep_jit.cc
+SRC_CC_LIB := src/adaptive_sleeper.cc
 
 OBJ_CPP := $(SRC_CPP:.cpp=.o)
 OBJ_CU  := $(SRC_CU:.cu=.o)

@@ -20,10 +20,10 @@ Recorded in `../DeepEP-v2-d4f41e4.local-changes.patch` (diff against pristine
 
 | File | Change | Why |
 |------|--------|-----|
-| `csrc/elastic/buffer.hpp` | add `ElasticBuffer::get_native_v2_resources()` (+pybind) | export window/dev_comm pointers the native UCCL EFA wrapper needs |
-| `csrc/kernels/backend/api.cuh` | add `NCCLSymmetricMemoryContext::get_raw_window_ptr()` | `raw_window_ptr` is private; needed as the EFA MR base |
-| `csrc/jit/compiler.hpp` | JIT bridge tweak | UCCL native V2 JIT path |
-| `csrc/jit/kernel_runtime.hpp` | JIT bridge tweak | UCCL native V2 JIT path |
+| `csrc/elastic/buffer.hpp` | add `ElasticBuffer::get_native_v2_resources()` (+pybind) | export window/dev_comm pointers needed by the UCCL-GIN integration |
+| `csrc/kernels/backend/api.cuh` | add `NCCLSymmetricMemoryContext::get_raw_window_ptr()` | expose the raw symmetric window base for UCCL-GIN resource wiring |
+| `csrc/jit/compiler.hpp` | JIT bridge tweak | keep vendored DeepEP JIT buildable from this repo |
+| `csrc/jit/kernel_runtime.hpp` | JIT bridge tweak | keep vendored DeepEP JIT buildable from this repo |
 
 ## Updating from upstream
 
@@ -33,5 +33,6 @@ There is no `git submodule update`. To bump DeepEP:
 3. Re-apply the local edits (see the patch above) and update this file's commit hash
    + change table. Keep the edits minimal so re-applying stays cheap.
 
-Paths are referenced by `ep/Makefile` (`DEEPEP_V2_ROOT`) and the Python wrapper
-`ep/deep_ep_v2_wrapper/deep_ep/__init__.py`; keep this directory name stable.
+Paths are referenced by the UCCL-GIN integration plan and future build glue; keep
+this directory name stable. The old `ep/deep_ep_v2_wrapper/` fork path has been
+removed and must not be restored.

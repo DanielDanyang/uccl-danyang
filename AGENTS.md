@@ -140,47 +140,50 @@ export NCCL_SOCKET_IFNAME=enp71s0
 - `devCommCreate: creating 129 contexts`
 - `GIN Proxy will not be using GDRCopy`
 
-## Native V2 EP 当前方向和开发准则
+## UCCL-GIN 当前方向和开发准则
 
-- 当前主线是 `ep/`，不是 `uccl-ep/`。`uccl-ep/` 已废弃，不再作为开发、测试或
-  benchmark 目标。
-- `ep/` backend 必须以 DeepEP V2 的 JIT `.cuh`、`BufferLayout`、`TokenLayout`、
-  expanded dispatch、reduced combine、handle/cache 语义为核心。
+- 当前主线是 `ep/` + vendored `thirdparty/DeepEP-v2-d4f41e4/`，不是旧
+  `DeepEP-danyang/`，也不是已废弃的 `uccl-ep/`。
+- 当前唯一计划文档是 `ep/docs/uccl_gin_plan.md`；根目录旧 `plan.md` 已废弃。
+- 不再维护上一轮 fork-based native V2 路线。不要恢复或继续扩展：
+  - `ep/include/v2_efa/hybrid_dispatch_native.cuh`
+  - `ep/include/v2_efa/hybrid_combine_native.cuh`
+  - `ep/include/v2_efa/jit_plan.hpp`
+  - `ep/include/v2_efa/runtime.hpp`
+  - `ep/src/v2_efa_deep_ep_jit.cc`
+  - `ep/src/v2_efa_runtime.cc`
+  - `ep/deep_ep_v2_wrapper/`
+  - `ep/tests/v2_efa_native_dispatch_smoke.py`
+- 新方向是提供一个和 `deep_ep::elastic::handle::NCCLGin` 同形状的
+  `handle::UCCLGin`：
+  - `Rail` / scale-out 走 UCCL D2H FIFO、CPU proxy、EFA verbs、CQ/ack、quiet/barrier。
+  - `Lsa` / scale-up 继续走 DeepEP/NCCL/NVLink 的原有实现。
+  - DeepEP V2 kernel 调用面尽量保持上游写法，只通过 vendored DeepEP 的极小 patch
+    选择 `DEEPEP_GIN_T=handle::UCCLGin`。
 - `ep/` 必须优先复用原 `uccl/ep` 的 transport substrate：GPU 写 D2H FIFO、CPU
   proxy drain、EFA post、CQ poll、completion/ack 回传、quiet/barrier、thread
-  pinning、peer metadata exchange。
+  pinning、peer metadata exchange。能沿用 V1 transport 逻辑时不要自创新策略。
 - `ep/` 不应复用 V1 的 EP 语义层：`SourceMeta`、prefix matrix、packed/staged token
   buffer、V1 prepare/dispatch/combine binding、旧 static kernel。
-- 当前 native V2 command 方向：
-  - 主路径直接复用原 `uccl/ep` 的旧 16B `TransferCmd`，不要把差异很大的
-    `V2TransferCmd` 作为 dispatch/combine 主路径 wire command。
-  - V2 JIT 负责把 V2 `buffer/workspace/signal_scratch` 指针计算成 unified transport
-    window offset，然后直接写旧 `TransferCmd`。
-  - signal/tail/count 不新增 immediate command 字段；先把 value 写入 registered
-    signal scratch slot，再用旧 `TransferCmd` 普通 WRITE 写到远端 workspace word。
-  - lane 不进入 command；用 `channel_idx % num_fifo_queues` 选择 D2H queue/proxy/lane。
-  - 多个 D2H queue 只表示 channel/proxy thread/NIC lane 并行，不表示 dispatch/combine
-    语义分队列。V1 没有按 dispatch/combine 分队列，V2 也不应该分。
-- 当前必须坚持的 V2 descriptor 方向：
-  - dispatch descriptor/JIT 应直接描述和计算 `dst_rank, queue/channel, expert_id,
-    src_token range, expanded_slot range, count, payload bytes`，最终落成旧
-    `TransferCmd` 的 local/remote offset。
-  - combine descriptor 应直接描述 V2 reduced-combine 的反向 gather/reduce/send 路径。
-  - receiver 应直接写入 V2 expanded layout 或 reduced-combine 目标区域，避免回到 V1
-    packed token staging。
-- 如果 V2 中任何设计和原 `uccl/ep` 不同，必须在当前计划或设计文档里写明理由。默认沿用
-  V1 transport 方法；只有当 V2 语义、buffer layout、JIT/cache 或 AWS EFA 约束使原方法
-  无法表达时，才允许不同。
-- 如果新增 queue、command 字段、buffer、metadata 或 proxy 状态，必须说明它对应的 V2
-  语义来源，不能只因为实现方便而新增。
+- V2 相关改动应集中在两处：
+  - vendored DeepEP V2 里的最小 seam patch（`handle.cuh`、kernel gin 类型选择、
+    必需的 host getter/JIT include）。
+  - `ep/` 里的 UCCL-GIN Rail backend 和 proxy/coalescing/atomic 支撑。
+- API 覆盖面可以分阶段；当前优先完成 DeepEP V2 dispatch 所需的 GIN 语义，再扩到
+  combine 和 low-latency。
+- 如果 UCCL-GIN 中任何设计和原 `uccl/ep` transport 不同，必须在
+  `ep/docs/uccl_gin_plan.md` 或专门设计文档里写明理由。默认沿用 V1 transport 方法；
+  只有当 DeepEP V2 GIN 语义或 AWS EFA 约束使原方法无法表达时，才允许不同。
+- 如果新增 queue、command 字段、buffer、metadata 或 proxy 状态，必须说明它对应的
+  GIN/V2 语义来源，不能只因为实现方便而新增。
 - 如果遇到 bug，不要优先自创新策略；先检查原 `uccl/ep` 是否已有类似逻辑可以复用。
   能用原逻辑就用原逻辑；如果必须自己写，必须在计划或文档里给出充分理由。
 - 不要为了跑通 correctness 写 fallback、临时路径、semantic all-to-all、Python
   materialize、overlay、dummy/scaffold 路径进主代码。可以分模块做 isolated test，但
-  主 dispatch/combine path 必须朝最终方案写。
+  主 dispatch/combine path 必须朝最终 UCCL-GIN 方案写。
 - 不要 commit 一段“只跑通 correctness、性能明显不对”的 fallback 路径作为完成状态。
-  代码可以分阶段，但每个阶段都应服务于最终 native V2 + old `TransferCmd` + UCCL
-  proxy substrate 方案。
+  代码可以分阶段，但每个阶段都应服务于最终 DeepEP V2 + UCCL-GIN + UCCL proxy
+  substrate 方案。
 - `worklog.md` 需要持续记录操作、测试命令、benchmark 数据和重要设计结论。
 - 重要开发进度应在本地及时 commit，使用用户的 git/GitHub 身份，不添加 Codex
   co-author。
