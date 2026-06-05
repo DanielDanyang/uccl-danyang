@@ -1139,6 +1139,41 @@ void Proxy::post_gpu_commands_mixed(
       post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
                               rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
                               cfg_.thread_idx, cfg_.use_normal_mode);
+      if (!atomic_wrs.empty()) {
+        std::unordered_set<uint64_t> pending_release_wrs(rdma_wrs.begin(),
+                                                         rdma_wrs.end());
+        std::set<PendingUpdate> pending_atomic_updates;
+        auto const start = std::chrono::steady_clock::now();
+        while (!pending_release_wrs.empty()) {
+          for (auto it = pending_release_wrs.begin();
+               it != pending_release_wrs.end();) {
+            if (acked_wrs_.find(*it) != acked_wrs_.end()) {
+              it = pending_release_wrs.erase(it);
+            } else {
+              ++it;
+            }
+          }
+          uint64_t dummy_tail = 0;
+          notify_gpu_completion(dummy_tail);
+          if (pending_release_wrs.empty()) break;
+
+          poll_cq_dual(ctx_, acked_wrs_, cfg_.thread_idx, ring, ctx_by_tag_,
+                       atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
+                       pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
+                       adaptive_sleeper_, cfg_.use_normal_mode);
+          if (std::chrono::steady_clock::now() - start >
+              std::chrono::seconds(10)) {
+            fprintf(stderr,
+                    "Timed out waiting for RDMA WRITE release before ATOMIC, "
+                    "thread_idx=%d pending=%zu first_wr=%llu\n",
+                    cfg_.thread_idx, pending_release_wrs.size(),
+                    static_cast<unsigned long long>(
+                        pending_release_wrs.empty() ? 0
+                                                    : *pending_release_wrs.begin()));
+            std::abort();
+          }
+        }
+      }
     }
     rdma_wrs.clear();
     rdma_cmds.clear();

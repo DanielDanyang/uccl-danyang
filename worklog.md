@@ -1230,3 +1230,108 @@ DeepEP V2 dispatch。
   - 分离 dispatch-only 和 epilogue/host wait 时间,确认 UCCL-GIN Rail backend
     真实瓶颈。
   - 清理临时 debug/env-gated test hook 是否应变成正式入口或单独测试脚本。
+
+## 2026-06-05:补 UCCL-GIN Rail release ordering,README-like EP8x2 跑通
+
+目标:
+
+- 在已通过小配置 EP8x2 smoke 后,跑更接近 README 的 first-case:
+  - `--num-processes 8`
+  - `--test-first-only`
+  - `--num-sms 20`
+  - `--num-tokens 8192`
+  - `--hidden 7168`
+  - `--num-topk 8`
+  - `--num-experts 256`
+
+第一次大配置结果:
+
+- 日志:
+  - rank0:`/tmp/uccl_gin_deepep_ep8x2_readme_rank0.log`
+  - rank1:`/tmp/uccl_gin_deepep_ep8x2_readme_rank1.log`
+- 失败:
+  `dispatch_copy_epilogue.cuh:106, condition: ptx::deduplicate(dst_expert_idx, lane_idx) or dst_expert_idx == -1`
+- 这个错误和之前 payload/tail 不同 queue 的症状一样,但当时 payload 和 tail 已经固定
+  到同一 `channel_idx` queue。
+
+代码检查结论:
+
+- `post_gpu_commands_mixed()` 会按 command 类型分桶:
+  - 先收集所有 `WRITE`
+  - 再收集所有 `ATOMIC`
+  - post 时先 post RDMA WRITE batch,再 post ATOMIC batch
+- 但是没有等待 WRITE CQE 就 post ATOMIC。
+- UCCL-GIN 的 tail 用 `rail_red_add()` 表达 NCCL-GIN 的 `red_add_rel`。
+  `rel` 语义要求 tail 可见时,前面的 payload WRITE 已经对 receiver 可见。
+- EFA/SRD 下“先 post WRITE,后 post ATOMIC”不等于“receiver 先看到 payload,再看到
+  tail”;大配置中 forward warp 会按 tail 读取到还没完成的 payload,最终 epilogue
+  看到坏的 topk metadata。
+
+修复:
+
+- 在 `ep/src/proxy.cpp::post_gpu_commands_mixed()` 中,如果同一批 command 里存在
+  ATOMIC tail:
+  - RDMA WRITE batch post 后,把本批 `rdma_wrs` 放入 `pending_release_wrs`。
+  - 持续 `poll_cq_dual()`。
+  - 每轮从 `acked_wrs_` 中移除已完成的本批 WRITE。
+  - 调 `notify_gpu_completion()` 正常推进 GPU ring tail。
+  - 等本批 WRITE 全部 CQE 到达后,再 post ATOMIC batch。
+- 这个是 UCCL-GIN Rail `red_add_rel` 的正式 release 语义,不是调试 fallback。
+- 代价:当前实现是 per proxy batch 的 coarse release fence,性能会受影响;后续可以做
+  per-ring/per-destination 的更细 fence 或 coalesced tail,但 correctness 语义必须保留。
+
+构建注意:
+
+- 两台机器并行 `make -C ep install` 会在共享 EFS 上同时链接同一个 `ep.abi3.so`,
+  触发:
+  `final link failed: Stale file handle`
+- 解决:顺序构建/安装。
+  - `p5en_0`:先 `rm -f ep/ep.abi3.so`,再 `make -C ep install ...` 通过。
+  - `p5en_1`:随后 `make -C ep install ...` 通过。
+
+第二次大配置结果:
+
+- GPU 空闲检查:
+  - `p5en_0`:8 张 GPU 均 `0 MiB/0%`
+  - `p5en_1`:8 张 GPU 均 `0 MiB/0%`
+- 命令核心:
+  `DEEPEP_USE_UCCL_GIN=1 EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN`
+  `python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py`
+  `--num-processes 8 --test-first-only --num-sms 20 --num-tokens 8192`
+  `--hidden 7168 --num-topk 8 --num-experts 256`
+- 结果:
+  - rank0 exit code `0`
+  - rank1 exit code `0`
+- 日志:
+  - rank0:`/tmp/uccl_gin_deepep_ep8x2_readme_rank0.log`
+  - rank1:`/tmp/uccl_gin_deepep_ep8x2_readme_rank1.log`
+
+README-like 性能摘录:
+
+- dispatch:
+  - rank0 local ranks:约 `22 GB/s (SO)`, `70-73 GB/s (SU)`,
+    `~5.5-5.6 ms`,每 rank 约 `396-402 MB`
+  - rank1 local ranks:多数约 `14 GB/s (SO)`, `45-46 GB/s (SU)`,
+    `~8.8 ms`;local rank 4/EP12 约 `22 GB/s (SO)`
+- expanded dispatch:
+  - rank0:约 `22 GB/s (SO)`, `71-73 GB/s (SU)`, `~5.5 ms`
+  - rank1:多数约 `14 GB/s (SO)`,EP12 约 `22 GB/s (SO)`
+- cached dispatch:
+  - rank0:约 `22 GB/s (SO)`, `71-73 GB/s (SU)`
+  - rank1:多数约 `14 GB/s (SO)`,EP12 约 `22 GB/s (SO)`
+- combine/reduced combine:
+  - rank0:约 `13-22 GB/s (SO)`
+  - rank1:约 `11-17 GB/s (SO)`
+
+当前结论:
+
+- UCCL-GIN Rail backend 已能通过真实 DeepEP V2 EP8x2 README-like first-case
+  correctness 和 perf 输出。
+- 当前 dispatch 已明显高于之前 aws-ofi-nccl proxy GIN 的 DeepEP V2 `~5 GB/s`
+  级别,但仍未接近 README CX7/IB 的 `~90 GB/s`。
+- 下一步优化应聚焦:
+  - release fence 粒度太粗,导致 tail 发布等待整批 WRITE CQE。
+  - 仅 4 proxy threads/queues 时,80 channels 会在 4 条 CPU proxy/CQ 路径上排队。
+  - rank1 大多数 local rank 只有 `14 GB/s`,存在明显 per-rank/NIC/proxy 不均衡。
+  - 需要加 dispatch-only 分段计时和 proxy profile,区分 transport、notify、forward、
+    epilogue 和 release-fence wait 的耗时。
