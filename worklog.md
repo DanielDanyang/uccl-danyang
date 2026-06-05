@@ -1335,3 +1335,58 @@ README-like 性能摘录:
   - rank1 大多数 local rank 只有 `14 GB/s`,存在明显 per-rank/NIC/proxy 不均衡。
   - 需要加 dispatch-only 分段计时和 proxy profile,区分 transport、notify、forward、
     epilogue 和 release-fence wait 的耗时。
+
+## 2026-06-05:打开 UCCL proxy command profile
+
+目的:
+
+- 复用已有 `UCCL_PROXY_PROFILE_COMMANDS=1`,先不加新 profiling 代码。
+- 同配置重跑 README-like EP8x2,观察 proxy thread 的 WR/atomic 分布。
+
+命令差异:
+
+- 在上一节 README-like EP8x2 环境上额外设置:
+  `UCCL_PROXY_PROFILE_COMMANDS=1`
+- 日志:
+  - rank0:`/tmp/uccl_gin_deepep_ep8x2_profile_rank0.log`
+  - rank1:`/tmp/uccl_gin_deepep_ep8x2_profile_rank1.log`
+- 结果:
+  - rank0 exit code `0`
+  - rank1 exit code `0`
+
+性能稳定性:
+
+- rank0 dispatch 仍约 `22 GB/s (SO)`,`~5.5 ms`。
+- rank1 除 EP12 外,多数 dispatch 仍约 `14 GB/s (SO)`,`~8.8 ms`。
+- 打开 command profile 没有改变 correctness。
+
+proxy profile 观察:
+
+- 每个 global rank 有 4 个 proxy thread,每个 thread 显示 `rings=8`。
+- thread 0/1 明显比 thread 2/3 更忙:
+  - thread 0/1 典型:
+    - `write_cmds ~= 457k-458k`
+    - `atomic_cmds ~= 155k-156k`
+    - `write_bytes ~= 3.44 GB`(整个测试进程累计)
+  - thread 2/3 典型:
+    - `write_cmds ~= 303k-306k`
+    - `atomic_cmds ~= 103k-104k`
+    - `write_bytes ~= 2.28-2.30 GB`
+- 这不是单个 rank 的偶然现象,rank0 节点和 rank1 节点都类似。
+
+结论:
+
+- 当前 channel/proxy queue 映射存在约 `1.5x` 的 proxy thread 负载不均。
+- 由于 `UCCL_PROXY_PROFILE` 的 `seconds` 覆盖整个测试进程生命周期,其中包含 Python
+  correctness/perf 多阶段时间,`write_GBps` 绝对值不适合作为 transport 带宽;更有用的是
+  command 数量和 per-thread 分布。
+- 下一步代码优化建议:
+  - 检查 `init_uccl_gin()` 构造的 `num_queues` 与每个 proxy 的 `rings=8` 对应关系。
+  - 检查 `lane_hint=channel_idx` 经过 `num_queues` 取模后是否均匀落到 4 个 proxy
+    thread;如果 device array 是 proxy-major/ring-major 排列,需要确认映射没有把 80
+    channels 偏到前两个 proxy。
+  - notify 的 scaleout count 仍默认 lane 0,会额外压 thread 0;可以把 notify count
+    按 `dst_scaleout_rank_idx` 或 count index 显式分散到 queues,但必须保持 count
+    WRITE 和对应 wait 语义正确。
+  - release fence 应从“本批有 ATOMIC 就等所有 WRITE”改成 per-ring/per-tail-word
+    fence,避免一个 busy ring 拖住同 proxy batch 里的其他 ring。
