@@ -85,9 +85,10 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     }
 }
 
-template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
+template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles,
+          int kTag = kDeviceBarrierTag, typename Gin = handle::NCCLGin>
 __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
-    const handle::NCCLGin& gin,
+    const Gin& gin,
     const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     // This barrier only uses 1 SM
@@ -101,7 +102,7 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (thread_idx < kNumRanks) {
         const auto dst_ptr =
-            gin.get_sym_ptr<ncclTeamTagLsa>(workspace.get_nvl_barrier_signal_ptr(phase), thread_idx);
+            gin.template get_sym_ptr<ncclTeamTagLsa>(workspace.get_nvl_barrier_signal_ptr(phase), thread_idx);
         ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1);
     }
     __syncthreads();
@@ -181,13 +182,14 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
 }
 
 template <bool kIsScaleupNVLink, int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs,
-          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag, bool kFlushStores = true>
+          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag, bool kFlushStores = true,
+          typename Gin = handle::NCCLGin>
 __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
-    const handle::NCCLGin& gin,
+    const Gin& gin,
     const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     if constexpr (kIsScaleupNVLink) {
-        nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag>(
+        nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag, Gin>(
             gin, workspace, rank_idx, sm_idx, thread_idx);
     } else {
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
@@ -196,9 +198,9 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
-          bool kFlushStores = true>
+          bool kFlushStores = true, typename Gin = handle::NCCLGin>
 __forceinline__ __device__ void scaleout_barrier_wo_local_sync(
-    const handle::NCCLGin& gin,
+    const Gin& gin,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
     gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
@@ -209,8 +211,9 @@ template <bool kIsScaleupNVLink,
           int kNumScaleoutRanks, int kNumScaleupRanks,
           int kNumSMs, int kNumThreads, int kNumQPs,
           int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
-          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true>
-__forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
+          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true,
+          typename Gin = handle::NCCLGin>
+__forceinline__ __device__ void gpu_barrier(const Gin& gin,
                                             const layout::WorkspaceLayout& workspace,
                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                             const int& sm_idx, const int& thread_idx,
@@ -236,7 +239,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
         EP_DEVICE_ASSERT(kNumSMs >= 2 and "At least 2 SMs for a hybrid barrier");
         if (sm_idx == 0) {
             // First SM do the scaleup barrier
-            scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+            scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores, Gin>(
                 gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
 
             // We need an extra grid sync, as the scaleout barrier will do a sync after flush, before the barrier
@@ -245,16 +248,16 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
                 cooperative_groups::this_grid().sync();
         } else {
             // The remaining SMs do the scaleout barrier
-            scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+            scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores, Gin>(
                 gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
         }
     } else if (do_scaleup) {
         // Scaleup only
-        scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+        scaleup_barrier_wo_local_sync<kIsScaleupNVLink, kNumScaleupRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores, Gin>(
             gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
     } else if (do_scaleout) {
         // Scaleout only
-        scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
+        scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores, Gin>(
             gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
     }
 

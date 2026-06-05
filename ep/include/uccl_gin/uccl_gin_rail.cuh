@@ -1,0 +1,87 @@
+#pragma once
+//
+// UCCL-GIN Rail device backend (P0 seed).
+//
+// Minimal device-side ops for the EFA `Rail` (scale-out / inter-node) path of
+// the planned `handle::UCCLGin`. They push the old 16B `TransferCmd` into a
+// host-pinned D2H ring (`d2hq::D2HHandle`); the UCCL CPU proxy drains the ring
+// and posts EFA verbs. This header is intentionally lean (only D2H ring + cstdint)
+// so it can later be #included by the JIT-compiled DeepEP kernels too.
+//
+// Covered now (per the standalone microbench scope): put + red_add_rel.
+// Not yet: put_value / signal / wait / flush / coalescing (see uccl_gin_plan.md).
+//
+// Offset conventions (must match ep/src/rdma.cpp):
+//   * put (WRITE): req_lptr/req_rptr are window offsets shifted right by
+//     kWriteAddrShiftNormal (=2, 4-byte granularity), relative to the single
+//     registered window base.
+//   * red_add (ordered ATOMIC): value = signed delta (must fit 15 bits),
+//     req_rptr = RAW byte offset of the counter inside the receiver's atomic
+//     buffer (<= AtomicsImm::kOFF_MASK), atomic_offset = 1 (non-zero => the
+//     proxy takes the PackAtomicWithSeq ordered path).
+
+#include "../ring_buffer.cuh"        // TransferCmd, CmdType, make_cmd_type, kWriteAddrShiftNormal
+#include "../d2h_queue_device.cuh"   // d2hq::D2HHandle
+#include <cstdint>
+
+namespace uccl_gin {
+
+static constexpr uint32_t kAtomicOffMask = 0x1FFFu;
+static constexpr int kAtomicValueMin = -(1 << 14);
+static constexpr int kAtomicValueMax = (1 << 14) - 1;
+
+// Window offset (4-byte shifted) for a payload pointer relative to window base.
+__device__ __forceinline__ uint32_t window_off(uint64_t addr, uint64_t window_base) {
+  if (addr < window_base || ((addr - window_base) & ((1u << kWriteAddrShiftNormal) - 1u))) {
+    __trap();
+  }
+  const uint64_t shifted = (addr - window_base) >> kWriteAddrShiftNormal;
+  if (shifted > 0xFFFFFFFFull) {
+    __trap();
+  }
+  return static_cast<uint32_t>(shifted);
+}
+
+// Rail put: one-sided WRITE of `bytes` from local window offset -> remote window
+// offset on global rank `dst_rank`. Both offsets are already 4-byte shifted
+// (use window_off()). Returns the D2H ring slot it landed in.
+__device__ __forceinline__ uint64_t rail_put(d2hq::D2HHandle* q, int dst_rank,
+                                             uint32_t bytes,
+                                             uint32_t local_off_shifted,
+                                             uint32_t remote_off_shifted) {
+  TransferCmd cmd{};
+  cmd.cmd_type = make_cmd_type(CmdType::WRITE, /*is_combine=*/false,
+                               /*low_latency=*/false);
+  cmd.dst_rank = static_cast<uint8_t>(dst_rank);
+  cmd.bytes = bytes;
+  cmd.req_lptr = local_off_shifted;
+  cmd.req_rptr = remote_off_shifted;
+  uint64_t slot = 0;
+  q->atomic_set_and_commit(cmd, &slot);
+  return slot;
+}
+
+// Rail red_add_rel: ordered remote atomic add of `delta` to the int64 counter at
+// `atomic_byte_off` inside the receiver's atomic buffer on global rank `dst_rank`.
+// The proxy applies it in seq order (PackAtomicWithSeq) so a stream of adds to
+// the same counter cannot be reordered. `delta` must fit 15 bits.
+__device__ __forceinline__ uint64_t rail_red_add(d2hq::D2HHandle* q, int dst_rank,
+                                                 int delta,
+                                                 uint32_t atomic_byte_off) {
+  if (delta < kAtomicValueMin || delta > kAtomicValueMax ||
+      atomic_byte_off > kAtomicOffMask || (atomic_byte_off & 0x7u)) {
+    __trap();
+  }
+  TransferCmd cmd{};
+  cmd.cmd_type = make_cmd_type(CmdType::ATOMIC, /*is_combine=*/false,
+                               /*low_latency=*/false);
+  cmd.dst_rank = static_cast<uint8_t>(dst_rank);
+  cmd.value = delta;               // unions with req_lptr; proxy reads cmd.value
+  cmd.req_rptr = atomic_byte_off;  // RAW byte offset into receiver atomic buffer
+  cmd.atomic_offset = 1;           // non-zero => ordered (PackAtomicWithSeq) path
+  uint64_t slot = 0;
+  q->atomic_set_and_commit(cmd, &slot);
+  return slot;
+}
+
+}  // namespace uccl_gin

@@ -816,3 +816,206 @@ EFA 的硬骨头(无 atomic→有序软原子、小消息→coalescing、barrier
 按 `uccl_gin_plan.md`:P0 抽 `uccl_gin_rail.cuh`(收纳现有 v2_d2h_* / PackAtomicWithSeq)→
 P1 `handle::UCCLGin` 骨架(Lsa 复用 NCCLGin、Rail 调 P0)→ P2 thirdparty 极小 patch
 (`DEEPEP_GIN_T` 可替换)接通 dispatch、删 800 行 fork → P3 proxy 侧 coalescing → P4 combine。
+
+## 2026-06-04:UCCL-GIN Rail API 独立微基准(不接 DeepEP,对比 NCCL-GIN)
+
+目标:先把 UCCL-GIN 的几个 Rail op 独立出来测,和直接 NCCL-GIN 对比,确认 API 本身,
+再谈接进 DeepEP。决策:**形态 A(纯 C++/CUDA standalone,两条路一个 MPI 程序),
+第一版只覆盖 put + red_add_rel**。
+
+写好的文件(本地写,无法本地编译,需上服务器 compile-iterate):
+
+- `ep/include/uccl_gin/uccl_gin_rail.cuh`(L1 backend):device `rail_put`(WRITE,
+  window offset >>2)、`rail_red_add`(ordered ATOMIC:`value=delta`、
+  `req_rptr=atomic-buf 字节 offset`、`atomic_offset=1` 触发 PackAtomicWithSeq)。
+  字段语义对照 `ep/src/rdma.cpp:2907-2936` 的 ATOMIC 编码确认过。
+- `ep/include/uccl_gin/resources.cuh`:`UCCLGinResources` POD(d2h_queues/num_queues/
+  window_base/atomic_tail_base/topology),一次注入,稳定 ABI。
+- `ep/include/uccl_gin/uccl_gin.cuh`:**`handle::UCCLGin` 抽象**——镜像 DeepEP
+  `handle::NCCLGin` 的方法签名(`gin.put<Team>` / `gin.red_add_rel<Team>`,team tag 用
+  `ncclTeamTagRail/Lsa`)。v1 实现 Rail 的 put+red_add(调 L1 backend),Lsa 与
+  put_value/signal/wait/flush 先 `__trap()` 占位(P1 补)。**这才是被测的抽象**;微基准
+  通过它调用,和 NCCL 路的 `gin.put(...)` 调用面对称。
+- `ep/tests/uccl_gin_microbench/microbench.cu`:MPI rendezvous + paired-remote
+  workload;NCCL-GIN 路(`ncclMemAlloc`+window+`ncclDevComm`(GIN)+`ncclGin.put(SignalInc)`,
+  仿 `nccl/docs/examples/06_device_api/02_alltoall_gin/main.cu`)与 UCCL-GIN 路
+  (`UcclProxy`+D2H ring+`rail_put/rail_red_add`)同程序对比;size sweep 打印 per-rank GB/s。
+- `Makefile`(复用 `ep/src/*.o`,链 NCCL/EFA/MPI)、`README.md`(build/run/已知缺口)。
+
+API grounding(读过并对齐):`uccl_proxy.hpp`(UcclProxy ctor/set_peers_meta/
+start_dual/get_d2h_channel_device_addrs)、`d2h_queue_device.cuh`(D2HHandle.
+atomic_set_and_commit)、`ring_buffer.cuh`(TransferCmd/make_cmd_type/shift)、
+`proxy.hpp`(PeerMeta)、NCCL `nccl_device.h` 示例。
+
+**已知缺口(README 里列了,上服务器要验/补)**:
+1. NCCL device 链接可能要 device runtime lib(不止 `-lnccl`),GIN 需 aws-ofi-nccl master。
+2. UCCL proxy bootstrap 的 PeerMeta OOB 用 MPI_Allgather + enp71s0 IP(替代 Python
+   all_gather_object);start_dual 后可能要 settle。
+3. **timing 语义**:cudaEvent 只计 kernel enqueue,UCCL put 是异步(proxy drain);
+   真 end-to-end BW 要等 receiver 收齐(counter),不能只 streamSync。v1 先 sync+barrier,
+   服务器上要改成等 counter 再信 GB/s。
+4. correctness 校验在 main 里是 TODO(拷回 recv + counter 对比 rank-tagged 数据)。
+5. 两路都单 stream(1 CTA / 1 D2H lane)做 apples-to-apples;多 lane/CTA fan-out +
+   coalescing 是后续 sweep。
+
+参考点(AGENTS.md):NCCL-GIN 大包 ~44 GB/s/rank,16KiB ~8.8、32KiB ~12.5(单流);
+UCCL per-token 未合并 ~30。微基准把同一组 op 隔离出来,好把差距归因(op 开销 vs
+coalescing vs proxy rate)。
+
+## 2026-06-05:uccl-gin branch 服务器编译与 smoke
+
+操作:
+
+- 远端 `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang` 切到 `uccl-gin`
+  branch,HEAD=`5abc0810`。同步本地新增的 `ep/include/uccl_gin/`、
+  `ep/tests/uccl_gin_microbench/` 和 `worklog.md`。
+- 编译主 `ep`:  
+  `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+  通过。只有既有 warning(nanobind 宏重定义、`proxy.cpp` write return、optional
+  maybe-uninitialized)。
+- 编译 microbench:  
+  `make -C ep/tests/uccl_gin_microbench PYTHON=$VIRTUAL_ENV/bin/python CUDA_HOME=/usr/local/cuda-13.0`
+  通过。
+
+编译/代码 review 中修掉的问题:
+
+- Makefile 不能假设 `mpicxx` 在 PATH。改为优先用 `/opt/amazon/openmpi5/bin/mpicxx`
+  并显式加 `MPI_INC/MPI_LIB`。
+- `nvcc` 不接受 OpenMPI wrapper 给出的 `-Wl,...`;改成 `-Xlinker`。
+- NCCL wheel 只有 `libnccl.so.2`,没有 `libnccl.so`;改为链接 `-l:libnccl.so.2`。
+- `rdma.o` 用到 `efadv_create_qp_ex`,需要链接 `-lefa`。
+- NCCL header 必须让 wheel include path 排在 repo include 前面,并加
+  `-DNCCL_CHECK_CUDACC=1`,否则会看不到 `ncclGin/ncclDevCommRequirements`。
+- 默认 build 开了 `USE_MSCCLPP_FIFO_BACKEND`,D2H 资源不能用
+  `get_d2h_channel_device_addrs()+init_from_dev_ptr`;改为
+  `get_d2h_channel_handle_addrs()` 并把 device `D2HHandle*` 指针数组传进
+  `UCCLGinResources`。
+- NCCL-GIN reference kernel 里 `waitSignal(ncclCoopCta())/flush(ncclCoopCta())`
+  原先只在 `threadIdx.x==0` 调用,会卡死;改为 CTA 全线程参与 cooperative op。
+- UCCL 原 timing 只计 kernel enqueue,会出现 1MiB `481 GB/s` 这种假数;改成
+  CPU wall-clock 并等待 receiver-side atomic counter 到 1 后停表。
+- `uccl_gin_rail.cuh` 补了 device-side guard:window offset 不能低于 base/必须 4B
+  对齐/shift 后要进 32bit;ordered atomic 的 offset 必须 <=8191 且 8B 对齐,delta
+  必须进 15bit signed。
+- `UCCLGin::lane()` 补 `num_queues>0 && d2h_queues!=nullptr` guard。
+
+运行日志:
+
+- UCCL 2 节点 x 1 GPU bootstrap smoke:
+  `/tmp/uccl_gin_microbench_smoke_2node_uccl.log`。能启动并走到 proxy/RDMA,但这个
+  rank layout 不符合 UCCL normal-mode 的 `rank±MAX_NUM_GPUS` 假设,不能作为完整
+  drain 测试。
+- NCCL 2 节点 x 1 GPU smoke:
+  `/tmp/uccl_gin_microbench_smoke_2node_nccl.log`。修 cooperative wait 后能完成。
+- UCCL 2 节点 x 1 GPU counter-wait 尝试:
+  `/tmp/uccl_gin_microbench_sweep_2node_1gpu_counter_wait.log`。暴露
+  `Posting rdma to a different rank` abort,根因是 1-rank/node 的 peer rank diff=1,
+  而原 transport normal mode 要求跨节点同 local rank diff=`MAX_NUM_GPUS`(8)。
+- EP16 UCCL-only counter-wait:
+  `/tmp/uccl_gin_microbench_ep16_uccl_counter_wait.log`
+  - 4KiB: `0.58 GB/s/rank`
+  - 16KiB: `4.00 GB/s/rank`
+  - 64KiB: `11.79 GB/s/rank`
+- EP16 NCCL-only reference:
+  `/tmp/uccl_gin_microbench_ep16_nccl.log`
+  - 4KiB: `0.14 GB/s/rank`
+  - 16KiB: `0.57 GB/s/rank`
+  - 64KiB: `2.31 GB/s/rank`
+
+结论:
+
+- `UCCLGinResources -> UCCLGin -> old TransferCmd -> UcclProxy/EFA` 的 standalone
+  Rail put+red_add 路径已经能在 EP16 跑通,并且使用了每 GPU 对应的 EFA NIC。
+- 当前 microbench 还没有 payload correctness check;只通过 receiver counter 表明
+  proxy drain + receiver atomic 已完成。下一步应补 recv buffer 校验,再做多 CTA/lane、
+  coalescing 和 DeepEP V2 kernel call-site 替换。
+
+## 2026-06-05:回主线 P1 —— 忠实 drop-in `handle::UCCLGin` + drop-in 局限性发现
+
+微基准初步验证够了(EP16 隔离 put+red_add,UCCL 比 NCCL-GIN 快 4–7×,方向成立)。回主线做 P1。
+
+- 完整读了 `deep_ep/common/handle.cuh` 的 `handle::NCCLGin` 接口。
+- 新增 `ep/include/uccl_gin/uccl_gin_handle.cuh`:`deep_ep::elastic::handle::UCCLGin`,
+  **组合一个 NCCLGin**(Lsa/World/barrier/get/signal/wait/flush 全部委托,语义不变),
+  **只重写 Rail 分支**;签名与 NCCLGin 对齐,目标是 kernel call site 不改、只换 gin 类型。
+- 标准版微基准仍用 lean `uccl_gin.cuh`(Rail-only);drop-in 用这个新 handle。
+
+**关键发现:drop-in 命题比 plan 原来说的弱——只有 `put<Rail>` 是干净的换类型;
+`red_add_rel<Rail>`(tail)和 `put_value<Rail>` 不是透明 drop-in:**
+- NCCL 的 `red_add_rel<Rail>` 在 receiver GPU 上对 *window* 做 add(`gin.signal(VASignalAdd)`);
+  UCCL 的有序原子是 receiver *CPU proxy* 对 *host-mapped atomic buffer* 做 fetch_add
+  (CPU 不能 fetch_add 设备 HBM 的 window)。
+- 而且 ordered-atomic immediate 的 offset 字段只有 ~13 bit(≤8191),装不下 window tail
+  的大 offset;必须用**紧凑 (channel, src-rank) 索引**(就是删掉的 fork 里 `v2_atomic_tail_ptr`)。
+  这个索引无法只从 `sym_ptr` 还原。
+- 还有 receiver 侧:forward warp 读 tail 的位置也得从 window 改成 atomic_tail_base 的同一
+  紧凑槽。
+- 结论:`red_add_rel<Rail>` 在 handle 里先 `__trap()` + 文档;另给一个显式
+  `rail_tail_add(channel, src_rank, dst_scaleout, delta)` 供 P2 kernel patch 调用。
+  `put_value<Rail>` 同样先 trap(需要 local source 暂存,P2 接 notify count 路径时补)。
+
+所以 **P2 不是"只换 gin 类型",而是 = 换 gin 类型 + patch tail 写/读两侧成紧凑索引 op +
+comm.cuh barrier 模板化**。put(payload,占绝大多数字节)是干净换;tail/count(signaling)
+需要 kernel 配合。这不影响方向(put 是 BW 主体),但要在 plan 里写清。
+
+## 2026-06-05:回主线 P2 device-side dispatch patch(不继续 microbench)
+
+用户明确说 microbench 差不多即可,回到主线。停止继续扩 microbench/correctness,开始接
+DeepEP V2 dispatch。
+
+代码推进:
+
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/common/comm.cuh`
+  - `nvlink_barrier_wo_local_sync / scaleup_barrier_wo_local_sync /
+    scaleout_barrier_wo_local_sync / gpu_barrier` 的 gin 参数从硬写
+    `const handle::NCCLGin&` 改成模板 `const Gin&`(default 仍是 NCCLGin)。
+  - 默认上游调用不需要变;UCCLGin 只要暴露 `nccl_dev_comm` 和 Lsa `get_sym_ptr`,
+    scaleup/NVLink barrier 就可继续复用原逻辑。
+
+- `ep/include/uccl_gin/uccl_gin_handle.cuh`
+  - `UCCLGin` 增加 `nccl_dev_comm/nccl_window` 引用,兼容 `comm.cuh`。
+  - 增加 compact tail helpers:
+    - `rail_tail_offset(channel, src_scaleout)`
+    - `rail_tail_ptr(channel, src_scaleout)`
+    - `decode_rail_tail(raw, finish, count)`
+    - `rail_tail_add(channel, src, dst, count_delta, finish)`
+  - tail 编码决定:
+    - ordinary update: `+ count_delta`
+    - final update: `+ 8192 + count_delta`
+    - receiver: `finish = raw >= 8192`, `count = raw - finish*8192`
+  - 这样 finish/count 走同一个 compact slot,PackAtomicWithSeq 对同一 index 保序,
+    避免两 slot 的 finish-vs-count 乱序问题。
+
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - 在 `DEEPEP_USE_UCCL_GIN` 宏打开时 include `uccl_gin_handle.cuh`。
+  - kernel signature 在宏打开时多一个 `uccl_gin::UCCLGinResources` 参数。
+  - 构造 `handle::UCCLGin(nccl_dev_comm, nccl_window, resources, qp_idx, sharing_mode)`。
+  - kernel 开始时清零 compact tail slots(`kNumChannels * kNumScaleoutRanks`)。
+  - scaleout warp tail write 从 `gin.red_add_rel<Rail>(packed_tail_delta)` 改为
+    `gin.rail_tail_add(...)`。
+  - forward warp tail read 从 workspace packed tail 改为读 `gin.rail_tail_ptr(...)`
+    并 `decode_rail_tail(...)`。
+  - 默认宏不开时原 NCCL-GIN 路径完全保持。
+
+- `ep/docs/uccl_gin_plan.md`
+  - 修正旧说法:`red_add_rel<Rail>`/`put_value<Rail>` 不是透明 drop-in。
+  - 记录 compact tail 编码和 P2 真实 patch 面。
+
+服务器验证:
+
+- 同步到 `p5en_0:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang`。
+- 默认 `ep` 构建通过:
+  `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+- 用临时 TU 实例化 `DEEPEP_USE_UCCL_GIN` 的 `hybrid_dispatch_impl`:
+  `/tmp/uccl_gin_hybrid_dispatch_compile.cu`
+  编译命令核心:
+  `nvcc -std=c++20 --expt-relaxed-constexpr -arch=sm_90 -DNCCL_CHECK_CUDACC=1 ... -c`
+  结果通过,产物 `/tmp/uccl_gin_hybrid_dispatch_compile.o`。
+
+当前剩余主线缺口:
+
+- host/JIT 侧还没有把真实 `UCCLGinResources` 传进 `launch_dispatch`。
+- Python/ElasticBuffer 侧还没有启动 UcclProxy 并构造 device-side
+  `UCCLGinResources` 给 DeepEP V2 JIT kernel。
+- `put_value<Rail>` 仍未接 notify/count path;hybrid dispatch 当前 notify scaleout
+  用的是 `put<Rail>` 两条 count buffer WRITE,所以 dispatch payload/tail 主路径可先继续。

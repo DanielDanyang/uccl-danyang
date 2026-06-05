@@ -7,6 +7,9 @@
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 
+#ifdef DEEPEP_USE_UCCL_GIN
+#include <uccl_gin/uccl_gin_handle.cuh>
+#endif
 
 namespace deep_ep::elastic {
 
@@ -43,6 +46,9 @@ hybrid_dispatch_impl(
     const int sf_token_stride, const int sf_hidden_stride,
     // TODO(NCCL): so many params, plans to optimize?
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
+#ifdef DEEPEP_USE_UCCL_GIN
+    const uccl_gin::UCCLGinResources uccl_gin_resources,
+#endif
     void* buffer,
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx) {
@@ -75,7 +81,22 @@ hybrid_dispatch_impl(
     // Each warp is a channel
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, (kNumNotifyWarps > 0)>(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
+#ifdef DEEPEP_USE_UCCL_GIN
+    EP_STATIC_ASSERT(kScaleoutUpdateInterval + handle::kUCCLGinTailFinishDelta <= uccl_gin::kAtomicValueMax,
+                     "UCCL-GIN tail delta must fit the ordered atomic immediate");
+    EP_STATIC_ASSERT(kNumChannels * kNumScaleoutRanks * sizeof(int64_t) <= uccl_gin::kAtomicOffMask + 1,
+                     "UCCL-GIN compact tail buffer must fit the ordered atomic offset field");
+    const auto gin = handle::UCCLGin(nccl_dev_comm, nccl_window, uccl_gin_resources, qp_idx, sharing_mode);
+
+    // The receiver forward warp reads compact software-atomic tails from the
+    // host-mapped atomic buffer. Clear the compact slots at kernel start because
+    // they are not part of DeepEP's normal workspace cleanup.
+    for (int i = sm_idx * kNumThreads + thread_idx; i < kNumChannels * kNumScaleoutRanks; i += kNumSMs * kNumThreads)
+        reinterpret_cast<int64_t*>(uccl_gin_resources.atomic_tail_base)[i] = 0;
+    cooperative_groups::this_grid().sync();
+#else
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+#endif
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
@@ -333,6 +354,10 @@ hybrid_dispatch_impl(
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx < kNumScaleoutRanks and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
+                const auto tail_delta = stored_scaleout_tail - stored_old_scaleout_tail;
+#ifdef DEEPEP_USE_UCCL_GIN
+                gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx, tail_delta, finish_flag, channel_idx);
+#else
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
@@ -340,6 +365,7 @@ hybrid_dispatch_impl(
                 // NOTES: the "release" scope will be `sys` for the local rank (we may involve NVLink so not `gpu`)
                 // For RDMA requests, "release" is ensured by "atomic"
                 gin.red_add_rel<ncclTeamTagRail>(ptr, signaled_tail - old_signaled_tail, lane_idx);
+#endif
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();
@@ -512,9 +538,15 @@ hybrid_dispatch_impl(
 
                 // Read new signaled tails
                 if (lane_idx < kNumScaleoutRanks) {
+#ifdef DEEPEP_USE_UCCL_GIN
+                    const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
+                        gin.rail_tail_ptr(channel_idx, lane_idx));
+                    gin.decode_rail_tail(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
+#else
                     const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
                         workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
                     math::unpack2<int, int64_t>(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
+#endif
                 }
                 __syncwarp();
                 return false;
@@ -648,8 +680,13 @@ hybrid_dispatch_impl(
         __syncwarp();
 
         // Clean tails for next usages
-        if (lane_idx < kNumScaleoutRanks)
+        if (lane_idx < kNumScaleoutRanks) {
+#ifdef DEEPEP_USE_UCCL_GIN
+            *gin.rail_tail_ptr(channel_idx, lane_idx) = 0;
+#else
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
+#endif
+        }
         __syncwarp();
     }
 
