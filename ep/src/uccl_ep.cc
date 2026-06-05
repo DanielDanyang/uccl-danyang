@@ -73,10 +73,15 @@ class UCCLGinResourceHandle {
 
     // Match the microbench and legacy UCCL/EP setup: all proxy threads share
     // proxy 0's ordered software-atomic buffer.
-    atomic_tail_base_ = proxy_ptrs.front()->get_atomic_buffer_addr();
+    const auto atomic_tail_host_base = proxy_ptrs.front()->get_atomic_buffer_addr();
     for (auto* proxy : proxy_ptrs) {
-      proxy->set_atomic_buffer_addr(atomic_tail_base_);
+      proxy->set_atomic_buffer_addr(atomic_tail_host_base);
     }
+    void* atomic_tail_device_ptr = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&atomic_tail_device_ptr,
+                                        reinterpret_cast<void*>(atomic_tail_host_base),
+                                        0));
+    atomic_tail_base_ = reinterpret_cast<uint64_t>(atomic_tail_device_ptr);
 
     std::vector<uint64_t> device_handle_addrs;
     for (auto* proxy : proxy_ptrs) {

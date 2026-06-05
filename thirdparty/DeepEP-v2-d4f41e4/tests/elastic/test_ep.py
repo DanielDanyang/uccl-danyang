@@ -488,6 +488,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                      num_cpu_timeout_secs=args.num_cpu_timeout_secs)
 
     buffer = construct_elastic_buffer()
+    if int(os.getenv('DEEPEP_USE_UCCL_GIN', '0')):
+        buffer.init_uccl_gin()
 
     # Warning in case of precise unbalanced ratio
     if args.precise_unbalanced_ratio:

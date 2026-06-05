@@ -189,6 +189,9 @@ hybrid_dispatch_impl(
                     return false;
                 });
             }
+#ifdef DEEPEP_USE_UCCL_GIN
+            __threadfence_system();
+#endif
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Issue scaleout writes to peers
@@ -467,12 +470,23 @@ hybrid_dispatch_impl(
 
             // Issue IBGDA requests
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
+#ifdef DEEPEP_USE_UCCL_GIN
+                gin.put<ncclTeamTagRail>(
+                        scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+                        scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
+                        tma_buffer.get_num_bytes<false>(),
+                        stored_dst_scaleout_rank_idx,
+                        ncclGinOptFlagsAggregateRequests,
+                        ncclGin_None(),
+                        channel_idx);
+#else
                 gin.put<ncclTeamTagRail>(
                         scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                         scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
                         tma_buffer.get_num_bytes<false>(),
                         stored_dst_scaleout_rank_idx,
                         ncclGinOptFlagsAggregateRequests);
+#endif
             }
             __syncwarp();
 

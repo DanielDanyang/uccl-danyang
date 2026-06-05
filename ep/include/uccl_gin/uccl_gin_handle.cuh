@@ -88,6 +88,23 @@ struct UCCLGin {
       static_assert(std::is_same_v<remote_action_t, ncclGin_None>,
                     "UCCLGin: Rail put with remote_action not supported (use red_add_rel)");
       (void)extra_options;  // AggregateRequests handled by our own coalescing (P3)
+      if (dst_rank_idx == res.scaleout_rank) {
+        auto* dst32 = reinterpret_cast<uint32_t*>(recv_sym_ptr);
+        const auto* src32 = reinterpret_cast<const uint32_t*>(send_sym_ptr);
+        const int words = num_bytes / static_cast<int>(sizeof(uint32_t));
+        for (int i = 0; i < words; ++i) dst32[i] = src32[i];
+        auto* dst8 = reinterpret_cast<uint8_t*>(recv_sym_ptr) + words * sizeof(uint32_t);
+        const auto* src8 = reinterpret_cast<const uint8_t*>(send_sym_ptr) + words * sizeof(uint32_t);
+        for (int i = words * static_cast<int>(sizeof(uint32_t)); i < num_bytes; ++i)
+          dst8[i - words * static_cast<int>(sizeof(uint32_t))] =
+              src8[i - words * static_cast<int>(sizeof(uint32_t))];
+        __threadfence_system();
+        return;
+      }
+      // The CPU proxy/NIC reads `send_sym_ptr` after observing the D2H command.
+      // NCCL-GIN provides this ordering internally; UCCL-GIN must publish prior
+      // device writes to system scope before committing the command slot.
+      __threadfence_system();
       const uint32_t loff = uccl_gin::window_off(reinterpret_cast<uint64_t>(send_sym_ptr), res.window_base);
       const uint32_t roff = uccl_gin::window_off(reinterpret_cast<uint64_t>(recv_sym_ptr), res.window_base);
       uccl_gin::rail_put(lane(lane_hint), rail_global_rank(dst_rank_idx),
@@ -170,6 +187,11 @@ struct UCCLGin {
     }
     const uint32_t off = rail_tail_offset(channel_idx, src_rank_idx);
     const int delta = count_delta + (finish ? kUCCLGinTailFinishDelta : 0);
+    if (dst_scaleout == res.scaleout_rank) {
+      atomicAdd_system(reinterpret_cast<unsigned long long*>(res.atomic_tail_base + off),
+                       static_cast<unsigned long long>(delta));
+      return;
+    }
     uccl_gin::rail_red_add(lane(lane_hint), rail_global_rank(dst_scaleout), delta, off);
   }
 

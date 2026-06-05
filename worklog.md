@@ -1119,3 +1119,114 @@ DeepEP V2 dispatch。
   - `put_value<Rail>`/notify count 路径是否仍有 NCCL-GIN Rail call 没替换。
   - compact tail buffer 目前受 `kAtomicOffMask` 限制,适合 EP8x2;更大 scaleout
     需要扩大/分片 atomic tail layout。
+
+## 2026-06-05:UCCL-GIN DeepEP V2 EP8x2 first-case correctness 跑通
+
+本轮先在本地 commit 了 host/JIT resources 注入链路:
+
+- commit: `8b25aa42 Wire UCCL-GIN resources into DeepEP dispatch`
+- 没有添加 co-author。
+
+随后把 `test_ep.py` 的 UCCL-GIN 初始化接进 first-case 测试:
+
+- `construct_elastic_buffer()` 之后,如果 `DEEPEP_USE_UCCL_GIN=1`,调用
+  `buffer.init_uccl_gin()`。
+- 这样 DeepEP V2 的真实 `ElasticBuffer.dispatch/combine` 会在第一次 JIT dispatch
+  前收到 UCCL-GIN resources,而不是只测 standalone microbench。
+
+服务器验证过程和修复:
+
+1. 第一次 EP8x2 smoke 进入 dispatch 后 abort:
+
+   - 日志:`/tmp/uccl_gin_deepep_ep8x2_smoke_rank*.log`
+   - 关键错误:`Posting atomic to itself`
+   - 根因:原 NCCL-GIN Rail team 的本 scaleout rank 路径不走 EFA proxy;UCCL-GIN
+     `rail_tail_add()` 直接把 `dst_scaleout == self` 也编码成 proxy ATOMIC,触发
+     UCCL proxy 的 self-command abort。
+   - 修复:`UCCLGin::rail_tail_add()` 对本 scaleout rank 直接
+     `atomicAdd_system()` 到 compact tail slot。
+
+2. 下一轮进入 `dispatch_copy_epilogue` 后 device assert:
+
+   - 错误:
+     `dispatch_copy_epilogue.cuh:106, condition: ptx::deduplicate(dst_expert_idx, lane_idx) or dst_expert_idx == -1`
+   - 第一处根因:kernel 读 compact tail 使用的是 host VA。`cudaHostAllocMapped`
+     的 host pointer 不能直接当 device pointer 传给 kernel。
+   - 修复:`UCCLGinResourceHandle` 在 host 侧对 proxy0 的 atomic buffer 调
+     `cudaHostGetDevicePointer()`,把 device-mapped VA 作为 `atomic_tail_base`
+     传入 `UCCLGinResources`。
+
+3. 修完 mapped VA 后仍然有 epilogue metadata assert:
+
+   - 根因:payload `put<Rail>` 默认 lane 0,tail `rail_tail_add()` 用
+     `channel_idx % num_queues`。同一 channel 的 payload 和 tail 落在不同 D2H
+     queue/proxy 上,tail 可能先于 payload 到达,forward/epilogue 读取到坏 metadata。
+   - 修复:在 `DEEPEP_USE_UCCL_GIN` 下,`hybrid_dispatch.cuh` 的 scaleout payload
+     `gin.put<Rail>()` 额外传 `channel_idx` lane hint,保证 payload 和该 channel
+     的 tail 进入同一 D2H queue。
+
+4. 再跑后失败点变成 host CPU wait:
+
+   - 错误:
+     `Dispatch CPU wait exception ... CPU side received count ... 0 0 ...`
+   - rank1 日志出现大量:
+     `DeepEP hybrid notify (scale-out expert/rank reduction) timeout ... wait scale-out: 0, decoded: -1`
+   - 说明 payload/tail 已能前进,但 notify 阶段的 scaleout count WRITE 没有被对端
+     notify warp 看到。
+   - 根因:UCCL-GIN 的 Rail `put` 是“GPU 写 send buffer -> GPU 提交 D2H command ->
+     CPU proxy/NIC 读 send buffer”。原 NCCL-GIN 内部提供了 device put 前的发布顺序,
+     UCCL-GIN 没有;proxy/NIC 可能读到 count send buffer 里的旧 0。
+   - 修复:
+     - `UCCLGin::put<Rail>()` 在 remote D2H command commit 前做
+       `__threadfence_system()`。
+     - notify 阶段 SM0 写完 encoded rank/expert count send buffer 后,在
+       `named_barrier` 前加 `__threadfence_system()`;这样所有参与写 count 的
+       notify 线程都把全局写发布到 system scope。
+
+5. 服务器端编译检查:
+
+   - `p5en_0` GPU 空闲:8 张卡均 `0 MiB/0%`。
+   - `p5en_1` GPU 空闲:8 张卡均 `0 MiB/0%`。
+   - 同步文件到两台机器的
+     `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/`。
+   - 在 `p5en_0` 编译临时 TU:
+     `/tmp/uccl_gin_hybrid_dispatch_compile.cu`
+   - 命令核心:
+     `nvcc -std=c++20 --expt-relaxed-constexpr -arch=sm_90 -DNCCL_CHECK_CUDACC=1 -DDEEPEP_USE_UCCL_GIN ... -c`
+   - 结果:通过。
+
+6. EP8x2 smoke correctness:
+
+   - 命令核心:
+     `DEEPEP_USE_UCCL_GIN=1 EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN`
+     `python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py`
+     `--num-processes 8 --test-first-only --skip-perf-test --num-sms 8`
+     `--num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256`
+   - 多机环境:
+     - `WORLD_SIZE=2`
+     - `RANK=0/1`
+     - `MASTER_ADDR=172.31.78.36`
+     - `OFI_NCCL_FORCE_NUM_RAILS=4`
+     - `FI_PROVIDER=efa`
+     - `NCCL_NET_PLUGIN=ofi`
+   - JIT cache:
+     - rank0:`/tmp/deepep_uccl_gin_jit_rank0`
+     - rank1:`/tmp/deepep_uccl_gin_jit_rank1`
+   - 日志:
+     - rank0:`/tmp/uccl_gin_deepep_ep8x2_smoke_rank0.log`
+     - rank1:`/tmp/uccl_gin_deepep_ep8x2_smoke_rank1.log`
+   - 结果:
+     - rank0 exit code `0`
+     - rank1 exit code `0`
+
+当前结论:
+
+- UCCL-GIN 已经作为 DeepEP V2 `hybrid_dispatch.cuh` 的 Rail backend 跑通真实
+  `ElasticBuffer.dispatch/combine` first-case EP8x2 correctness。
+- 当前通过的是小规模 correctness smoke,不是 README 风格性能数据。
+- 下一步回到主线应做:
+  - 用更接近 README 的 `hidden=7168,num_tokens=8192,num_sms=20` 做 dispatch
+    correctness/perf。
+  - 分离 dispatch-only 和 epilogue/host wait 时间,确认 UCCL-GIN Rail backend
+    真实瓶颈。
+  - 清理临时 debug/env-gated test hook 是否应变成正式入口或单独测试脚本。
