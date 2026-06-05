@@ -645,6 +645,7 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
       auto [front_wr, front_bytes] = pend.front();
       if (acked_wrs_.find(front_wr) == acked_wrs_.end()) break;
       acked_wrs_.erase(front_wr);  // consume this completion
+      inflight_write_wrs_.erase(front_wr);
       pend.pop_front();            // retire pending entry
 
       if (front_bytes) {
@@ -667,6 +668,7 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
   }
 #else
   for (auto wr_id : acked_wrs_) {
+    inflight_write_wrs_.erase(wr_id);
     size_t const rb_idx = (wr_id >> 32) & 0xFFFFFFFF;
     size_t const cmd_idx = wr_id & 0xFFFFFFFF;
 
@@ -676,6 +678,10 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
     }
 
     d2hq::HostD2HHandle* h = &cfg_.d2h_queues[rb_idx];
+    if (ctx_.quiet_wr != -1 && wr_id == static_cast<uint64_t>(ctx_.quiet_wr)) {
+      ctx_.quiet_inflight = false;
+      ctx_.quiet_wr = -1;
+    }
     h->volatile_clear_cmd_type(cmd_idx);
     h->mark_acked(cmd_idx % h->capacity());
   }
@@ -983,12 +989,61 @@ void Proxy::run_local() {
 void Proxy::post_gpu_commands_mixed(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post) {
-  // Separate atomic operations from regular RDMA writes
-  std::vector<uint64_t> rdma_wrs, atomic_wrs, quiet_wrs, barrier_wrs;
-  std::vector<TransferCmd> rdma_cmds, atomic_cmds, quiet_cmds, barrier_cmds;
+  if (cmds_to_post.empty()) return;
+  rdma_wrs.clear();
+  rdma_cmds.clear();
+  atomic_wrs.clear();
+  atomic_cmds.clear();
+
+  // Preserve D2H command order around control commands.  UCCL-GIN relies on
+  // WRITE ... QUIET ... ATOMIC, so the tail ATOMIC must not be moved before
+  // the device-issued QUIET.
+  auto flush_writes = [&]() {
+    if (rdma_wrs.empty()) return;
+    post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
+                            rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
+                            cfg_.thread_idx, cfg_.use_normal_mode);
+    inflight_write_wrs_.insert(rdma_wrs.begin(), rdma_wrs.end());
+    rdma_wrs.clear();
+    rdma_cmds.clear();
+  };
+
+  auto flush_atomics = [&]() {
+    if (atomic_wrs.empty()) return;
+    post_atomic_operations(ctx_, atomic_wrs, atomic_cmds, ctxs_for_all_ranks_,
+                           cfg_.rank, cfg_.thread_idx, acked_wrs_,
+                           cfg_.use_normal_mode);
+    atomic_wrs.clear();
+    atomic_cmds.clear();
+  };
 
   for (size_t i = 0; i < cmds_to_post.size(); ++i) {
-    switch (get_base_cmd(cmds_to_post[i].cmd_type)) {
+    const auto base_cmd = get_base_cmd(cmds_to_post[i].cmd_type);
+    if (profile_commands_) {
+      auto const now = std::chrono::steady_clock::now();
+      if (profile_post_batches_ == 0) profile_start_ = now;
+      profile_end_ = now;
+      ++profile_post_cmds_;
+      switch (base_cmd) {
+        case CmdType::WRITE:
+          ++profile_write_cmds_;
+          profile_write_bytes_ += static_cast<uint64_t>(cmds_to_post[i].bytes);
+          break;
+        case CmdType::ATOMIC:
+          ++profile_atomic_cmds_;
+          break;
+        case CmdType::QUIET:
+          ++profile_quiet_cmds_;
+          break;
+        case CmdType::BARRIER:
+          ++profile_barrier_cmds_;
+          break;
+        default:
+          break;
+      }
+    }
+
+    switch (base_cmd) {
       case (CmdType::ATOMIC): {
 #ifdef USE_SENDER_BARRIER
         if (!cfg_.use_normal_mode) {
@@ -1022,6 +1077,7 @@ void Proxy::post_gpu_commands_mixed(
         }
 #endif
 
+        flush_writes();
         atomic_wrs.push_back(wrs_to_post[i]);
         atomic_cmds.push_back(cmds_to_post[i]);
 
@@ -1049,18 +1105,28 @@ void Proxy::post_gpu_commands_mixed(
         break;
       }
       case (CmdType::WRITE): {
+        flush_atomics();
         rdma_wrs.push_back(wrs_to_post[i]);
         rdma_cmds.push_back(cmds_to_post[i]);
         break;
       }
       case (CmdType::QUIET): {
-        quiet_cmds.push_back(cmds_to_post[i]);
-        quiet_wrs.push_back(wrs_to_post[i]);
+        flush_writes();
+        flush_atomics();
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+        assert(ctx_.quiet_wr == -1);
+#endif
+        ctx_.quiet_wr = wrs_to_post[i];
+        quiet({wrs_to_post[i]}, {cmds_to_post[i]}, {});
         break;
       }
       case (CmdType::BARRIER): {
-        barrier_cmds.push_back(cmds_to_post[i]);
-        barrier_wrs.push_back(wrs_to_post[i]);
+        flush_writes();
+        flush_atomics();
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+        assert(ctx_.barrier_wr == -1);
+#endif
+        send_barrier(wrs_to_post[i]);
         break;
       }
       default: {
@@ -1070,142 +1136,11 @@ void Proxy::post_gpu_commands_mixed(
       }
     }
   }
-  if (rdma_wrs.size() + atomic_wrs.size() + barrier_cmds.size() +
-          quiet_cmds.size() ==
-      0) {
-    return;
-  }
   if (profile_commands_) {
-    auto const now = std::chrono::steady_clock::now();
-    if (profile_post_batches_ == 0) profile_start_ = now;
-    profile_end_ = now;
-    uint64_t write_bytes = 0;
-    for (auto const& cmd : rdma_cmds) {
-      write_bytes += static_cast<uint64_t>(cmd.bytes);
-    }
     ++profile_post_batches_;
-    profile_post_cmds_ += static_cast<uint64_t>(
-        rdma_wrs.size() + atomic_wrs.size() + quiet_wrs.size() +
-        barrier_wrs.size());
-    profile_write_cmds_ += static_cast<uint64_t>(rdma_wrs.size());
-    profile_write_bytes_ += write_bytes;
-    profile_atomic_cmds_ += static_cast<uint64_t>(atomic_wrs.size());
-    profile_quiet_cmds_ += static_cast<uint64_t>(quiet_wrs.size());
-    profile_barrier_cmds_ += static_cast<uint64_t>(barrier_wrs.size());
   }
-  // Handle regular RDMA writes
-  if (!rdma_wrs.empty()) {
-    const char* serialize_env = std::getenv("UCCL_V2_SERIALIZE_RDMA_WRITES");
-    const bool serialize_writes =
-        serialize_env != nullptr && std::atoi(serialize_env) != 0;
-    if (serialize_writes) {
-      std::set<PendingUpdate> pending_atomic_updates;
-      std::vector<uint64_t> one_wr;
-      std::vector<TransferCmd> one_cmd;
-      one_wr.reserve(1);
-      one_cmd.reserve(1);
-      for (size_t i = 0; i < rdma_wrs.size(); ++i) {
-        one_wr.assign(1, rdma_wrs[i]);
-        one_cmd.assign(1, rdma_cmds[i]);
-        post_rdma_async_batched(ctx_, cfg_.gpu_buffer, 1, one_wr, one_cmd,
-                                ctxs_for_all_ranks_, cfg_.rank,
-                                cfg_.thread_idx, cfg_.use_normal_mode);
-
-        auto const start = std::chrono::steady_clock::now();
-        for (;;) {
-          if (acked_wrs_.find(rdma_wrs[i]) != acked_wrs_.end()) {
-            uint64_t dummy_tail = 0;
-            notify_gpu_completion(dummy_tail);
-            break;
-          }
-          poll_cq_dual(ctx_, acked_wrs_, cfg_.thread_idx, ring, ctx_by_tag_,
-                       atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
-                       pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
-                       adaptive_sleeper_, cfg_.use_normal_mode);
-          if (std::chrono::steady_clock::now() - start >
-              std::chrono::seconds(10)) {
-            fprintf(stderr,
-                    "Timed out waiting for serialized RDMA WRITE completion, "
-                    "thread_idx=%d wr_id=%llu dst_rank=%u bytes=%u\n",
-                    cfg_.thread_idx,
-                    static_cast<unsigned long long>(rdma_wrs[i]),
-                    static_cast<unsigned>(rdma_cmds[i].dst_rank),
-                    static_cast<unsigned>(rdma_cmds[i].bytes));
-            std::abort();
-          }
-        }
-      }
-    } else {
-      post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
-                              rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
-                              cfg_.thread_idx, cfg_.use_normal_mode);
-      if (!atomic_wrs.empty()) {
-        std::unordered_set<uint64_t> pending_release_wrs(rdma_wrs.begin(),
-                                                         rdma_wrs.end());
-        std::set<PendingUpdate> pending_atomic_updates;
-        auto const start = std::chrono::steady_clock::now();
-        while (!pending_release_wrs.empty()) {
-          for (auto it = pending_release_wrs.begin();
-               it != pending_release_wrs.end();) {
-            if (acked_wrs_.find(*it) != acked_wrs_.end()) {
-              it = pending_release_wrs.erase(it);
-            } else {
-              ++it;
-            }
-          }
-          uint64_t dummy_tail = 0;
-          notify_gpu_completion(dummy_tail);
-          if (pending_release_wrs.empty()) break;
-
-          poll_cq_dual(ctx_, acked_wrs_, cfg_.thread_idx, ring, ctx_by_tag_,
-                       atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
-                       pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
-                       adaptive_sleeper_, cfg_.use_normal_mode);
-          if (std::chrono::steady_clock::now() - start >
-              std::chrono::seconds(10)) {
-            fprintf(stderr,
-                    "Timed out waiting for RDMA WRITE release before ATOMIC, "
-                    "thread_idx=%d pending=%zu first_wr=%llu\n",
-                    cfg_.thread_idx, pending_release_wrs.size(),
-                    static_cast<unsigned long long>(
-                        pending_release_wrs.empty() ? 0
-                                                    : *pending_release_wrs.begin()));
-            std::abort();
-          }
-        }
-      }
-    }
-    rdma_wrs.clear();
-    rdma_cmds.clear();
-  }
-
-  if (!atomic_wrs.empty()) {
-    post_atomic_operations(ctx_, atomic_wrs, atomic_cmds, ctxs_for_all_ranks_,
-                           cfg_.rank, cfg_.thread_idx, acked_wrs_,
-                           cfg_.use_normal_mode);
-    atomic_wrs.clear();
-    atomic_cmds.clear();
-  }
-
-  if (!barrier_cmds.empty()) {
-#ifdef USE_MSCCLPP_FIFO_BACKEND
-    assert(barrier_wrs.size() == 1 && ctx_.barrier_wr == -1);
-#endif
-    assert(quiet_wrs.empty() && "quiet_wrs should be empty");
-    send_barrier(barrier_wrs[0]);
-    barrier_wrs.clear();
-    barrier_cmds.clear();
-  }
-
-  if (!quiet_cmds.empty()) {
-#ifdef USE_MSCCLPP_FIFO_BACKEND
-    assert(quiet_wrs.size() == 1 && ctx_.quiet_wr == -1);
-#endif
-    ctx_.quiet_wr = quiet_wrs[0];
-    quiet(quiet_wrs, quiet_cmds);
-    quiet_wrs.clear();
-    quiet_cmds.clear();
-  }
+  flush_writes();
+  flush_atomics();
 }
 
 void Proxy::dump_command_profile() const {
@@ -1242,14 +1177,21 @@ void Proxy::dump_command_profile() const {
   }
 }
 
-void Proxy::quiet_cq() {
-  auto outstanding_batches = [&]() -> size_t { return 0; };
+void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
+  std::unordered_set<uint64_t> pending_release_wrs(release_wrs.begin(),
+                                                   release_wrs.end());
+  pending_release_wrs.insert(inflight_write_wrs_.begin(),
+                             inflight_write_wrs_.end());
+  auto outstanding_batches = [&]() -> size_t {
+    return pending_release_wrs.size();
+  };
   constexpr int kConsecutiveEmptyToExit = 3;
   int empty_iters = 0;
   ibv_wc wc[kMaxOutstandingSends];
   using clock = std::chrono::steady_clock;
   auto last_log = clock::now();
   std::set<PendingUpdate> pending_atomic_updates;
+  uint64_t dummy_tail = 0;
   for (;;) {
     int ne = poll_cq_once(get_cq(ctx_), wc, kMaxOutstandingSends);
     if (ne > 0) {
@@ -1269,6 +1211,14 @@ void Proxy::quiet_cq() {
     } else {
       ++empty_iters;
     }
+    for (auto it = pending_release_wrs.begin(); it != pending_release_wrs.end();) {
+      if (acked_wrs_.find(*it) != acked_wrs_.end()) {
+        it = pending_release_wrs.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    notify_gpu_completion(dummy_tail);
     if (outstanding_batches() == 0 && empty_iters >= kConsecutiveEmptyToExit) {
       break;
     }
@@ -1281,10 +1231,13 @@ void Proxy::quiet_cq() {
   }
 }
 
-void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds) {
+void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds,
+                  std::vector<uint64_t> release_wrs) {
   assert(cmds.size() == 1 && "quiet size must be 1");
-  quiet_cq();
+  quiet_cq(std::move(release_wrs));
   acked_wrs_.insert(wrs[0]);
+  uint64_t dummy_tail = 0;
+  notify_gpu_completion(dummy_tail);
 }
 
 void Proxy::destroy(bool free_gpu_buffer) {
@@ -1479,6 +1432,7 @@ void Proxy::destroy(bool free_gpu_buffer) {
 #endif
 
   acked_wrs_.clear();
+  inflight_write_wrs_.clear();
   wr_id_to_start_time_.clear();
   ctxs_for_all_ranks_.clear();
   ctx_by_tag_.clear();

@@ -2,6 +2,12 @@
 
 #include <nccl.h>
 #include <nccl_device.h>
+#include <cstddef>
+
+#if __has_include(<uccl_gin/resources.cuh>)
+#include <uccl_gin/resources.cuh>
+#define DEEPEP_HAVE_UCCL_GIN_RESOURCES_FOR_ABI_CHECK 1
+#endif
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
@@ -27,6 +33,20 @@ struct NativeUCCLGinResources {
     int scaleup_rank = 0;
     uint32_t num_lanes = 1;
 };
+
+#ifdef DEEPEP_HAVE_UCCL_GIN_RESOURCES_FOR_ABI_CHECK
+static_assert(sizeof(NativeUCCLGinResources) == sizeof(uccl_gin::UCCLGinResources));
+static_assert(alignof(NativeUCCLGinResources) == alignof(uccl_gin::UCCLGinResources));
+static_assert(offsetof(NativeUCCLGinResources, d2h_queues) == offsetof(uccl_gin::UCCLGinResources, d2h_queues));
+static_assert(offsetof(NativeUCCLGinResources, num_queues) == offsetof(uccl_gin::UCCLGinResources, num_queues));
+static_assert(offsetof(NativeUCCLGinResources, window_base) == offsetof(uccl_gin::UCCLGinResources, window_base));
+static_assert(offsetof(NativeUCCLGinResources, atomic_tail_base) == offsetof(uccl_gin::UCCLGinResources, atomic_tail_base));
+static_assert(offsetof(NativeUCCLGinResources, num_scaleout_ranks) == offsetof(uccl_gin::UCCLGinResources, num_scaleout_ranks));
+static_assert(offsetof(NativeUCCLGinResources, num_scaleup_ranks) == offsetof(uccl_gin::UCCLGinResources, num_scaleup_ranks));
+static_assert(offsetof(NativeUCCLGinResources, scaleout_rank) == offsetof(uccl_gin::UCCLGinResources, scaleout_rank));
+static_assert(offsetof(NativeUCCLGinResources, scaleup_rank) == offsetof(uccl_gin::UCCLGinResources, scaleup_rank));
+static_assert(offsetof(NativeUCCLGinResources, num_lanes) == offsetof(uccl_gin::UCCLGinResources, num_lanes));
+#endif
 
 class DispatchPrologueRuntime final : public jit::LaunchRuntime<DispatchPrologueRuntime> {
 public:

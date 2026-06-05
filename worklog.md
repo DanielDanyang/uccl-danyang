@@ -1,5 +1,109 @@
 # Worklog
 
+## 2026-06-05: UCCL-GIN dispatch ordering cleanup and V2 receiver readiness guard
+
+### 背景
+
+这轮目标是按 review 建议把 dispatch 重新拉回“尽量复用原 UCCL/EP transport substrate”的方向：
+
+- 不再让 proxy 在看到 tail/ATOMIC 时自发做一层粗粒度 CQE 等待。
+- 保持旧 `TransferCmd` + FIFO/proxy/CQ/ack 路径。
+- payload 是否 ready 尽量在 receiver 侧判断，贴近原 `uccl/ep` 的 epoch-tag 思路。
+
+### 修改 1: proxy 保持 D2H 命令顺序
+
+旧实现把一个 batch 里的命令按类型分桶，然后固定按 `WRITE -> ATOMIC -> QUIET` 发。这个会破坏 device 侧原本的顺序，尤其是 `WRITE ... QUIET ... ATOMIC` 会被重排成 `WRITE ... ATOMIC ... QUIET`。
+
+本轮把 `ep/src/proxy.cpp::post_gpu_commands_mixed()` 改成顺序处理：
+
+- 连续 `WRITE` 仍批量 post。
+- 连续 `ATOMIC` 仍批量 post。
+- 遇到 `WRITE -> ATOMIC` 或 `ATOMIC -> WRITE` 时先 flush 前一类。
+- 遇到 `QUIET/BARRIER` 时先 flush 前面的 `WRITE/ATOMIC`，再处理 control command。
+
+这保留 batching，但不跨越 control command 重排。
+
+### 修改 2: 删除 hot path 的 per-tail QUIET
+
+我最初尝试在每次 UCCL-GIN tail add 前发 device-side `QUIET`，但小配置直接失败：
+
+- 日志：`/tmp/uccl_gin_quiet_small_rank0.log`
+- 现象：大量 `[UCCL-GIN quiet] waiting lane=... slot=...`
+- 结论：per-channel/per-tail QUIET 太重，而且不是原 `uccl/ep` 的用法。原 V1 更像是在阶段边界用少量 quiet，真正的数据 ready 由 receiver-side epoch tag 判定。
+
+因此 dispatch hot path 撤掉了 per-tail `gin.quiet()` 调用；`UCCLGin::quiet()` API 先保留，后续用于更粗粒度的阶段边界或其他 API 覆盖。
+
+### 修改 3: receiver-side V2 readiness guard
+
+无 QUIET 后，小配置通过，但 README-like 大配置出现 correctness failure：
+
+- 日志：`/tmp/uccl_gin_noquiet_readme_rank1.log`
+- 失败：
+  `sorted_src_token_global_idx` 里出现重复 token，比如 `[0, 0, 1, ...]`
+
+这说明 tail/count 已经让 forwarder 开始消费 slot，但对应 payload/metadata 还没有稳定可见。原 `uccl/ep` 在 `internode.cu` 中用 payload 里的 epoch tag 做 receiver-side spin-wait；V2 token layout 没有同样的 per-destination tag 字段，而且一个 source token 的 send buffer 可能发给多个 dst slot，不能直接把 dst-slot tag 塞进同一个 send token padding。
+
+本轮先采用 V2 原生 metadata 的轻量替代：
+
+- 在 forwarder TMA load 前读取 `token_buffer.get_src_token_global_idx_ptr()`。
+- 对每个 `(channel, source scaleout rank)` 维护上一条已经消费的 `src_token_global_idx`。
+- 等到 observed metadata 同时满足：
+  - 来自预期 global rank：`recv_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx`
+  - 严格大于该 source stream 的上一条 token id
+- 满足后才 TMA load 和 forward。
+
+这不是完整 V1 epoch tag，但语义上回到了“receiver 不信 tail，先等 payload 自己的 ready/monotonic metadata”。
+
+### 验证
+
+编译：
+
+- `p5en_0`: `make -C ep install ...` 通过
+- `p5en_1`: `make -C ep install ...` 通过
+- JIT header smoke 通过：
+  `/tmp/uccl_gin_hybrid_dispatch_compile.cu`
+
+小配置 correctness：
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-perf-test \
+  --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256
+```
+
+- rank0 log: `/tmp/uccl_gin_ready_small_rank0.log`
+- rank1 log: `/tmp/uccl_gin_ready_small_rank1.log`
+- 结果：两边 exit code 0。
+
+README-like EP8 x 2 / EP16：
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only \
+  --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256
+```
+
+- rank0 log: `/tmp/uccl_gin_ready_readme_rank0.log`
+- rank1 log: `/tmp/uccl_gin_ready_readme_rank1.log`
+- 结果：两边 exit code 0。
+
+关键性能：
+
+- rank0 dispatch: 约 `36 GB/s (SO)`，`115-119 GB/s (SU)`，约 `3.4 ms`
+- rank1 dispatch:
+  - EP12: `36 GB/s (SO)`
+  - 其他多数 EP: 约 `18 GB/s (SO)`，约 `6.7 ms`
+- combine/reduced combine: 多数约 `17 GB/s (SO)`，个别 EP 约 `22 GB/s (SO)`
+
+### 当前判断
+
+- correctness 现在依赖 receiver-side metadata monotonic guard，而不是 proxy-side coarse CQE fence。
+- 这比 per-tail QUIET 更接近原 UCCL/EP 的“receiver 侧 ready 判定”哲学。
+- 性能仍有明显 rank/EP imbalance，下一步应继续看：
+  - FIFO/proxy lane 映射是否把部分 channel 压到少数 proxy thread/NIC。
+  - `channel_idx % num_queues` 是否应该改成更接近原 UCCL/EP 的 channel/proxy 映射。
+  - 是否需要完整 V2 per-slot ready tag buffer，而不是复用 `src_token_global_idx` 单调性。
+
 ## 2026-06-04: native V2 dispatch 远端验证与 bug 记录
 
 ### 环境

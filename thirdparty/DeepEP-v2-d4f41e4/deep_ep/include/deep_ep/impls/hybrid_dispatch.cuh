@@ -57,6 +57,10 @@ hybrid_dispatch_impl(
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
+#ifdef DEEPEP_USE_UCCL_GIN
+    EP_STATIC_ASSERT(kNumMaxTokensPerChannel < handle::kUCCLGinTailFinishDelta,
+                     "UCCL-GIN packed tail finish bit requires a larger finish delta");
+#endif
 
     // Utils
     // NOTES: a warp is a channel (different channels may share QPs)
@@ -93,6 +97,7 @@ hybrid_dispatch_impl(
     // they are not part of DeepEP's normal workspace cleanup.
     for (int i = sm_idx * kNumThreads + thread_idx; i < kNumChannels * kNumScaleoutRanks; i += kNumSMs * kNumThreads)
         reinterpret_cast<int64_t*>(uccl_gin_resources.atomic_tail_base)[i] = 0;
+    __threadfence_system();
     cooperative_groups::this_grid().sync();
 #else
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
@@ -523,6 +528,7 @@ hybrid_dispatch_impl(
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
         int stored_finish_flag = lane_idx >= kNumScaleoutRanks;
         int stored_scaleout_tail_idx = 0;
+        int last_forward_src_token_global_idx = -1;
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
@@ -578,6 +584,37 @@ hybrid_dispatch_impl(
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
             for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
                 const auto token_buffer = recv_buffer.get_token_buffer(slot_idx);
+
+#ifdef DEEPEP_USE_UCCL_GIN
+                // EFA/SRD does not give payload-before-tail ordering.  Mirror
+                // UCCL-EP's receiver-side epoch-tag idea using V2's native
+                // source-token metadata: within one (channel, source rank) stream
+                // the source token index must become strictly increasing before
+                // the forwarder consumes this slot.
+                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                    const auto expected_rank_idx = recv_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
+                    const auto old_src_token_idx = ptx::exchange(last_forward_src_token_global_idx, recv_scaleout_rank_idx);
+                    const auto observed_src_token_idx = ptx::ld_acquire_sys<int>(
+                        token_buffer.get_src_token_global_idx_ptr());
+                    const bool ready =
+                        observed_src_token_idx / kNumMaxTokensPerRank == expected_rank_idx and
+                        observed_src_token_idx > old_src_token_idx;
+                    if (ready) {
+                        if (lane_idx == recv_scaleout_rank_idx)
+                            last_forward_src_token_global_idx = observed_src_token_idx;
+                        return true;
+                    }
+                    if (is_last_check and lane_idx == recv_scaleout_rank_idx) {
+                        printf("DeepEP UCCL-GIN ready metadata timeout, scale-out: %d, scale-up: %d, "
+                               "channel: %d, src scale-out: %d, slot: %d, observed: %d, prev: %d, expected rank: %d\n",
+                               scaleout_rank_idx, scaleup_rank_idx, channel_idx,
+                               recv_scaleout_rank_idx, slot_idx, observed_src_token_idx,
+                               old_src_token_idx, expected_rank_idx);
+                    }
+                    return false;
+                });
+                __syncwarp();
+#endif
 
                 // Wait TMA arrival
                 ptx::tma_store_wait();
@@ -701,6 +738,9 @@ hybrid_dispatch_impl(
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
 #endif
         }
+#ifdef DEEPEP_USE_UCCL_GIN
+        __threadfence_system();
+#endif
         __syncwarp();
     }
 

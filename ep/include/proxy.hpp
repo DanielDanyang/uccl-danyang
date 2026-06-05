@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <assert.h>
 #include <stdio.h>
@@ -108,8 +109,9 @@ class Proxy {
   void post_barrier_msg(int dst_rank, bool ack, uint64_t seq);
   void send_barrier(uint64_t wr);
   void barrier_check();
-  void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds);
-  void quiet_cq();
+  void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds,
+             std::vector<uint64_t> release_wrs);
+  void quiet_cq(std::vector<uint64_t> release_wrs);
   RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations
@@ -120,6 +122,7 @@ class Proxy {
 
   // Completion tracking
   std::unordered_set<uint64_t> acked_wrs_;
+  std::unordered_set<uint64_t> inflight_write_wrs_;
   std::unordered_map<uint64_t, std::chrono::high_resolution_clock::time_point>
       wr_id_to_start_time_;
   uint64_t completion_count_ = 0;

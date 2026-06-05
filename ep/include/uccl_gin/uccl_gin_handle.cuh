@@ -35,6 +35,7 @@ namespace deep_ep::elastic::handle {
 
 static constexpr int kUCCLGinTailFinishDelta = 1 << 13;
 static constexpr int kUCCLGinTailCountMask = kUCCLGinTailFinishDelta - 1;
+static constexpr unsigned long long kUCCLGinQuietPrintCycles = 20000000000ull;
 
 struct UCCLGin {
   const ncclDevComm_t& nccl_dev_comm;      // comm.cuh compatibility
@@ -101,10 +102,6 @@ struct UCCLGin {
         __threadfence_system();
         return;
       }
-      // The CPU proxy/NIC reads `send_sym_ptr` after observing the D2H command.
-      // NCCL-GIN provides this ordering internally; UCCL-GIN must publish prior
-      // device writes to system scope before committing the command slot.
-      __threadfence_system();
       const uint32_t loff = uccl_gin::window_off(reinterpret_cast<uint64_t>(send_sym_ptr), res.window_base);
       const uint32_t roff = uccl_gin::window_off(reinterpret_cast<uint64_t>(recv_sym_ptr), res.window_base);
       uccl_gin::rail_put(lane(lane_hint), rail_global_rank(dst_rank_idx),
@@ -195,6 +192,39 @@ struct UCCLGin {
     uccl_gin::rail_red_add(lane(lane_hint), rail_global_rank(dst_scaleout), delta, off);
   }
 
+  __device__ __forceinline__ void quiet(int lane_hint = 0) const {
+    auto* q = lane(lane_hint);
+    uint64_t slot = 0;
+    TransferCmd cmd{};
+    cmd.cmd_type = CmdType::QUIET;
+    q->atomic_set_and_commit(cmd, &slot);
+
+    auto last_print = clock64();
+    while (true) {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+      if (q->fifo.poll(slot)) break;
+#else
+      const uint64_t tail = q->ring->volatile_tail();
+      if (tail > slot) break;
+#endif
+      if (clock64() - last_print > kUCCLGinQuietPrintCycles) {
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+        printf("[UCCL-GIN quiet] waiting lane=%d slot=%llu\n",
+               lane_hint,
+               static_cast<unsigned long long>(slot));
+#else
+        printf("[UCCL-GIN quiet] waiting lane=%d slot=%llu head=%llu tail=%llu\n",
+               lane_hint,
+               static_cast<unsigned long long>(slot),
+               static_cast<unsigned long long>(q->ring->head),
+               static_cast<unsigned long long>(tail));
+#endif
+        last_print = clock64();
+      }
+      __nanosleep(64);
+    }
+  }
+
   // ---- the rest: delegate to NCCLGin (Lsa/World/barrier; Rail get/signal are
   //      not on the dispatch hot path in v1, handled in later phases) ---------
   template <typename team_t, typename remote_action_t>
@@ -207,7 +237,7 @@ struct UCCLGin {
   }
   __device__ __forceinline__ void wait(ncclGinRequest_t& r) const { nccl.wait(r); }
   template <typename coop_t = ncclCoopThread>
-  __device__ __forceinline__ void flush() const { nccl.flush<coop_t>(); /* P3: also drain UCCL lane */ }
+  __device__ __forceinline__ void flush() const { nccl.flush<coop_t>(); }
   template <typename team_t, typename coop_t = ncclCoopThread>
   __device__ __forceinline__ void flush_async(const int& src, ncclGinRequest_t* r, const int& xo = 0) const {
     nccl.flush_async<team_t, coop_t>(src, r, xo);
