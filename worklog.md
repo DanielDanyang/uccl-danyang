@@ -1019,3 +1019,103 @@ DeepEP V2 dispatch。
   `UCCLGinResources` 给 DeepEP V2 JIT kernel。
 - `put_value<Rail>` 仍未接 notify/count path;hybrid dispatch 当前 notify scaleout
   用的是 `put<Rail>` 两条 count buffer WRITE,所以 dispatch payload/tail 主路径可先继续。
+
+## 2026-06-05:接入 host/JIT UCCL-GIN resources(编译验证通过)
+
+本轮先 commit 了上一轮 device-side 起点:
+
+- commit: `8664de6a Add UCCL-GIN dispatch device path`
+- 没有添加 co-author。
+
+继续推进内容:
+
+- `thirdparty/DeepEP-v2-d4f41e4/csrc/kernels/elastic/dispatch.hpp`
+  - 新增 host-side ABI mirror `NativeUCCLGinResources`。
+  - 这个 struct 和 `ep/include/uccl_gin/resources.cuh::UCCLGinResources`
+    保持字段顺序/大小一致,但 DeepEP `_C` 默认构建不需要 include UCCL header。
+  - `DispatchRuntime::Args` 增加:
+    - `bool use_uccl_gin_resources`
+    - `NativeUCCLGinResources uccl_gin_resources`
+  - `launch_impl` 在 hybrid dispatch 且 resources 已启用时,多传一个 POD 参数给
+    JIT kernel;默认 NCCL-GIN 路径仍走原签名。
+
+- `thirdparty/DeepEP-v2-d4f41e4/csrc/elastic/buffer.hpp`
+  - `ElasticBuffer` 增加 `set_uccl_gin_resources(pybind11::dict)` binding。
+  - dict 字段:
+    - `d2h_queues_ptr`
+    - `num_queues`
+    - `window_base`
+    - `atomic_tail_base`
+    - `num_scaleout_ranks`
+    - `num_scaleup_ranks`
+    - `scaleout_rank`
+    - `scaleup_rank`
+    - `num_lanes`
+  - setter 会校验 topology 必须和 DeepEP/NCCL context 一致。
+  - dispatch 时如果 resources 已设置,把它传入 `launch_dispatch`。
+
+- `ep/src/uccl_ep.cc`
+  - 新增 Python-visible `UCCLGinResourceHandle`。
+  - 它负责:
+    - 从一组 `UcclProxy` 收集每个 proxy 的 device-side D2H handle 地址。
+    - `cudaMalloc` 一个 device array(`d2hq::D2HHandle**`)并持有其生命周期。
+    - 复用 proxy0 的 atomic buffer,并把同一个 atomic buffer 设置给所有 proxy。
+    - `as_dict()` 导出 DeepEP `_C.set_uccl_gin_resources()` 需要的稳定 dict。
+  - 新增 helper `uccl.ep.build_uccl_gin_resources(...)`。
+
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/buffers/elastic.py`
+  - 新增 `ElasticBuffer.init_uccl_gin(...)`。
+  - 它从 `runtime.get_native_v2_resources()` 获取 DeepEP V2 的 workspace/window
+    指针:
+    - proxy/MR 注册使用 `rdma_workspace_ptr`
+    - kernel offset origin 使用 mapped `workspace_ptr`
+    - 注册长度使用 `workspace_bytes + buffer_bytes`(GPU/HBM segment only)
+  - 创建/启动 `uccl.ep.Proxy` 组,all_gather peer metadata,构造
+    `UCCLGinResourceHandle`,然后调用 `_C.ElasticBuffer.set_uccl_gin_resources()`。
+  - 自动补:
+    - `DEEPEP_REPO_ROOT=<repo root>`
+    - `EP_JIT_EXTRA_FLAGS+=-DDEEPEP_USE_UCCL_GIN`
+  - 注意:如果进程已经触发过 DeepEP JIT 编译,这些 env 可能太晚;真正跑测时建议清
+    `EP_JIT_CACHE_DIR`/`~/.deep_ep` 并在第一次 dispatch 前调用 `init_uccl_gin()`。
+
+- `uccl/__init__.py`
+  - 加 `pkgutil.extend_path`。
+  - 原因:从仓库根目录运行测试时,源码树里的 `uccl/` 会遮蔽 site-packages 里
+    已安装的 `uccl.ep.abi3.so`;扩展 `__path__` 后 `import uccl.ep` 能继续找到
+    已安装 extension。
+
+远端验证:
+
+- 同步到 `p5en_0:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang`。
+- `uccl.ep` 编译通过:
+  `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+- DeepEP `_C` 编译通过:
+  `cd thirdparty/DeepEP-v2-d4f41e4 && python setup.py build_ext --inplace`
+  - 第一次在最后链接失败:`/usr/bin/ld: cannot find -l:libnccl.so.2`。
+  - 根因是 vendored DeepEP `setup.py` 把 NCCL rpath 写进 `extra_link_args`,
+    但没有把 NCCL lib dir 放入 `library_dirs`;补
+    `LIBRARY_PATH=/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/nvidia/nccl/lib`
+    后增量 build/link 通过。
+- Python API 可见性检查通过(从 `/tmp` 运行,避免仓库根 `uccl/` 源包遮蔽已安装
+  `uccl.ep` extension):
+  - `uccl.ep.build_uccl_gin_resources == True`
+  - `uccl.ep.UCCLGinResourceHandle == True`
+  - `deep_ep.ElasticBuffer.init_uccl_gin == True`
+  - `deep_ep._C.ElasticBuffer.set_uccl_gin_resources == True`
+- `uccl/__init__.py` namespace path 修复后,从仓库根目录也能
+  `import uccl.ep`,解析到
+  `/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so`。
+- 宏打开的 device kernel 实例化编译通过:
+  `/tmp/uccl_gin_hybrid_dispatch_compile.cu`
+  `nvcc -std=c++20 --expt-relaxed-constexpr -arch=sm_90 -DNCCL_CHECK_CUDACC=1 ... -c`
+  产物 `/tmp/uccl_gin_hybrid_dispatch_compile.o`。
+
+当前状态:
+
+- host/JIT resources 注入链路的第一版已经写完并编译通过。
+- 还没有跑真实 EP8x2 dispatch correctness/benchmark。
+- 下一步应该跑最小双机 dispatch correctness;若卡住,优先看:
+  - `init_uccl_gin()` 是否必须在任何 DeepEP JIT 编译前调用。
+  - `put_value<Rail>`/notify count 路径是否仍有 NCCL-GIN Rail call 没替换。
+  - compact tail buffer 目前受 `kAtomicOffMask` 限制,适合 EP8x2;更大 scaleout
+    需要扩大/分片 atomic tail layout。

@@ -11,6 +11,23 @@
 
 namespace deep_ep::elastic {
 
+// Host-side ABI mirror of `uccl_gin::UCCLGinResources`.
+//
+// Keep this POD layout in lockstep with `ep/include/uccl_gin/resources.cuh`.
+// DeepEP's host extension should not require UCCL headers in the default build;
+// the JIT kernel only needs the real type when `DEEPEP_USE_UCCL_GIN` is enabled.
+struct NativeUCCLGinResources {
+    void* d2h_queues = nullptr;
+    uint32_t num_queues = 0;
+    uint64_t window_base = 0;
+    uint64_t atomic_tail_base = 0;
+    int num_scaleout_ranks = 1;
+    int num_scaleup_ranks = 1;
+    int scaleout_rank = 0;
+    int scaleup_rank = 0;
+    uint32_t num_lanes = 1;
+};
+
 class DispatchPrologueRuntime final : public jit::LaunchRuntime<DispatchPrologueRuntime> {
 public:
     struct Args {
@@ -116,6 +133,8 @@ public:
         int sf_token_stride, sf_hidden_stride;
         ncclDevComm_t nccl_dev_comm;
         ncclWindow_t nccl_window;
+        bool use_uccl_gin_resources;
+        NativeUCCLGinResources uccl_gin_resources;
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
@@ -179,6 +198,24 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleup_rank_idx));
+        } else if (args.use_uccl_gin_resources) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+                kernel, config,
+                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.copied_topk_idx,
+                args.cumulative_local_expert_recv_stats,
+                args.psum_num_recv_tokens_per_scaleup_rank,
+                args.psum_num_recv_tokens_per_expert,
+                args.dst_buffer_slot_idx,
+                args.token_metadata_at_forward,
+                args.num_tokens,
+                args.sf_token_stride, args.sf_hidden_stride,
+                args.nccl_dev_comm, args.nccl_window,
+                args.uccl_gin_resources,
+                args.buffer,
+                args.workspace, args.mapped_host_workspace,
+                args.scaleout_rank_idx, args.scaleup_rank_idx
+            ));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -235,6 +272,7 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& cached_mode,
                             const bool& deterministic,
                             const bool& do_cpu_sync,
+                            const NativeUCCLGinResources* uccl_gin_resources,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -296,6 +334,8 @@ static void launch_dispatch(void* x, void* sf,
         .num_tokens = num_tokens,
         .sf_token_stride = sf_token_stride, .sf_hidden_stride = sf_hidden_stride,
         .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
+        .use_uccl_gin_resources = uccl_gin_resources != nullptr,
+        .uccl_gin_resources = uccl_gin_resources == nullptr ? NativeUCCLGinResources{} : *uccl_gin_resources,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,

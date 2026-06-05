@@ -1,5 +1,7 @@
 import os
+import importlib
 import math
+import time
 import torch
 import torch.distributed as dist
 from typing import Callable, Optional, Tuple, Union, List, Sequence
@@ -232,6 +234,8 @@ class ElasticBuffer:
 
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
+        self._uccl_gin_proxies = None
+        self._uccl_gin_resource_handle = None
 
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
@@ -244,10 +248,107 @@ class ElasticBuffer:
         """
         assert self.explicitly_destroy
 
+        self.destroy_uccl_gin()
         if self.runtime is not None:
             self.runtime.destroy()
             self.runtime = None  # Cannot use anymore
             self.nccl_comm_handle = None
+
+    def init_uccl_gin(self,
+                      num_lanes: int = 0,
+                      startup_sleep_sec: float = 3.0) -> None:
+        """
+        Initialize the UCCL-GIN Rail backend for the hybrid scale-out path.
+
+        This keeps DeepEP's V2 Buffer/JIT semantics intact: NCCL-GIN is still
+        used for scale-up/NVLink, while Rail operations are redirected through
+        UCCL's D2H FIFO + CPU proxy + EFA verbs substrate.
+        """
+        try:
+            uccl_ep = importlib.import_module('uccl.ep')
+        except ImportError as exc:
+            raise RuntimeError("init_uccl_gin requires the uccl.ep extension") from exc
+
+        if self._uccl_gin_proxies is not None:
+            raise RuntimeError("UCCL-GIN resources are already initialized")
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+        os.environ.setdefault('DEEPEP_REPO_ROOT', repo_root)
+        extra_flags = os.environ.get('EP_JIT_EXTRA_FLAGS', '')
+        if '-DDEEPEP_USE_UCCL_GIN' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (extra_flags + ' -DDEEPEP_USE_UCCL_GIN').strip()
+
+        resources = self.runtime.get_native_v2_resources()
+        window_base = int(resources['workspace_ptr'])
+        rdma_window_base = int(resources['rdma_workspace_ptr'])
+        rdma_window_bytes = int(resources['workspace_bytes']) + int(resources['buffer_bytes'])
+
+        num_proxy_threads = int(uccl_ep.get_num_proxy_threads())
+        proxies = []
+        for thread_idx in range(num_proxy_threads):
+            proxy = uccl_ep.Proxy(
+                thread_idx=thread_idx,
+                gpu_buffer_addr=rdma_window_base,
+                total_size=rdma_window_bytes,
+                rank=self.rank_idx,
+                node_idx=self.scaleout_rank_idx,
+                local_rank=self.scaleup_rank_idx,
+                num_experts=0,
+                num_ranks=self.num_ranks,
+                num_nodes=self.num_scaleout_ranks,
+                use_normal_mode=True,
+                is_intranode=(self.num_scaleout_ranks <= 1),
+                gpu_buffer_is_host_allocated=False,
+                owns_gpu_buffer=False,
+            )
+            proxies.append(proxy)
+
+        my_meta = {
+            'rank': self.rank_idx,
+            'ptr': rdma_window_base,
+            'nbytes': rdma_window_bytes,
+            'ip': uccl_ep.get_oob_ip() if self.num_ranks > 1 else '',
+            'listen_ports': [proxy.get_listen_port() for proxy in proxies],
+        }
+        all_meta = [None] * self.num_ranks
+        dist.all_gather_object(all_meta, my_meta, group=self.group)
+        peers_meta = [all_meta[rank] for rank in range(self.num_ranks)]
+
+        if self.num_scaleout_ranks > 1:
+            for proxy in proxies:
+                proxy.set_peers_meta(peers_meta)
+
+        dist.barrier(group=self.group)
+        if self.num_scaleout_ranks > 1:
+            for proxy in proxies:
+                proxy.start_dual()
+            if startup_sleep_sec > 0:
+                time.sleep(startup_sleep_sec)
+
+        resource_handle = uccl_ep.build_uccl_gin_resources(
+            proxies,
+            window_base,
+            self.num_scaleout_ranks,
+            self.num_scaleup_ranks,
+            self.scaleout_rank_idx,
+            self.scaleup_rank_idx,
+            num_lanes,
+        )
+        self.runtime.set_uccl_gin_resources(resource_handle.as_dict())
+        self._uccl_gin_proxies = proxies
+        self._uccl_gin_resource_handle = resource_handle
+
+    def destroy_uccl_gin(self) -> None:
+        proxies = self._uccl_gin_proxies
+        self._uccl_gin_proxies = None
+        self._uccl_gin_resource_handle = None
+        if proxies is None:
+            return
+        for proxy in proxies:
+            try:
+                proxy.stop()
+            except Exception:
+                pass
 
     @staticmethod
     def get_buffer_size_hint(group: dist.ProcessGroup,

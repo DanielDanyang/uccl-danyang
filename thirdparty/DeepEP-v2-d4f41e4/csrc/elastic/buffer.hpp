@@ -55,6 +55,11 @@ class ElasticBuffer {
     // NCCL context
     std::shared_ptr<nccl::NCCLSymmetricMemoryContext> nccl_context;
 
+    // Optional UCCL-GIN Rail resources. Default DeepEP/NCCL-GIN runs leave this
+    // disabled; the Python wrapper enables it only after UCCL proxies are ready.
+    bool uccl_gin_resources_enabled = false;
+    NativeUCCLGinResources uccl_gin_resources;
+
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
     static constexpr int kNumMaxSMs = 160;
@@ -234,6 +239,46 @@ public:
         // native EFA path touches neither; add a hybrid-correct getter here if
         // combine/engram ever needs the CPU segment.
         return d;
+    }
+
+    void set_uccl_gin_resources(const pybind11::dict& d) {
+        EP_HOST_ASSERT(not destroyed);
+        const auto get_u64 = [&](const char* key) -> uint64_t {
+            EP_HOST_ASSERT(d.contains(key));
+            return pybind11::cast<uint64_t>(d[key]);
+        };
+        const auto get_i32 = [&](const char* key) -> int {
+            EP_HOST_ASSERT(d.contains(key));
+            return pybind11::cast<int>(d[key]);
+        };
+        const auto get_u32 = [&](const char* key) -> uint32_t {
+            EP_HOST_ASSERT(d.contains(key));
+            return pybind11::cast<uint32_t>(d[key]);
+        };
+
+        NativeUCCLGinResources resources;
+        resources.d2h_queues = reinterpret_cast<void*>(get_u64("d2h_queues_ptr"));
+        resources.num_queues = get_u32("num_queues");
+        resources.window_base = get_u64("window_base");
+        resources.atomic_tail_base = get_u64("atomic_tail_base");
+        resources.num_scaleout_ranks = get_i32("num_scaleout_ranks");
+        resources.num_scaleup_ranks = get_i32("num_scaleup_ranks");
+        resources.scaleout_rank = get_i32("scaleout_rank");
+        resources.scaleup_rank = get_i32("scaleup_rank");
+        resources.num_lanes = get_u32("num_lanes");
+
+        EP_HOST_ASSERT(resources.d2h_queues != nullptr);
+        EP_HOST_ASSERT(resources.num_queues > 0);
+        EP_HOST_ASSERT(resources.window_base != 0);
+        EP_HOST_ASSERT(resources.atomic_tail_base != 0);
+        EP_HOST_ASSERT(resources.num_scaleout_ranks == nccl_context->num_scaleout_ranks);
+        EP_HOST_ASSERT(resources.num_scaleup_ranks == nccl_context->num_scaleup_ranks);
+        EP_HOST_ASSERT(resources.scaleout_rank == nccl_context->scaleout_rank_idx);
+        EP_HOST_ASSERT(resources.scaleup_rank == nccl_context->scaleup_rank_idx);
+        EP_HOST_ASSERT(resources.num_lanes > 0);
+
+        uccl_gin_resources = resources;
+        uccl_gin_resources_enabled = true;
     }
 
     // ReSharper disable once CppMemberFunctionMayBeStatic
@@ -1023,6 +1068,7 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, deterministic, do_cpu_sync,
+                        uccl_gin_resources_enabled ? &uccl_gin_resources : nullptr,
                         comm_stream);
 
         // Received token counters
@@ -1368,6 +1414,7 @@ static void register_apis(pybind11::module_& m) {
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("get_native_v2_resources", &ElasticBuffer::get_native_v2_resources)
+        .def("set_uccl_gin_resources", &ElasticBuffer::set_uccl_gin_resources)
         .def("barrier", &ElasticBuffer::barrier)
         .def("engram_write", &ElasticBuffer::engram_write)
         .def("engram_fetch", &ElasticBuffer::engram_fetch)
