@@ -61,6 +61,36 @@ __device__ __forceinline__ uint64_t rail_put(d2hq::D2HHandle* q, int dst_rank,
   return slot;
 }
 
+// Rail put + EFA piggyback tail add: one payload WRITE carries a receiver-side
+// software-atomic immediate.  This mirrors the original UCCL/EP EFA path where
+// a chunk payload WR also advances the channel tail, avoiding a separate tiny
+// WRITE_WITH_IMM for the count update.
+//
+// The 16B TransferCmd stores the piggyback delta in `atomic_val`, an 8-bit field
+// sharing the bytes word, so this helper is intentionally chunk-count only
+// (1..255).  Larger finish/control deltas still use rail_red_add.
+__device__ __forceinline__ uint64_t rail_put_tail_add(
+    d2hq::D2HHandle* q, int dst_rank, uint32_t bytes,
+    uint32_t local_off_shifted, uint32_t remote_off_shifted, uint32_t count_delta,
+    uint32_t atomic_byte_off) {
+  if (count_delta == 0 || count_delta > 0xFFu || atomic_byte_off > kAtomicOffMask ||
+      (atomic_byte_off & 0x7u)) {
+    __trap();
+  }
+  TransferCmd cmd{};
+  cmd.cmd_type = make_cmd_type(CmdType::WRITE, /*is_combine=*/false,
+                               /*low_latency=*/false);
+  cmd.dst_rank = static_cast<uint8_t>(dst_rank);
+  cmd.bytes = bytes;
+  cmd.atomic_val = static_cast<uint8_t>(count_delta);
+  cmd.req_lptr = local_off_shifted;
+  cmd.req_rptr = remote_off_shifted;
+  cmd.atomic_offset = static_cast<uint16_t>(atomic_byte_off);
+  uint64_t slot = 0;
+  q->atomic_set_and_commit(cmd, &slot);
+  return slot;
+}
+
 // Rail red_add_rel: ordered remote atomic add of `delta` to the int64 counter at
 // `atomic_byte_off` inside the receiver's atomic buffer on global rank `dst_rank`.
 // The proxy applies it in seq order (PackAtomicWithSeq) so a stream of adds to

@@ -1494,3 +1494,1438 @@ proxy profile 观察:
     WRITE 和对应 wait 语义正确。
   - release fence 应从“本批有 ATOMIC 就等所有 WRITE”改成 per-ring/per-tail-word
     fence,避免一个 busy ring 拖住同 proxy batch 里的其他 ring。
+
+## 2026-06-05:在 UCCL-GIN 层补回 payload-before-tail 保证(对照 NCCL-GIN 源码)
+
+### NCCL-GIN 怎么做到的(查 nccl 源码确认)
+
+原版 DeepEP forward warp 直接信 tail、不做 readiness,是因为 NCCL-GIN **保证 signal
+(tail)在 payload 之后生效**。机制不是“一个 GIN op 原子完成”,而是 **对 signals MR
+强制 strong ordering(SO)**:
+- `nccl/src/gin/gin_host_proxy.cc:475`:“Enforcing strong ordering on the signals mr
+  is vital to ensure ordering between puts and signals.”,signals MR 用
+  `NCCL_NET_MR_FLAG_FORCE_SO` 注册。
+- `nccl/src/gin/gin_host.cc:374`:`NCCL_WIN_STRICT_ORDERING → NCCL_NET_MR_FLAG_FORCE_SO`。
+- 即:payload 走 relaxed MR 拿带宽,signal 走 SO MR;NIC/libfabric 保证对 SO MR 的写
+  排在之前 payload 写之后。无 CPU 等待、无序列化。
+（更正:之前把 profiling 的 “RDMA/SO” 当 strong-ordering 是错的——那是 scale-out。
+故无证据 EFA 经 raw ibverbs 支持 SO MR。）
+
+### 为什么 UCCL-GIN 不能照搬 SO MR
+
+- UCCL 走 raw ibverbs/efadv,EFA MR 用 `IBV_ACCESS_RELAXED_ORDERING` 注册
+  (`ep/src/rdma.cpp:616/782`),没有 NCCL/libfabric 的 `FORCE_SO` 通道。
+- 关键:UCCL 的 tail 不是“NIC 写 MR”,而是 **receiver CPU proxy 收 write-with-imm 后
+  fetch_add**(EFA 无硬件 remote atomic)。没有可被 strong-order 的目标 MR。
+
+### UCCL-GIN 等价保证:proxy completion fence
+
+UCCL 有 NCCL 没有的 CPU proxy completion 信息。用它定序:**先 post payload WRITE,等
+其 CQE(EFA 可靠,CQE == 已送达 receiver 内存),再 post tail ATOMIC**。tail 的 imm
+在 payload 落地后才到 → CPU proxy apply count 时 payload 已在 recv buffer → forward
+warp 信 tail 即可,与原版一致。这正是之前删掉的 per-batch fence 思路;当时换成
+receiver readiness 反而引入 epoch bug(同 token 每轮同 `src_token_global_idx`、slot 不清、
+无轮号 → 多轮读陈旧)。现改回 fence + **删 readiness**。
+
+### 本次改动
+
+- `ep/src/proxy.cpp`:
+  - `post_gpu_commands_mixed` 末尾:`flush_writes(); 若有 atomic 则 quiet_cq({}) 等
+    payload WRITE completion; 再 flush_atomics()`,保证 tail 在 payload 之后 post。
+  - `quiet_cq`:completion 后从 `inflight_write_wrs_` erase(原来只清本地 pending、不清
+    `inflight_write_wrs_` → 无界增长 + 跨批可能死等已被清出 `acked_wrs_` 的旧 WR)。
+    顺带修的 lifecycle bug。
+- `thirdparty/.../impls/hybrid_dispatch.cuh`:删 `#ifdef DEEPEP_USE_UCCL_GIN` 的
+  readiness spin 段 + `last_forward_src_token_global_idx`;forward warp 回到原版“信 tail”。
+
+### 取舍 / 待办
+
+- fence 当前是 per-proxy-thread(等该线程全部 inflight write),非 per-ring,会让 busy
+  ring 拖住同线程其他 ring;correctness 优先,后续改 per-ring。
+- tail 频率:每 `kScaleoutUpdateInterval` token 一次,应从上游默认 3 调到 ~32(fork
+  sweep 最优),否则 fence 触发过频——首要 perf 旋钮。
+- “NCCL 在 GIN handle 的就在 UCCL-GIN handle”:NCCL `ncclGinOptFlagsAggregateRequests`
+  ↔ UCCL proxy 侧 coalescing(合并连续 WRITE),是 P3,不在本次。
+- ⚠️ 本次本地盲改,需上服务器 compile + 多轮 + payload correctness 验证(确认删 readiness
+  后多轮不读陈旧、fence 不死锁)。
+
+## 2026-06-05:改成 per-ring 小 batch payload-before-tail fence
+
+上一次实现的问题:
+
+- fence 只放在 `post_gpu_commands_mixed()` 末尾,如果一个 proxy batch 中出现
+  `WRITE -> ATOMIC -> WRITE`,中间的 ATOMIC 会被后面的 WRITE 触发提前
+  `flush_atomics()`,没有等前面的 payload WRITE CQE。
+- `quiet_cq({})` 会把整个 proxy thread 的 `inflight_write_wrs_` 全等完,这比原
+  UCCL/EP 的 channel/ring 语义更粗,会让无关 channel 被最慢 WR 拖住。
+- 只记录当前函数里的 WRITE 也不够:payload WRITE 可能在上一次 proxy poll 已经 post,
+  对应 tail ATOMIC 在下一次 poll 才出现。
+
+本次改动:
+
+- `ep/src/proxy.cpp`
+  - 新增 `pending_signal_write_wrs_[ring]`:每个 D2H ring 记录“上一次 tail 之后、已经
+    post 但还没有被对应 tail signal 消费”的 payload WRITE WR id。
+  - WRITE batch post 后,WR id 进入对应 ring 的 pending 列表和 `inflight_write_wrs_`。
+  - ATOMIC/tail 到来时,先 `flush_writes()`,再消费该 ATOMIC 所属 ring 的 pending
+    payload WR,形成一个小 release batch。
+  - `flush_atomics_ordered()` 只等待这个小 release batch 的 CQE,再 post ATOMIC batch。
+    它不会全局 drain 同 proxy thread 上其他 ring 的 WRITE。
+  - `wait_for_write_cq()` 会用 `inflight_write_wrs_` 过滤 release WR:已经被普通
+    completion/notify 退役的 WR 视为已满足,避免跨 poll 场景死等旧 ack。
+  - `notify_gpu_completion()` 退役 WR 时,同时从 per-ring pending 列表删除,保持列表有界。
+- `thirdparty/DeepEP-v2-d4f41e4/.../hybrid_dispatch.cuh`
+  - `DEEPEP_USE_UCCL_GIN` 下把默认 `kScaleoutUpdateInterval` 从 3 调到 32,让 tail
+    signal 变成小 batch,类似 NCCL-GIN aggregate/signal batching 和原 UCCL/EP
+    的 batching 思路。
+  - forwarder 注释改为依赖 Rail transport 的 payload-before-tail ordering,不再保留
+    V2-only metadata readiness spin。
+
+设计状态:
+
+- correctness 语义现在是:同一 D2H ring/channel 上,tail ATOMIC 发布前只等待该 ring
+  自上次 tail 以来的 payload WRITE 完成;这比全 proxy quiet 更接近原 UCCL/EP 的
+  channel-level substrate。
+- performance 语义现在是:device 侧每约 32 个 token 发一次 tail,proxy 侧每个 tail
+  batch 做一次 exact release fence。下一步需要上服务器重新 build/JIT,验证 EP8x2
+  correctness 和 README-like dispatch bandwidth。
+
+## 2026-06-05:服务器验证 exact fence,退回 coarse proxy quiet
+
+用户更新约束:
+
+- 最近服务器一般没人用,后续默认不必每次执行 GPU 空闲检查;只有异常/长实验/不确定时再查。
+- 已同步更新 `AGENTS.md`。
+
+构建:
+
+- 同步本轮改动到 `p5en_0:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang`。
+- `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+  通过。
+- Python import 检查通过:
+  - `uccl.ep` 来自 venv site-packages 的 `ep.abi3.so`
+  - `deep_ep` 来自 vendored `thirdparty/DeepEP-v2-d4f41e4`
+  - `deep_ep.ElasticBuffer.init_uccl_gin == True`
+
+实验 1: exact per-ring fence + `kScaleoutUpdateInterval=32`
+
+- 命令:EP8x2 smoke
+  `--num-processes 8 --test-first-only --skip-perf-test --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_exact_smoke_rank0.log`
+  - rank1:`/tmp/uccl_gin_exact_smoke_rank1.log`
+- 结果:失败。
+- 现象:
+  - 多个 rank 触发 `dispatch_copy_epilogue.cuh:106`
+    `ptx::deduplicate(dst_expert_idx, lane_idx) or dst_expert_idx == -1`
+  - expanded dispatch 最终报 CPU wait count 全 0。
+- 结论:硬把 UCCL-GIN 默认 tail interval 从 3 改成 32 不安全;小 batch 不能直接改
+  template 默认值,需要有更完整的 coalescing/receiver 语义验证。
+
+实验 2: exact per-ring fence + 上游默认 `kScaleoutUpdateInterval=3`
+
+- 同步退回 interval=3 后重跑同样 EP8x2 smoke。
+- 日志:
+  - rank0:`/tmp/uccl_gin_exact_smoke_i3_rank0.log`
+  - rank1:`/tmp/uccl_gin_exact_smoke_i3_rank1.log`
+- 结果:rank0/rank1 exit code 均为 0。
+- 结论:exact per-ring fence 在小配置 correctness 上可行。
+
+实验 3: exact per-ring fence + interval=3 的 README-like EP8x2
+
+- 命令:
+  `--num-processes 8 --test-first-only --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_exact_readme_i3_rank0.log`
+  - rank1:`/tmp/uccl_gin_exact_readme_i3_rank1.log`
+- 结果:失败。
+- 现象:大配置很快触发大量 `dispatch_copy_epilogue.cuh:106` metadata assert。
+- 结论:per-ring exact release fence 的依赖范围太窄,大配置下会漏掉跨 queue/ring 的
+  payload-before-tail 依赖。小配置通过不代表语义正确。
+
+代码状态修正:
+
+- `ep/src/proxy.cpp` 已退回 conservative coarse proxy quiet:
+  - 遇到 ATOMIC/tail 前先 post pending WRITE。
+  - `quiet_cq({})` drain 当前 proxy thread 的全部 inflight WRITE。
+  - 再 post ATOMIC batch。
+- 删除了 per-ring pending WR 状态和 unused `wait_for_write_cq`。
+- `hybrid_dispatch.cuh` 保持上游默认 `kScaleoutUpdateInterval=3`,只保留删除
+  receiver metadata readiness spin 和注释更新。
+
+下一步:
+
+- 重新同步 coarse quiet 版本并跑 README-like EP8x2,应恢复上一版 correctness。
+- 小 batch/性能优化需要另开一个安全设计:不能只靠 ring id 推断 dependency,更像
+  UCCL/EP 原 internode 的 batching,需要显式 batch 边界或 proxy coalescing。
+
+实验 4: coarse proxy quiet + 上游默认 `kScaleoutUpdateInterval=3` 的 README-like EP8x2
+
+- 已重新同步 coarse quiet 版本到服务器并 rebuild `ep`。
+- 命令:
+  `--num-processes 8 --test-first-only --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_coarse_readme_rank0.log`
+  - rank1:`/tmp/uccl_gin_coarse_readme_rank1.log`
+- 结果:rank0/rank1 exit code 均为 0。
+- rank0/node0 local rank 0-7:
+  - expanded dispatch 约 `36-37 GB/s (RDMA/SO)`,约 `118-120 GB/s (NVLink/SU)`,
+    latency 约 `3348-3362 us`。
+  - cached dispatch 约 `36-37 GB/s (RDMA/SO)`,约 `118-120 GB/s (NVLink/SU)`,
+    latency 约 `3340-3364 us`。
+  - combine RDMA/SO 约 `13-22 GB/s`。
+- rank1/node1 local rank 8-15:
+  - expanded dispatch 约 `6 GB/s (RDMA/SO)`,约 `19-20 GB/s (NVLink/SU)`,
+    latency 约 `20642-20653 us`。
+  - cached dispatch 约 `6 GB/s (RDMA/SO)`,约 `19-20 GB/s (NVLink/SU)`,
+    latency 约 `20457-20474 us`。
+  - combine RDMA/SO 约 `13-22 GB/s`。
+
+结论:
+
+- coarse proxy quiet 恢复了 README-like EP8x2 correctness,说明当前主路径仍应保持
+  substrate-level ordering,不能采用刚验证失败的 per-ring exact fence。
+- 但是 coarse quiet 版本出现明显 rank 不对称:node0 dispatch 已到 `36-37 GB/s`,
+  node1 dispatch 只有 `6 GB/s`。这比单纯“proxy quiet 串行化”更像是单侧 proxy/CQ/NIC
+  lane 选择、CPU 线程调度、remote direction 或 JIT/cache 状态导致的失衡。
+- 下一轮性能排查应先复现并拆分 node0/node1:
+  - 开启 proxy command/profile 计数,比较两侧 WRITE/ATOMIC 数量、CQ wait 时间、quiet 次数。
+  - 检查两侧 selected NIC/lane 分布是否一致。
+  - 做一次 warm-cache 重跑确认是否稳定复现。
+  - 再设计真正的小 batch/coalescing,不能用硬改 `kScaleoutUpdateInterval=32`。
+
+## 2026-06-05:异步 per-tail dependency + receiver metadata readiness
+
+review 结论采纳:
+
+- `flush_atomics_ordered()` 里每个 tail batch 前 `quiet_cq({})` 会把整个 proxy
+  thread 的 inflight WRITE 全部同步 drain。
+- 由于 DeepEP V2 dispatch 默认约每 `kScaleoutUpdateInterval=3` 个 token 发一次
+  scaleout tail,这会把网络上在飞 payload 限制在约 3 个 WR,严重破坏 EFA pipeline。
+- 这不是最终性能方案,应该改成异步 per-tail dependency:tail batch 记录自己依赖的
+  payload WR id,proxy 继续 post 后续 WRITE;在普通 CQ polling 中看到依赖 WR 完成后,
+  再 post 对应 ATOMIC/tail。
+
+代码改动:
+
+- `ep/src/proxy.cpp`
+  - 新增 `PendingAtomicBatch` 队列。
+  - WRITE post 后把 WR id 加入 `atomic_dependency_wrs_`。
+  - 遇到 ATOMIC/tail 时不再调用 `quiet_cq({})`,而是 `enqueue_pending_atomics(...)`。
+  - `notify_gpu_completion()` 通过 `retire_inflight_write()` 递减 pending batch 的
+    `pending_writes`。
+  - `progress_pending_atomics()` 只 post 队首且依赖已满足的 ATOMIC batch,保持 tail
+    batch FIFO 顺序。
+  - `QUIET/BARRIER` 保守调用 `drain_pending_atomics()`,不影响 dispatch hot path。
+- `hybrid_dispatch.cuh`
+  - 恢复 UCCL-GIN receiver-side metadata readiness check。
+  - tail 只表示 slot range 已发布;每个 slot 还要用 V2 `src_token_global_idx`
+    证明 payload metadata 已经对 receiver GPU 可见。
+
+中间失败:
+
+- 只做异步 per-tail dependency,不加 receiver metadata readiness,EP8x2 smoke 会触发
+  `dispatch_copy_epilogue.cuh:106` metadata assert。
+- 日志:
+  - rank0:`/tmp/uccl_gin_async_smoke_rank0.log`
+  - rank1:`/tmp/uccl_gin_async_smoke_rank1.log`
+- 结论:sender CQE + tail 后发并不足以当作 receiver GPU payload-ready 证明;这和
+  UCCL/EP 原来依赖 per-token epoch/tag readiness 的思路一致。
+
+验证 1:async tail + receiver metadata readiness 的 EP8x2 smoke
+
+- 命令:
+  `--num-processes 8 --test-first-only --skip-perf-test --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_async_meta_smoke_rc_rank0.log`
+  - rank1:`/tmp/uccl_gin_async_meta_smoke_rc_rank1.log`
+- 结果:rank0/rank1 rc 均为 0。
+- 注:一次重跑遇到 `MASTER_PORT=29653` 的 `EADDRINUSE`,换到 `29711` 后通过。
+
+验证 2:async tail + receiver metadata readiness 的 README-like EP8x2
+
+- 命令:
+  `--num-processes 8 --test-first-only --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_async_meta_readme_rank0.log`
+  - rank1:`/tmp/uccl_gin_async_meta_readme_rank1.log`
+- 结果:rank0/rank1 rc 均为 0。
+- rank0/node0 local rank 0-7:
+  - dispatch/expanded dispatch 约 `36-37 GB/s (RDMA/SO)`,latency 约
+    `3332-3359 us`。
+  - cached dispatch 约 `36 GB/s (RDMA/SO)`,latency 约 `3373-3393 us`。
+  - combine/reduced combine 约 `16-22 GB/s (RDMA/SO)`。
+- rank1/node1 local rank 8-15:
+  - dispatch/expanded dispatch 约 `8 GB/s (RDMA/SO)`,latency 约
+    `16223-16267 us`。
+  - cached dispatch 约 `7 GB/s (RDMA/SO)`,latency 约 `16324-16339 us`。
+  - combine/reduced combine 约 `13-17 GB/s (RDMA/SO)`。
+
+结论:
+
+- 异步 tail dependency + receiver readiness correctness 可行,并删除了 hot path
+  中 per-tail synchronous global CQ drain。
+- 但是 dispatch BW 还没有达到预期:node0 仍约 `36-37 GB/s`,node1 从 coarse quiet
+  的约 `6 GB/s` 只提高到 `7-8 GB/s`。
+- 因此“每 3 token 全局 drain”确实是坏设计,但不是当前唯一主瓶颈。下一步应重点排查:
+  - node0/node1 方向不对称:proxy/CQ/NIC lane/CPU pinning/路由是否不同。
+  - receiver metadata readiness spin 是否成为 rank1 的等待主因。
+  - `AggregateRequests` 仍被忽略,每 token 一条约 14KB WRITE,还没有真正 small-batch/coalescing。
+  - tail frequency 仍是 interval=3;硬改 32 已证伪,需要按 UCCL/EP 的语义 batching
+    方式做,不能只改常量。
+
+## 2026-06-05:本地实现 proxy-side tail atomic coalescing,未上服务器
+
+用户要求:
+
+- 先改代码,不要上 server。
+- 优先处理 tail 数量过多的问题:不改 device 端 `kScaleoutUpdateInterval`,而是在
+  proxy 侧把同一目标的 tail add 合并,减少 receiver `WRITE_WITH_IMM` CQE/apply 次数。
+- 下一次上机需要 profile 两侧不对称:原始 atomic 命令数、实际 post 的 atomic WR 数、
+  coalesce 数量,以及 proxy poll/progress/post 时间占比。
+
+代码改动:
+
+- `ep/src/proxy.cpp`
+  - `PendingAtomicBatch` 现在在 post 前做 conservative coalescing。
+  - 只合并同一个 pending batch 中相邻且同目标的 ordered atomic:
+    `D2H ring/channel + dst_rank + cmd_type + req_rptr + atomic_offset` 必须一致。
+  - 合并后使用最后一个 D2H wr id 作为实际 verbs WR;前面被合并掉的 atomic ring
+    slots 记录到 `atomic_completion_aliases_`。
+  - 当实际 WR 的 CQE 到来时,`expand_atomic_completion_aliases()` 把 alias wr ids
+    一起加入 `acked_wrs_`,避免 D2H ring 因被合并的 atomic slot 未 ack 而卡死。
+  - 合并只在 `value` 累加仍落在 `[-kMaxSendAtomicValue, kMaxSendAtomicValue]`
+    范围时发生。
+  - profile 输出新增:
+    - `posted_atomic_wrs`
+    - `coalesced_atomic_wrs`
+    - `poll_us`
+    - `progress_atomic_us`
+    - `post_gpu_us`
+  - profile timing 仅在 `UCCL_PROXY_PROFILE_COMMANDS` 打开时取时钟,不污染默认 hot path。
+
+当前状态:
+
+- 仅本地修改,未同步/编译/运行服务器。
+- `git diff --check` 通过。
+
+## 2026-06-06:清理服务器环境,用 CUDA 13/NCCL 2.30.4 验证 UCCL-GIN coalescing
+
+用户要求:
+
+- 上服务器操作,先清理之前环境。
+- README 要求 CUDA 13+,不能继续使用临时装错的 CUDA 12.8 / PyTorch cu128 环境。
+
+环境清理和重新搭建:
+
+- 错误环境:
+  - `/home/ubuntu/uccl-gin-cu13-venv` 是一次误建环境,已不再使用。
+  - EFS 上的半成品 `/home/ubuntu/efs/yzhou/playground/daniel/.venvs/uccl-gin-cu13`
+    删除时遇到 stale file handle,不要依赖它。
+- 正确环境:
+  - 两台机器新建 `/home/ubuntu/.venvs/uccl-gin-cu13`。
+  - 安装 `torch==2.12.0+cu130`,`cuda-toolkit==13.0.2`。
+  - PyTorch cu130 默认安装 `nvidia-nccl-cu13==2.29.7`,但 vendored DeepEP V2
+    `_C` 按 NCCL `2.30.4` 编译。第一次 smoke 失败:
+    `NCCL library version is too old. This application was compiled with NCCL version 23004, but is running with NCCL library version 22907.`
+  - 随后升级两台机器 venv 内 `nvidia-nccl-cu13==2.30.4`。虽然 pip 提示与 torch
+    declared dependency 不一致,但这是当前 DeepEP V2 `_C` 必需的运行时版本。
+- 当前实例 IP 已变化:
+  - `p5en_0`: `ip-172-31-70-225`,内网 IP `172.31.70.225`
+  - `p5en_1`: `ip-172-31-71-140`,内网 IP `172.31.71.140`
+  - 旧 `MASTER_ADDR=172.31.78.36` 已失效,会导致 c10d `No route to host`。
+
+构建:
+
+- 同步本地 tracked 工作树到
+  `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/`。
+- `p5en_0`/`p5en_1` 都执行:
+  - `source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate`
+  - `CUDA_HOME=/usr/local/cuda-13.0`
+  - `LD_LIBRARY_PATH` 优先包含:
+    `/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/lib`
+  - `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+- 编译通过。`ep.abi3.so` 安装到两台机器各自的
+  `/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/`。
+- import check:
+  - `torch 2.12.0+cu130`,CUDA `13.0`,GPU 可用。
+  - `uccl.ep` 从当前 venv import。
+  - `deep_ep` 从 vendored
+    `thirdparty/DeepEP-v2-d4f41e4/deep_ep` import。
+
+验证 1:EP8x2 smoke
+
+- 命令:
+  `--num-processes 8 --test-first-only --skip-perf-test --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256`
+- 环境:
+  - `MASTER_ADDR=172.31.70.225`
+  - `DEEPEP_USE_UCCL_GIN=1`
+  - `EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN`
+  - `NCCL_NET_PLUGIN=ofi`
+  - `FI_PROVIDER=efa`
+  - `FI_EFA_USE_DEVICE_RDMA=1`
+  - `OFI_NCCL_FORCE_NUM_RAILS=4`
+  - `UCCL_PROXY_PROFILE_COMMANDS=1`
+- 日志:
+  - rank0:`/tmp/uccl_gin_cu13_smoke_rank0.log`
+  - rank1:`/tmp/uccl_gin_cu13_smoke_rank1.log`
+- 结果:rank0/rank1 rc 均为 0。
+
+验证 2:README-like EP8x2 first-case
+
+- 命令:
+  `--num-processes 8 --test-first-only --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+- 日志:
+  - rank0:`/tmp/uccl_gin_cu13_readme_rank0.log`
+  - rank1:`/tmp/uccl_gin_cu13_readme_rank1.log`
+- 结果:rank0/rank1 rc 均为 0。
+- dispatch / expanded dispatch / cached dispatch:
+  - 两台机器所有 rank 基本都在 `8 GB/s (RDMA/SO)`,latency 约 `15.9-16.1 ms`。
+  - 这比上一轮 node0 的 `36-37 GB/s` 更差,说明当前 coalescing 改动没有带来预期
+    性能收益,且 CUDA13/NCCL2304 这轮的整体行为需要和上一轮环境做 A/B。
+- combine / reduced combine:
+  - 大多 `14-22 GB/s (RDMA/SO)`。
+  - combine 仍主要是上游 NCCL-GIN/DeepEP 路径,不是完整 UCCL-GIN combine 替换。
+
+proxy profile 结论:
+
+- 每个 proxy thread 仍看到大量 atomic:
+  - `atomic_cmds` 约 `103k-156k`。
+  - `posted_atomic_wrs` 也约 `102k-156k`。
+  - `coalesced_atomic_wrs` 只有几百到一千左右。
+- 因此当前 conservative “同 pending batch 内相邻同目标 atomic 合并”命中率太低,
+  基本没有真正减少 receiver `WRITE_WITH_IMM` apply 数量。
+- 后续如果继续走 coalescing,需要改变合并窗口或按照原 UCCL/EP 的 semantic batching
+  思路在 device/proxy 协议层制造更大的同目标连续批次;仅在现有 pending batch 内合并
+  相邻 atomic 远远不够。
+
+## 2026-06-06:继续分析 batching,阅读原 UCCL-EP 和 NCCL GIN proxy 实现
+
+用户要求:
+
+- 参考原 `uccl/ep` 的 batching 写法,不要只靠自己写的新策略。
+- 进一步看 NCCL GIN 是怎么处理 `AggregateRequests` / batching / proxy 的。
+- 每次重要发现和更改都必须写进 `worklog.md`。
+
+本地代码改动记录:
+
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - notify count 的 Rail put lane hint 从默认 queue 改成 `thread_idx`。
+  - payload Rail put 仍按 `channel_idx` 选择 lane。
+  - 目的:避免所有 notify 小写集中到 queue 0,让它和 scaleout lane 分散方式更接近。
+- `ep/src/proxy.cpp` / `ep/include/proxy.hpp`
+  - atomic coalescing 从“相邻同目标”扩展成“同一个 pending batch 内按目标聚合”。
+  - 合并条件仍保守:同 D2H ring、同 `dst_rank`、同 `cmd_type`、同 `req_rptr`、
+    同 `atomic_offset`,且不是 low-latency atomic,累加后的 `value` 仍能放进
+    `[-kMaxSendAtomicValue, kMaxSendAtomicValue]`。
+  - 新增 `ready_atomic_batch_`:已经满足依赖的 pending atomic 不立刻 post,先攒到
+    `512` 个 wr 或 force/drain 时再 coalesce + post。
+  - 注意:这部分是本地实验性修改,目前尚未重新在服务器编译/跑 benchmark。
+    上一轮服务器验证的是更早版本的 coalescing,结果仍约 `8 GB/s (RDMA/SO)`。
+
+阅读原 UCCL-EP V1 batching:
+
+- 参考文件:
+  `/Users/daniel/Documents/code/uccl-danyang/uccl-danyang/ep/src/internode.cu`
+  以及当前仓库原 V1 路径 `ep/src/internode.cu`。
+- 关键观察:
+  - 原 V1 并不是在 CPU proxy 里简单把很多零散 WR 合成一个 batch。
+  - 它先在 GPU 语义层按 RDMA rank/channel 维护 send window/tail/next_tail,把 token
+    copy 到 per-dst channel send buffer。
+  - coordinator 再按连续 token chunk 发起大块 RDMA:
+    `num_bytes_per_token * num_tokens_to_issue`。
+  - EFA 分支把 tail add 作为 RDMA send 参数的一部分传下去,即 payload chunk 和 tail
+    增量在语义上是一组 batch。
+  - V1 receiver 还有 per-token/source epoch tag 作为 ready 判断,不是只依赖
+    sender-side CQ 顺序。
+- 对 V2 的影响:
+  - 当前 V2 `hybrid_dispatch.cuh` 的 local staging 是按原始 `token_idx` sparse 存在
+    `scaleout_send_buffer.get_token_buffer(token_idx)`。
+  - 远端 expanded slot 对同一个 channel/dst 是连续的,但本地源地址不是连续 per-dst
+    compact layout。
+  - 因此要完全复刻 V1 的“一个 RDMA WRITE 发送多个 token chunk”,需要两条路之一:
+    - 改 V2 staging layout,把发往同一 dst/channel 的 token 先 compact 到连续 send buffer。
+    - 或者在 proxy/verbs 层支持 multi-SGE gather:多个 sparse local token buffer SGE
+      写到一段连续 remote expanded slots。
+  - 当前 EFA QP 创建时 `max_send_sge = 1`,所以 multi-SGE 不是小改;需要改 QP cap、
+    post path 和 completion alias。
+
+阅读 NCCL GIN 源码:
+
+- 本地 NCCL 源码路径:
+  - `nccl/src/include/nccl_device/gin.h`
+  - `nccl/src/include/nccl_device/gin/proxy/gin_proxy.h`
+  - `nccl/src/gin/gin_host_proxy.cc`
+  - `nccl/src/transport/net_ib/gin.cc`
+  - `nccl/src/include/nccl_device/gin/gdaki/gin_gdaki.h`
+- `AggregateRequests` 的真实含义:
+  - `ncclGinOptFlagsAggregateRequests` 在 GDAKI/device verbs 后端被映射成
+    `DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_SKIP_DB_RINGING`。
+  - 也就是说,在真 device verbs 路径里它主要是“跳过 doorbell、让后续 flush/doorbell
+    合并提交”的语义。
+  - 在 CPU proxy 后端,`ncclGinApi_Put<NCCL_NET_DEVICE_GIN_PROXY>` 接收 `optFlags`,
+    但实际调用内部 `nccl::gin::proxy::put(...)` 时没有继续使用该 flag。
+  - 结论:对 NCCL proxy GIN 来说,`AggregateRequests` 本身不会自动把多个 payload
+    GFD/WR 合成一个大 WR。
+- NCCL proxy device queue:
+  - GPU 端写的是 128B `ncclGinProxyGfd_t` descriptor 到 per-peer queue。
+  - `postGfd()` 只做 PI/CI credit、descriptor 发布和 queue slot 管理。
+  - 每个 GFD 仍代表一个 put/get/signal/flush 请求。
+- NCCL host proxy:
+  - `ncclGinProxyProgress()` 每次 poll completions,然后对每个 target rank 最多 poll
+    一个 GFD 并直接调用 backend `iput` / `iputSignal` / `iget` / `iflush`。
+  - 没看到 host proxy 把多个 GFD 合并成一个 verbs WR 的逻辑。
+- NCCL IB proxy 的 payload-before-signal:
+  - `ncclGinIbProxyIPutSignal()` 生成两个 WR:
+    - payload `IBV_WR_RDMA_WRITE`,不 signaled。
+    - signal `IBV_WR_ATOMIC_FETCH_AND_ADD`,signaled。
+  - 两个 WR 链在一起,一次 `ibv_post_send` 提交。
+  - 它不是“先等 payload CQE,再 post signal”;因此不会像我们早期同步 drain 那样
+    把流水线深度限制在几个 token。
+
+本轮设计结论:
+
+- NCCL GIN proxy 给我们的主要启发不是“proxy 自动 payload coalescing”,而是:
+  - device queue 要薄,proxy 要持续 drain。
+  - payload 和 signal/tail 应尽量同批提交,不要在每个 tail 前同步 CQ drain。
+  - `AggregateRequests` 对 EFA CPU proxy 不能直接带来 payload batch;如果 AWS EFA
+    路径要减少小 WR,必须由 UCCL-GIN 自己在 V2 semantic 层或 verbs gather 层做 batch。
+- 更接近原 UCCL-EP 哲学的下一步候选:
+  - 短期:保持异步 tail dependency,移除同步全局 drain;继续降低 receiver atomic apply
+    次数,但不要指望 NCCL 的 `AggregateRequests` 自动生效。
+  - 中期:实现 V2 semantic batching,让同一 channel/dst 的多个 token 成为一个
+    payload batch。由于 V2 local source sparse,需要评估 compact staging vs
+    multi-SGE gather。
+  - 如果走 multi-SGE gather,必须同步修改 EFA QP `max_send_sge`、EFA post path、
+    completion alias 和 imm/ack 语义;这比单纯 proxy-side atomic coalescing 更接近
+    真正 payload batching。
+
+当前状态:
+
+- 本轮只做本地源码阅读和文档更新。
+- 最新本地实验性代码尚未同步服务器、未编译、未 benchmark。
+
+## 2026-06-06:profiling V2 semantic batching 是否值得做
+
+背景:
+
+- 用户提出:在下结论前先 profiling 关键路径,再判断是否可以实现 V2 semantic
+  batching,让同一 channel/dst 的多个 token 成为一个 payload batch。
+- 本轮目标不是先改 batching 语义,而是量化现有 V2/UCCL-GIN 命令流里到底有多少
+  可 batch 的连续 token。
+
+本地 instrumentation:
+
+- 修改 `ep/include/proxy.hpp` 和 `ep/src/proxy.cpp`,在
+  `UCCL_PROXY_PROFILE_COMMANDS=1` 时追加只读 profile,不改变 transfer 语义。
+- 在 `post_gpu_commands_mixed()` 开始处统计:
+  - `stream_remote_*`: 当前命令流中连续 WRITE,同 ring/dst/bytes 且 remote offset
+    连续。
+  - `stream_local_*`: 同时要求 local offset 也连续。
+  - `semantic_remote_*`: 按 `(ring,dst)` 忽略中间 tail/atomic 后,remote offset 是否可
+    继续连续。
+  - `semantic_local_*`: semantic run 中 local offset 是否也连续。
+  - `semantic_gather_*`: remote 连续但 local 不连续的 semantic run,即只能通过
+    multi-SGE gather 或额外 compact staging 才可能合成一个 payload batch。
+- 修正了前一轮实验性 `ready_atomic_batch_` 路径:该路径在 smoke test 中触发
+  DeepEP forward timeout,不作为正确 profiling 基线;已删除,恢复成原本按
+  pending batch 顺序 progress 的路径。
+
+服务器构建:
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0
+export LIBRARY_PATH=/home/ubuntu/local-lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/ubuntu/local-lib:/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16
+```
+
+构建结果:
+
+- p5en_0 构建通过,只有 warning。
+- 同步 `ep/ep.abi3.so` 到 p5en_1 的 venv `uccl/` 包目录。
+
+smoke test:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-perf-test \
+  --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256
+```
+
+环境:
+
+```bash
+export DEEPEP_USE_UCCL_GIN=1
+export EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN
+export UCCL_PROXY_PROFILE_COMMANDS=1
+export NCCL_NET_PLUGIN=ofi
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export OFI_NCCL_FORCE_NUM_RAILS=4
+unset EP_DISABLE_GIN
+unset OFI_NCCL_GIN_GDAKI
+```
+
+smoke 结果:
+
+- 两节点均 `rc=0`。
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_semantic_profile_smoke2_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_semantic_profile_smoke2_rank1.log`
+- 小配置已经显示 local contiguous run 为 0,remote contiguous run 很短。
+
+README-like profile:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-check \
+  --num-sms 20 --num-tokens 8192 --hidden 7168 \
+  --num-topk 8 --num-experts 256 --ignore-local-traffic
+```
+
+结果:
+
+- 两节点均 `rc=0`。
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_semantic_profile_readme_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_semantic_profile_readme_rank1.log`
+- 打开 profiling 后 bandwidth 不代表最终性能,但可用于判断命令结构:
+  - dispatch/expanded/cached 大约 `4 GB/s (RDMA/SO)`,约 `15.8-16.2 ms`。
+  - combine/reduced combine 大约 `7-11 GB/s (RDMA/SO)`。
+
+两节点 profile 汇总:
+
+```text
+profiles                         64
+write_cmds sum                   24,282,920
+write_bytes sum                  182,578,798,336
+atomic_cmds sum                  8,284,068
+posted_atomic_wrs sum            8,236,036
+coalesced_atomic_wrs sum         48,032
+
+stream_remote_runs sum           1,562,611
+stream_remote_tokens sum         3,365,843
+stream_remote_max                3
+stream_local_runs sum            0
+stream_local_tokens sum          0
+stream_local_max                 0
+
+semantic_remote_runs sum         2,124,482
+semantic_remote_tokens sum       4,626,098
+semantic_remote_max              6
+semantic_local_runs sum          0
+semantic_local_tokens sum        0
+semantic_local_max               0
+
+semantic_gather_runs sum         2,124,482
+semantic_gather_tokens sum       4,626,098
+semantic_gather_max              6
+semantic_local_token_fraction    0/4626098
+semantic_gather_token_fraction   4626098/4626098
+```
+
+解释:
+
+- 现有 command stream 里真正连续出现的 remote payload 最多只有 3 个 token。
+- 即使按 `(ring,dst)` 忽略 tail/atomic,把同一 channel/dst 的 token 当作 semantic
+  run,remote contiguous run 也只有 5-6 个 token。
+- `semantic_local_runs=0` 表明这些候选 batch 的本地源地址从未连续;全部
+  `semantic_remote_tokens` 都落入 `semantic_gather_tokens`。
+- 因此“在 proxy 里把已有 token WRITE 简单拼成一个大 contiguous WRITE”不成立:
+  remote expanded slot 偶尔连续,但 local staging 是按原始 token index sparse 存放。
+
+当前判断:
+
+- V2 semantic batching 这个方向不是完全走不通,但不能是 proxy-only 的简单 WR
+  coalescing。
+- 如果只在 proxy 层做,最多只能做 5-6 token 的 multi-SGE gather batch;这要求改
+  EFA QP `max_send_sge`、post path、completion alias,而且 batch 太小,未必能抵消
+  gather/SGE 的 CPU 和 NIC 成本。
+- 更像原 UCCL-EP/V1 的高性能方案,应该是在 V2 JIT/semantic 层引入 compact
+  per-channel/per-dst send staging,让本地源地址也连续,再发一个真正的大 payload
+  WRITE batch。
+- 下一步如果继续推进 semantic batching,建议先实现/评估 compact staging 的额外
+  GPU copy 成本,而不是直接改 proxy 做 multi-SGE。
+
+## 2026-06-06:对比 V1 chunked RDMA 与 V2 sparse send buffer 后的 batching 设计判断
+
+对照源码:
+
+- V1: `ep/src/internode.cu:1066-1106`
+  - coordinator warp 等到某个 dst/channel 有足够 token ready。
+  - `num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens)`。
+  - 单次 `nvshmemi_ibgda_put_nbi_warp()` 发送
+    `num_bytes_per_token * num_tokens_to_issue`。
+  - EFA 分支把 `rdma_channel_tail` offset 和 `num_tokens_to_issue` 作为参数传下去,
+    payload WRITE 与 tail delta 在语义上绑定,不是额外每 token 一个独立 tail WR。
+- V2: `thirdparty/DeepEP-v2-d4f41e4/.../hybrid_dispatch.cuh:421-508`
+  - 每个 scaleout warp 按 `token_idx = channel_idx; token_idx += kNumChannels`
+    遍历原始 token。
+  - 先把当前 token TMA store 到
+    `scaleout_send_buffer.get_token_buffer(token_idx)`。
+  - 远端目的地是
+    `scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx)`。
+  - 随后对单个 token 调 `gin.put(..., tma_buffer.get_num_bytes<false>(), ...)`。
+
+关键差异:
+
+```text
+V1 send layout:
+
+  send_buffer[dst_rank][channel][slot 0][slot 1][slot 2]...
+                              └──── contiguous per dst/channel ────┘
+
+  coordinator sees ready tail/head:
+      slot 0..5 ready  ->  one RDMA WRITE for 6 tokens
+
+
+V2 current send layout:
+
+  scaleout_send_buffer[token_idx]
+
+  token_idx stream in one channel:
+      token 0 -> dst 1 -> local slot token[0]
+      token 80 -> dst 3 -> local slot token[80]
+      token 160 -> dst 1 -> local slot token[160]
+
+  remote expanded slots may be contiguous per dst/channel,
+  but local source slots are sparse in original token_idx space.
+```
+
+设计判断:
+
+- 用户提出的 “V1 每 WRITE 大约 6 tokens,当前 V2 每 WRITE 1 token,WR 数量差巨大”
+  是结构性问题,不是简单 tuning。
+- 但直接在 smem 里攒 6-8 个 token 再发也不现实:
+  - 当前 `tma_buffer` 是按 warp/单 token 设计。
+  - hidden=7168 时单 token staging 已经是十几 KB 量级。
+  - 多个 scaleout/forward warp 同时持有多 token batch 会超过 H200 单 SM shared memory
+    可用容量。
+- 因此真正可行的方向不是 “smem batch”,而是 “global compact staging + coordinator”:
+
+```text
+Scaleout producer warps:
+
+  input token stream
+        |
+        | classify dst/channel, reserve compact slot
+        v
+  compact_send[dst][channel][slot]
+        |
+        | publish per-dst/channel ready tail
+        v
+
+Coordinator / issuer warp:
+
+  read ready tail/head
+        |
+        | issue chunks of N tokens
+        v
+  RDMA WRITE compact_send[dst][channel][head:head+N]
+        |
+        | piggyback / coalesced tail delta N
+        v
+  remote V2 expanded recv[dst][channel][slot:slot+N]
+```
+
+需要注意的 V2 语义:
+
+- compact slot 必须仍然对应 V2 expanded slot,不能回到 V1 packed token staging。
+- `dst_buffer_slot_idx`、`token_metadata_at_forward`、forward linked-list/reorder 所需
+  metadata 需要能从 compact slot 映射回 V2 的 expanded slot 和原始 token metadata。
+- dispatch 可以先做;combine 后续要按 V2 reduced-combine 的反向 metadata 设计同类
+  compact/gather 机制。
+
+短期不推荐:
+
+- 不推荐先做 proxy-only multi-SGE gather:
+  - profile 显示 semantic remote run 最大只有 5-6。
+  - local contiguous run 为 0,所有候选都需要 gather。
+  - EFA QP 当前 `max_send_sge=1`;改 multi-SGE 要动 QP cap、post path、completion
+    alias,收益不一定覆盖 SGE 开销。
+- 不推荐在 smem 里直接攒 token batch:
+  - shared memory 容量和 V2 多 warp 并发模式不匹配。
+
+更合理的阶段方案:
+
+1. 在 V2 dispatch JIT 中新增 global compact send buffer layout:
+   `compact_send[scaleout_rank][channel][slot]`。
+2. producer warp 对每个 remote token:
+   - 用 per-dst/channel tail reserve compact slot。
+   - TMA store 单 token 到 compact slot。
+   - 写必要 metadata: original token idx、topk、weight、expanded slot。
+3. coordinator warp 复用 V1 chunked send 思路:
+   - 每 dst/channel 读 ready tail 和 last issued head。
+   - 满 `chunk_tokens` 或 finish 时发一个大 payload WRITE。
+   - tail delta 按 chunk 发,避免每 3 token 独立 tail。
+4. receiver 仍直接落 V2 expanded layout,不要引入 V1 packed receive staging。
+5. 先用 instrumentation 估算:
+   - compact copy cost。
+   - chunk size 分布。
+   - WR 数减少比例。
+   - tail WR/apply 减少比例。
+
+## 2026-06-06:review `ep/docs/uccl_gin_compact_staging.md`
+
+用户指出:
+
+- 如果方案等于重写半个 scaleout kernel,并且引入新的 V1-like buffer,那升级到 V2 的
+  意义会被削弱。
+- 需要 review `ep/docs/uccl_gin_compact_staging.md` 中“不新增 buffer,只改
+  `scaleout_send_buffer` 索引方式”的方案。
+
+代码对照:
+
+- `hybrid_dispatch.cuh` 当前 dispatch buffer:
+  - `scaleup_buffer`
+  - `scaleout_send_buffer = BufferLayout(token_layout, 1, kNumMaxTokensPerRank, ...)`
+  - `scaleout_recv_buffer = BufferLayout(token_layout, kNumScaleoutRanks,
+    kNumChannels * kNumMaxTokensPerChannel, scaleout_send_buffer.get_buffer_end_ptr())`
+- `buffer.hpp::get_dispatch_buffer_size()` 也只给 hybrid dispatch 的
+  `scaleout_send_buffer` 预留 `kNumMaxTokensPerRank` 个 token slot。
+- 因此文档里 “同一个 `scaleout_send_buffer`,换一种索引方式,不新增 buffer” 这个
+  目标是好目标,但示例代码
+  `BufferLayout(token_layout, kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel, ...)`
+  实际会把 send buffer token slot 数扩成约
+  `kNumScaleoutRanks * kNumMaxTokensPerRank`,不是同一块大小。
+
+我认为文档方向正确的部分:
+
+- 关键洞察是对的:`scaleout_send_buffer` 只有 scaleout warp 写和同一 scaleout warp
+  读,receiver/forward 不读它。因此改它的临时发送索引,不等于回到 V1 的接收语义。
+- “不在 smem 攒 batch,直接把 TMA store 目标换成 compact send slot” 是正确方向,
+  避免了 shared memory 容量问题。
+- 这不会破坏 V2 最大价值:
+  - receiver 仍是 V2 expanded layout。
+  - forward metadata、linked list、`dst_buffer_slot_idx` 仍按 V2 走。
+  - 没有引入 V1 `SourceMeta` / prefix matrix / packed receive staging。
+  - 只是把 scaleout sender 的临时 send scratch 从 `token_idx` 视图换成
+    channel/dst compact 视图。
+
+文档需要修正的 load-bearing 问题:
+
+1. buffer 大小假设不成立。
+   - 如果要支持任意 `kNumScaleoutRanks`,每个 `(channel,dst)` 都分
+     `kNumMaxTokensPerChannel` slot,就需要约
+     `kNumScaleoutRanks * kNumMaxTokensPerRank` 个 send slot。
+   - 当前 DeepEP V2 只预留 `kNumMaxTokensPerRank` 个 send slot。
+   - 若坚持不新增 buffer,只能做更紧的 layout:
+     - 对 EP8x2/两节点优化:每个 rank 只有一个 remote scaleout dst,local bypass
+       不用 send buffer,因此可把同一块 send buffer 解释成
+       `send[channel][slot]`,slot 可直接用 `stored_dst_slot_idx`。
+     - 对多 scaleout rank:需要 overflow/ring credit 或增加 buffer size;不能只靠
+       `slots_per_channel_dst = tokens / channels / ranks`。极端路由下一个 channel
+       的所有 token 都可能去同一个 remote dst。
+2. `cur_batch` 单 batch 状态会在 dst 交错时频繁 flush。
+   - 如果 token 流是 `dst0,dst1,dst0,dst1`,单个 `cur_batch` 基本退化成 1-token
+     batch。
+   - 应该维护 per-dst batch 状态数组,至少对 scaleout dst 数量很小的 EP8x2 可以
+     用一个 remote batch;多节点则每 dst 一个小状态。
+3. compact slot 不需要新的 `atomicAdd`。
+   - `stored_dst_slot_idx` 已经是当前 channel/dst 的 V2 recv slot,由
+     `ptx::exchange(stored_scaleout_tail, dst)` 得到,天然唯一且单调。
+   - 可以直接用 `compact_slot = stored_dst_slot_idx` 作为 send compact slot,这样
+     local compact slot 和 remote expanded slot 一一对应,不需要额外
+     `compact_tail[channel][dst]`。
+4. `kNumChannels` 不应手写估算。
+   - kernel 中 `kNumChannels = kNumScaleoutWarps * kNumSMs`。
+   - 实际 README-like profile 更像 80 个 channel,文档里的 `8 x 20 = 160` 需要
+     用 JIT 参数确认,不能作为容量证明。
+
+更推荐的收敛版本:
+
+```text
+EP8x2 first:
+
+  scaleout_send_buffer still has kNumMaxTokensPerRank slots
+
+  reinterpret as:
+    send[channel][slot], slot in [0, kNumMaxTokensPerChannel)
+
+  for remote token:
+    compact_slot = stored_dst_slot_idx
+    TMA store -> send[channel][compact_slot]
+    append to this channel's current remote batch
+
+  coordinator/flush:
+    when contiguous compact slots accumulated to N or finish:
+      rail_put(send[channel][first_slot],
+               recv[remote_rank][channel][first_slot],
+               N * token_bytes)
+      rail_tail_add(N, finish?)
+```
+
+这个版本的优点:
+
+- 不新增 send buffer,不改 `calculate_buffer_size()`。
+- 不新增 compact tail allocator。
+- 对 EP8x2/两节点最强:每个 local rank 只有一个 remote scaleout peer,local bypass 不占
+  send buffer。
+- 仍然保留 V2 expanded receiver layout。
+
+限制:
+
+- 这首先是 EP8x2/AWS 两节点优化。若要推广到 3+ scaleout ranks,必须重新处理
+  send buffer 容量:
+  - 要么增加 send buffer 至 `(kNumScaleoutRanks - 1) * kNumMaxTokensPerRank` 级别。
+  - 要么做 per-dst ring/credit/reuse,但这会明显接近 V1 coordinator 复杂度。
+- batch 大小受每个 channel 的 token 数限制,不会达到论文 HT 的 32 token 常态;
+  但从 1 token WRITE 变成 4-8 token WRITE 仍然可能显著改善 EFA 小包瓶颈。
+
+结论:
+
+- `uccl_gin_compact_staging.md` 的大方向值得做,但应改成 “EP8x2 优先、不新增
+  buffer、用 `stored_dst_slot_idx` 作为 compact send slot” 的版本。
+- 不建议按文档当前示例直接实现 `[channel][dst][slot]` 全量分区,因为那会扩大
+  send buffer 或在 skew route 下溢出,与“不新增 buffer”的目标冲突。
+
+## 2026-06-06:按 UCCL-EP 论文修正 compact staging 的 chunk 目标
+
+用户指出:
+
+- 4-8 token batch 不够。
+- `2512.19849v2.pdf` 的 EFA/HT 优化中 chunk 默认/典型是 32 token。
+
+重新阅读论文相关段落:
+
+- §2.2:GPU-initiated token-level communication 的 transfer unit 可以是 per-token 到
+  32 tokens,用于在细粒度 overlap 和网络利用率之间折中。
+- §3.3:HT kernel 使用多个 communication channel/ring buffer 暂存待发送 token,以
+  configurable chunk 发送,典型值 32 tokens。
+- §3.3/§4.1:在 EFA/SRD 上不能靠 sender 等 CQE 来保证 write-then-atomic;更好的方式是
+  receiver-side immediate/control-buffer/reorder,只对局部 channel enforce ordering。
+
+对 V2 compact staging 的修正:
+
+- 之前把 “4-8 token” 作为目标是不够的,只能作为 smoke/debug 阶段参数。
+- 最终目标应是 32-token chunk:
+  - FP8 hidden=7168 时单 token 约 11-14KB。
+  - 32 token WRITE 约 350-450KB,进入 EFA 大消息区间。
+- 32-token chunk 不是靠 smem batch,也不是靠 proxy gather,而是靠 sender-side
+  per-channel ring/window。
+
+重要纠正:
+
+- 不应把同一个 send buffer 平均切成 `[channel][dst][slot]`:
+  - 这会导致每 dst slot 只有平均份额,无法保证 skew route。
+  - 如果给每 dst 都保留 `kNumMaxTokensPerChannel`,则实际扩大 send buffer。
+- 对 EP8x2 first,可以不新增 payload buffer:
+  - local dst 走 bypass,不占 `scaleout_send_buffer`。
+  - 每个 rank 只有一个 remote scaleout dst。
+  - 因此可把现有 `scaleout_send_buffer` 解释成 `send[channel][slot]`。
+  - `slot = stored_dst_slot_idx`,即 V2 已经分配的 remote expanded slot。
+  - README-like `num_sms=20`,若 `num_channels_per_sm=4`,则
+    `kNumChannels=80`,`kNumMaxTokensPerChannel=ceil(8192/80)=103`;
+    每 channel 可发 3 个 32-token chunk + 1 个残余 chunk。
+
+更新了 `ep/docs/uccl_gin_compact_staging.md`:
+
+- 把目标从 6-8 token 改成 32 token。
+- 明确 EP8x2 first 的 no-new-buffer 条件。
+- 移除新增 `compact_tail/atomicAdd` 的设计,改用 `stored_dst_slot_idx`。
+- 明确 3+ scaleout ranks 需要额外 send capacity 或 per-dst ring credit,不能套用
+  EP8x2 简化版。
+
+## 2026-06-06:实现 EP8x2 UCCL-GIN dispatch compact staging 初版
+
+用户指出的 buffer size review:
+
+- 文档/旧方案中的
+  `BufferLayout(token_layout, kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel, ...)`
+  会让 send buffer 变成 `kNumScaleoutRanks` 倍,不符合“不新增 buffer”。
+- EP8x2 下每个 rank 只有一个 remote scaleout dst,local dst bypass,因此 send buffer
+  应该按 `send[channel][slot]` 解释,不需要乘 `kNumScaleoutRanks`。
+
+本地代码改动:
+
+- 文件:
+  `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+- 仅在 `DEEPEP_USE_UCCL_GIN` 下启用 compact dispatch;非 UCCL/NCCL 原路径不动。
+- 新增 UCCL-GIN EP8x2 static assertions:
+  - `kNumScaleoutRanks == 2`。
+  - padded compact send + recv layout 仍落在 DeepEP V2 原 dispatch buffer size 内。
+- send buffer:
+  - 从 `kNumMaxTokensPerRank` 变为 `kNumChannels * kNumMaxTokensPerChannel` 的 padded
+    per-channel view。
+  - 不改 host `calculate_buffer_size()`;利用上游 dispatch recv buffer 中为
+    `kNumChannels * kNumMaxTokensPerChannel` 预留的 padding slack。
+- remote payload:
+  - remote lane 用 `compact_remote_slot_idx =
+    ptx::exchange(stored_scaleout_tail, remote_scaleout_rank_idx)` 获取当前 V2 remote
+    expanded slot。
+  - TMA store 到 `scaleout_send_buffer[channel][compact_remote_slot_idx]`。
+  - warp-uniform `compact_batch_count` 攒到 `32` token 或遇到非连续 slot/finish 后 flush。
+  - flush 时只由 remote lane 发一个大 `gin.put<Rail>` 和一个
+    `rail_tail_add(count_delta)`。
+- local payload/tail:
+  - local rank 仍 bypass 到 `scaleout_recv_buffer`。
+  - `update_scaleout_tail()` 在 UCCL-GIN 下只让 local lane 发 local tail;remote tail 由
+    compact batch flush 负责,避免 tail 早于 batched payload 到达。
+
+关键注意:
+
+- flush lambda 必须 whole-warp 调用,不能只在 remote lane 调用,否则内部 `__syncwarp()`
+  会死锁。当前 batch state 设计成 warp-uniform,只有实际 WR/tail post 由 remote lane 执行。
+- 这是 EP8x2 first 实现,不是 3+ scaleout ranks 通用方案。
+- 目前尚未服务器编译/验证。
+
+服务器验证:
+
+构建:
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0
+export LIBRARY_PATH=/home/ubuntu/local-lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/ubuntu/local-lib:/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16
+```
+
+- p5en_0 构建通过。
+- 将 `ep/ep.abi3.so` 复制到 p5en_1 的
+  `/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/`。
+
+第一次 smoke 失败原因:
+
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_compact32_smoke_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_compact32_smoke_rank1.log`
+- 失败发生在 NCCL init,不是 compact kernel:
+  `Failed to bind NVLink SHARP (NVLS) Multicast memory ... Disable NVLS`.
+- 后续验证都加 `NCCL_NVLS_ENABLE=0`。
+
+smoke correctness:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-perf-test \
+  --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256
+```
+
+环境关键项:
+
+```bash
+export DEEPEP_USE_UCCL_GIN=1
+export EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN
+export EP_JIT_CACHE_DIR=/tmp/deepep_jit_uccl_compact_32
+export NCCL_NVLS_ENABLE=0
+export NCCL_NET_PLUGIN=ofi
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export OFI_NCCL_FORCE_NUM_RAILS=4
+```
+
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_compact32_smoke_nvls0_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_compact32_smoke_nvls0_rank1.log`
+- 结果:无 traceback/assert/timeout,进程退出后无残留 GPU 进程。
+
+README-like EP8x2 first-case:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-check \
+  --num-sms 20 --num-tokens 8192 --hidden 7168 \
+  --num-topk 8 --num-experts 256 --ignore-local-traffic
+```
+
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_compact32_readme_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_compact32_readme_rank1.log`
+- 两节点 `EXIT:0`。
+- dispatch:
+  - rank0 local ranks: `18 GB/s (RDMA/SO)`,约 `3389-3404 us`。
+  - rank1 local ranks: `18 GB/s (RDMA/SO)`,约 `3363-3388 us`。
+- expanded dispatch:
+  - rank0: `18 GB/s (RDMA/SO)`,约 `3381-3409 us`。
+  - rank1: `18 GB/s (RDMA/SO)`,约 `3352-3374 us`。
+- cached dispatch:
+  - rank0: `18 GB/s (RDMA/SO)`,约 `3389-3409 us`。
+  - rank1: `18 GB/s (RDMA/SO)`,约 `3307-3359 us`。
+- combine/reduced combine 当前未改,仍约 `7-11 GB/s (RDMA/SO)`。
+
+profile 验证 command 数:
+
+- 日志:
+  - p5en_0: `/tmp/uccl_gin_compact32_readme_profile_rank0.log`
+  - p5en_1: `/tmp/uccl_gin_compact32_readme_profile_rank1.log`
+- 两节点 `EXIT:0`。
+- 汇总 `64` 条 `UCCL_PROXY_PROFILE`:
+
+```text
+write_cmds sum             956,288
+write_bytes sum            182,578,798,336
+atomic_cmds sum            952,320
+posted_atomic_wrs sum      952,320
+coalesced_atomic_wrs sum   0
+```
+
+对比 compact 前 profile:
+
+```text
+write_cmds sum    24,282,920  -> 956,288   (约 25.4x 减少)
+atomic_cmds sum    8,284,068  -> 952,320   (约 8.7x 减少)
+write_bytes sum   保持 182,578,798,336
+```
+
+结论:
+
+- EP8x2 UCCL-GIN compact32 dispatch 初版已能跑通 README-like first-case。
+- 32-token batching 确实显著降低 D2H/WR command 数。
+- dispatch 从之前常见 `~8 GB/s` 提升到 `~18 GB/s`,但距离目标仍远;下一步应 profile
+  剩余瓶颈,尤其是:
+  - batched WRITE 是否仍被 tail/atomic dependency 或 proxy poll 限制。
+  - 每 rank/proxy 只有多少并发 WR/QP 深度。
+  - 32-token chunk 是否真的达到预期 WR size 分布,是否有大量 partial chunk。
+  - combine 仍未 compact/native 优化。
+
+## 2026-06-06: 参考原 UCCL/EP EFA write+piggyback atomic
+
+背景:
+
+- 原 `/Users/daniel/Documents/code/uccl-danyang/uccl-danyang/ep/src/internode.cu`
+  的 EFA 路径在 `nvshmemi_ibgda_put_nbi_warp` 里把 payload RDMA WRITE 和 tail
+  atomic delta 放在同一个 WR 上:
+
+```cpp
+uccl::nvshmemi_ibgda_put_nbi_warp<true>(
+    dst_off, src_off, num_bytes_per_msg, dst_rank, channel_id, lane_id, ...,
+#ifndef EFA
+    0, 0
+#else
+    tail_offset_in_atomic_buffer,
+    num_tokens_to_issue
+#endif
+);
+```
+
+- 当前 UCCL-GIN compact32 虽然已经把 payload WRITE 降到 chunk 级别,但仍然是:
+
+```text
+payload WRITE  +  独立 tail WRITE_WITH_IMM
+```
+
+  profile 里独立 `atomic_cmds` 仍有约 `952,320` 条。
+
+本地代码改动:
+
+- `ep/include/uccl_gin/uccl_gin_rail.cuh`
+  - 新增 `rail_put_tail_add(...)`。
+  - 保持旧 16B `TransferCmd` ABI: `CmdType::WRITE` + `bytes` + `req_lptr` +
+    `req_rptr`,并把 count delta 放到 `TransferCmd::atomic_val` 8-bit 字段,
+    tail offset 放到 `atomic_offset`。
+  - 限制: piggyback count delta 必须在 `1..255`; finish delta 仍走单独
+    `rail_red_add`。
+- `ep/include/uccl_gin/uccl_gin_handle.cuh`
+  - 新增 `UCCLGin::rail_put_tail_add(...)`,kernel 只表达 V2 channel/source tail
+    语义,command 编码留在 UCCL-GIN backend。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - compact remote batch flush 从 `gin.put + gin.rail_tail_add(count)` 改为
+    `gin.rail_put_tail_add(count)`。
+  - 每个 channel 末尾只保留独立 finish `rail_tail_add(0, finish=true)`。
+- `ep/src/rdma.cpp`
+  - normal-mode WRITE piggyback 判定改为 `cmd.atomic_val > 0`,支持 tail offset 0
+    这个合法槽位。
+  - 复用已有的 `RDMA_WRITE_WITH_IMM` + `AtomicsImm::PackAtomicWithSeq` receiver
+    reorder/apply 逻辑,没有新增 verbs 路径。
+- `ep/include/proxy.hpp`, `ep/src/proxy.cpp`
+  - profile 增加 `piggyback_atomic_write_cmds` 字段,用于确认 payload WR 中携带了
+    多少 tail count update。
+
+预期 profiling:
+
+- `write_cmds` 应接近 compact32 原值。
+- `piggyback_atomic_write_cmds` 应接近 remote payload chunk 数。
+- `atomic_cmds` 应从约 `952,320` 显著下降,剩余主要是每个 channel 的 finish 控制更新。
+- 服务器验证日志计划写到:
+  - build: `/tmp/uccl_gin_piggy_build.log`
+  - smoke: `/tmp/uccl_gin_piggy_smoke_rank0.log`,
+    `/tmp/uccl_gin_piggy_smoke_rank1.log`
+  - README-like: `/tmp/uccl_gin_piggy_readme_rank0.log`,
+    `/tmp/uccl_gin_piggy_readme_rank1.log`
+  - profile: `/tmp/uccl_gin_piggy_profile_rank0.log`,
+    `/tmp/uccl_gin_piggy_profile_rank1.log`
+
+服务器验证:
+
+- 同步文件:
+
+```bash
+rsync -av ep/include/uccl_gin/uccl_gin_rail.cuh \
+  ep/include/uccl_gin/uccl_gin_handle.cuh \
+  ep/include/proxy.hpp ep/src/proxy.cpp ep/src/rdma.cpp \
+  thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh \
+  worklog.md \
+  p5en_0:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/ --relative
+```
+
+- 构建:
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0
+export LIBRARY_PATH=/home/ubuntu/local-lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/ubuntu/local-lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16
+```
+
+  - 日志: `/tmp/uccl_gin_piggy_build.log`
+  - 结果: `BUILD_RC:0`。只有既有 warning:
+    - `write(...)` return value warning。
+    - `std::optional<std::function<void()>> recv_hook` maybe-uninitialized warning
+      来自 `src/uccl_ep.cc`。
+  - 安装产物已从 EFS 复制到 `p5en_1`:
+    `/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so`
+
+中间遇到的问题:
+
+- 第一次 smoke 少了 `PYTHONPATH`,rank0 报:
+  `ModuleNotFoundError: No module named 'deep_ep'`。
+- 第二次 smoke 少了 aws-ofi-nccl master 的 lib path,两端报:
+  `NCCL GIN is unavailable`。修正为:
+
+```bash
+export PYTHONPATH=/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/thirdparty/DeepEP-v2-d4f41e4:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang:$PYTHONPATH
+export LD_LIBRARY_PATH=/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib:/home/ubuntu/local-lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+```
+
+- 远端 `p5en_0` 没有 `p5en_1` SSH alias,所以不要在 `p5en_0` 上直接 `scp p5en_1:...`。
+  这次改为本地分别 SSH 两台,或者让 `p5en_1` 从共享 EFS 复制 build 产物。
+- `nohup ... &` launcher 会让外层 SSH 不可靠地滞留,导致 rank1 已启动但 rank0
+  没启动。后续两机测试改用两个前台 SSH session,rank1 先开 session,rank0 后开 session。
+
+smoke:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-perf-test \
+  --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256
+```
+
+- 关键环境:
+  `DEEPEP_USE_UCCL_GIN=1`,
+  `EP_JIT_EXTRA_FLAGS=-DDEEPEP_USE_UCCL_GIN`,
+  `EP_JIT_CACHE_DIR=/tmp/deepep_jit_uccl_piggy`,
+  `NCCL_NVLS_ENABLE=0`,
+  `LD_LIBRARY_PATH` 包含
+  `/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib`。
+- 日志:
+  - `/tmp/uccl_gin_piggy_smoke_rank0.log`
+  - `/tmp/uccl_gin_piggy_smoke_rank1.log`
+- 结果:两端 `EXIT:0`。
+
+README-like first-case:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-check \
+  --num-sms 20 --num-tokens 8192 --hidden 7168 \
+  --num-topk 8 --num-experts 256 --ignore-local-traffic
+```
+
+- 日志:
+  - `/tmp/uccl_gin_piggy_readme_rank0.log`
+  - `/tmp/uccl_gin_piggy_readme_rank1.log`
+- 两端 `EXIT:0`。
+- dispatch:
+  - rank0 EP0-7: `30 GB/s (SO)`,约 `2035-2051 us`。
+  - rank1 EP8-15: `30 GB/s (SO)`,约 `2030-2057 us`。
+- expanded dispatch:
+  - 两端均约 `30 GB/s (SO)`,约 `2033-2064 us`。
+- cached dispatch:
+  - rank0: `30 GB/s (SO)`,约 `2042-2056 us`。
+  - rank1: `30-31 GB/s (SO)`,约 `1994-2021 us`。
+- combine/reduced combine 未做 piggyback/compact 优化,仍约 `7-11 GB/s (SO)`。
+
+profile:
+
+- 命令同 README-like first-case,额外设置
+  `UCCL_PROXY_PROFILE_COMMANDS=1`。
+- 日志:
+  - `/tmp/uccl_gin_piggy_profile_rank0.log`
+  - `/tmp/uccl_gin_piggy_profile_rank1.log`
+- 两端 `EXIT:0`。
+- dispatch 在 profile 开启时仍约 `30 GB/s (SO)`,约 `2002-2045 us`。
+- 汇总 `64` 条 `UCCL_PROXY_PROFILE`:
+
+```text
+post_cmds_sum                    1,194,368
+write_cmds_sum                     956,288
+write_bytes_sum                182,578,798,336
+piggyback_atomic_write_cmds_sum    952,320
+atomic_cmds_sum                    238,080
+completed_wrs_sum              110,429,355
+posted_atomic_wrs_sum              238,080
+coalesced_atomic_wrs_sum                 0
+poll_us_sum                      5,743,428
+progress_atomic_us_sum           1,395,330
+post_gpu_us_sum                  5,248,920
+post_batches_sum                   904,662
+seconds_avg                          5.0186
+cmds_per_sec_sum                238,053.272
+```
+
+按 proxy thread 汇总:
+
+```text
+thread 0: post_cmds=361,088, write_cmds=289,664, piggyback=285,696,
+          atomic_cmds=71,424,  write_bytes=54,786,144,256
+thread 1: post_cmds=357,120, write_cmds=285,696, piggyback=285,696,
+          atomic_cmds=71,424,  write_bytes=54,801,849,600
+thread 2: post_cmds=238,080, write_cmds=190,464, piggyback=190,464,
+          atomic_cmds=47,616,  write_bytes=36,538,762,560
+thread 3: post_cmds=238,080, write_cmds=190,464, piggyback=190,464,
+          atomic_cmds=47,616,  write_bytes=36,452,041,920
+```
+
+对比上一轮 compact32 profile:
+
+```text
+write_cmds:    956,288 -> 956,288   (payload chunk 数不变)
+atomic_cmds:   952,320 -> 238,080   (约 4x 减少)
+piggyback:           0 -> 952,320   (count tail update 已并入 payload WRITE)
+dispatch:        ~18 GB/s -> ~30 GB/s
+```
+
+结论:
+
+- V1 风格的 EFA `WRITE + piggyback atomic` 在 V2 compact32 dispatch 上走通了。
+- 独立 tail count `WRITE_WITH_IMM` 基本被消除;剩余 `atomic_cmds` 主要是每个
+  channel/source 的 finish 控制更新。
+- 性能从 compact32 的约 `18 GB/s (SO)` 提升到约 `30 GB/s (SO)`。
+- 下一步真正的 dispatch 性能瓶颈不再是“每个 chunk 一个独立 count tail WR”,而更可能是:
+  - 仍有 238k finish/control atomic WR。
+  - proxy post/poll 和 D2H command drain 的 CPU 开销。
+  - thread 0/1 比 thread 2/3 承担更多 command/bytes,需要检查 channel-to-queue 映射
+    是否可更均匀。
+  - combine 还没走 compact/piggyback/native V2 优化。
+
+## 2026-06-06: review 后修补 proxy drain/dependency 和非 UCCL 编译参数
+
+输入 review 覆盖的问题:
+
+- `progress_pending_atomics(true)` force 路径 pop `PendingAtomicBatch` 前没有清理
+  `atomic_dep_by_wr_`,理论上会留下指向 deque front 元素的悬空指针。
+- `drain_pending_atomics` 里 `pending_atomic_updates` 是局部变量,传给
+  `remote_process_completions` 后没有 `apply_pending_updates`。
+- notify warp 的 `gin.put` 多传 UCCL-GIN 专用 `remote_action/lane_hint` 参数,非
+  `DEEPEP_USE_UCCL_GIN` 编译会不匹配上游 `NCCLGin::put`。
+- `wait_for_cq` outstanding 清零后还等 3 次空 poll,这是额外延迟,不是 correctness
+  必需条件。
+
+本地修复:
+
+- `ep/include/proxy.hpp`
+  - `PendingAtomicBatch` 新增 `dep_wrs`,记录这个 batch 注册到
+    `atomic_dep_by_wr_` 的依赖 WR。
+  - 新增 `clear_atomic_batch_deps(PendingAtomicBatch&)`。
+- `ep/src/proxy.cpp`
+  - `enqueue_pending_atomics` 记录 `dep_wrs`。
+  - `progress_pending_atomics(force)` 在 pop batch 前调用
+    `clear_atomic_batch_deps`;force 路径也会先清理反向映射,避免悬空指针。
+  - `drain_pending_atomics` 不再用 `progress_pending_atomics(true)` 作为常规路径;
+    它会继续 poll CQ,等 dependency WRITE 完成后再正常 post atomic,保留
+    payload-before-tail 顺序。
+  - `drain_pending_atomics` 在 `USE_RECEIVER_BARRIER && !use_normal_mode` 下调用
+    `apply_pending_updates`,和主 `run_dual` 路径一致。
+  - `wait_for_cq` 在 `pending_release_wrs` 清零后立即退出,去掉 3 次额外空 poll。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - notify warp 的两个 `gin.put<ncclTeamTagRail>` 分成 UCCL-GIN 和上游 NCCL-GIN
+    两套参数,修复非 UCCL 编译形态。
+
+复核后暂未改的 review 点:
+
+- `ptx::exchange(last_forward_src_token_global_idx, recv_scaleout_rank_idx)`:
+  `ptx::exchange` 是 warp shuffle,不是写入变量的 `std::exchange`;这行读取
+  `recv_scaleout_rank_idx` lane 的单调 baseline,不会在 retry 时把 baseline 覆盖成
+  rank id。因此本轮不改。
+- self-path `rail_tail_add` 缺 fence:当前 self `put` 路径在返回前已有
+  `__threadfence_system()`,且 review 后也确认这条原判断不成立。
+- `coalesce_atomic_batch` 读 inactive union:当前 lambda 先排除 low-latency
+  `cmd_type`,再读 normal-mode `atomic_offset`;当前 UCCL-GIN only non-LL ATOMIC。
+  本轮不做结构性改动。
+
+待服务器验证日志:
+
+- build: `/tmp/uccl_gin_reviewfix_build.log`
+- smoke:
+  - `/tmp/uccl_gin_reviewfix_smoke_rank0.log`
+  - `/tmp/uccl_gin_reviewfix_smoke_rank1.log`
+- README-like:
+  - `/tmp/uccl_gin_reviewfix_readme_rank0.log`
+  - `/tmp/uccl_gin_reviewfix_readme_rank1.log`
+- profile:
+  - `/tmp/uccl_gin_reviewfix_profile_rank0.log`
+  - `/tmp/uccl_gin_reviewfix_profile_rank1.log`
+
+服务器验证结果:
+
+- 同步到服务器分支 `uccl-gin`,目标路径
+  `/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang`。
+- build:
+  - 命令: `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j 16`
+  - 日志: `/tmp/uccl_gin_reviewfix_build.log`
+  - 结果: `BUILD_RC:0`。只有既有 warning,没有编译错误。
+- smoke:
+  - 命令: `tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-perf-test --num-sms 8 --num-tokens 64 --hidden 2048 --num-topk 6 --num-experts 256`
+  - 日志:
+    - `/tmp/uccl_gin_reviewfix_smoke_rank0.log`
+    - `/tmp/uccl_gin_reviewfix_smoke_rank1.log`
+  - 结果: 两端 `EXIT:0`。
+- README-like first-case:
+  - 命令: `tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-check --num-sms 20 --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 --ignore-local-traffic`
+  - 日志:
+    - `/tmp/uccl_gin_reviewfix_readme_rank0.log`
+    - `/tmp/uccl_gin_reviewfix_readme_rank1.log`
+  - 结果: 两端 `EXIT:0`。
+  - rank0 dispatch 摘要: uncached / expanded / cached dispatch 均约
+    `29-30 GB/s (SO)`,约 `2060-2080 us`。
+  - combine 仍约 `8-11 GB/s (SO)`,本轮没有改 combine 路径。
+- profile:
+  - 命令同 README-like first-case,额外设置
+    `UCCL_PROXY_PROFILE_COMMANDS=1`。
+  - 日志:
+    - `/tmp/uccl_gin_reviewfix_profile_rank0.log`
+    - `/tmp/uccl_gin_reviewfix_profile_rank1.log`
+  - 结果: 两端 `EXIT:0`,没有残留 `test_ep.py` 进程。
+  - 汇总 `64` 条 `UCCL_PROXY_PROFILE`:
+
+```text
+post_batches_sum                 914,649
+post_cmds_sum                  1,194,368
+write_cmds_sum                   956,288
+write_bytes_sum              182,578,798,336
+piggyback_atomic_write_cmds_sum  952,320
+atomic_cmds_sum                  238,080
+quiet_cmds_sum                         0
+barrier_cmds_sum                       0
+completed_wrs_sum            125,384,721
+posted_atomic_wrs_sum            238,080
+coalesced_atomic_wrs_sum               0
+poll_us_sum                    5,866,326
+progress_atomic_us_sum         1,416,783
+post_gpu_us_sum                5,243,800
+seconds_avg                        4.7870
+write_GBps_sum                    38.139
+cmds_per_sec_sum              249,498.120
+```
+
+复核结论:
+
+- 本轮修复没有改变 README-like dispatch 的主性能表现,仍保持 piggyback 版本的
+  `~30 GB/s (SO)`。
+- `quiet_cmds=0`、`barrier_cmds=0`,说明 hot dispatch path 没有退回同步 quiet/barrier
+  drain。
+- `coalesced_atomic_wrs=0` 是当前结构的预期结果:count tail 已经被 payload
+  `WRITE_WITH_IMM` piggyback 消除,剩余独立 `atomic_cmds` 主要是 finish/control 类
+  更新,同 target 可合并机会很少。
+- 本轮真正修的是 correctness/race/维护性风险:
+  - pending atomic batch pop 前清理 dependency backpointer。
+  - drain 路径 apply receiver atomic updates。
+  - 非 UCCL-GIN 编译不再给上游 NCCL-GIN `put` 多传参数。
+  - wait-for-CQ 去掉完成后的额外 3 次空 poll。

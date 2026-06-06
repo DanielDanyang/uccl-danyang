@@ -116,8 +116,18 @@ hybrid_dispatch_impl(
     // All the buffers
     auto scaleup_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
+#ifdef DEEPEP_USE_UCCL_GIN
+    constexpr int kNumCompactSendTokens = kNumChannels * kNumMaxTokensPerChannel;
+    EP_STATIC_ASSERT(kNumScaleoutRanks == 2, "UCCL-GIN compact dispatch is currently specialized for EP8x2");
+    EP_STATIC_ASSERT(kNumCompactSendTokens + kNumScaleoutRanks * kNumChannels * kNumMaxTokensPerChannel <=
+                     kNumMaxTokensPerRank + kNumScaleoutRanks * (kNumMaxTokensPerRank + kNumMaxChannels),
+                     "UCCL-GIN compact send padding must fit the original DeepEP V2 dispatch buffer size");
+    auto scaleout_send_buffer = layout::BufferLayout<false>(
+        token_layout, 1, kNumCompactSendTokens, scaleup_buffer.get_buffer_end_ptr());
+#else
     auto scaleout_send_buffer = layout::BufferLayout<false>(
         token_layout, 1, kNumMaxTokensPerRank, scaleup_buffer.get_buffer_end_ptr());
+#endif
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleoutRanks, kNumChannels * kNumMaxTokensPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
@@ -204,6 +214,22 @@ hybrid_dispatch_impl(
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
+#ifdef DEEPEP_USE_UCCL_GIN
+                gin.put<ncclTeamTagRail>(
+                    workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
+                    workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
+                    kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
+                    ncclGinOptFlagsAggregateRequests,
+                    ncclGin_None(),
+                    thread_idx);
+                gin.put<ncclTeamTagRail>(
+                    workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
+                    workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
+                    kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx,
+                    0,
+                    ncclGin_None(),
+                    thread_idx);
+#else
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
@@ -213,6 +239,7 @@ hybrid_dispatch_impl(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
+#endif
             }
             __syncwarp();
 
@@ -355,6 +382,37 @@ hybrid_dispatch_impl(
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
+#ifdef DEEPEP_USE_UCCL_GIN
+        const auto scaleout_send_channel_buffer = scaleout_send_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
+        constexpr int kUCCLGinCompactChunkTokens = 32;
+        EP_STATIC_ASSERT(kUCCLGinCompactChunkTokens <= 0xFF,
+                         "UCCL-GIN piggyback count delta must fit TransferCmd::atomic_val");
+        EP_STATIC_ASSERT(handle::kUCCLGinTailFinishDelta <= uccl_gin::kAtomicValueMax,
+                         "UCCL-GIN finish delta must fit the ordered atomic immediate");
+        const int remote_scaleout_rank_idx = scaleout_rank_idx ^ 1;
+        int compact_batch_first_slot = 0;
+        int compact_batch_count = 0;
+
+        const auto flush_compact_remote_batch = [&](const bool& finish_flag = false) {
+            if (compact_batch_count > 0 and lane_idx == remote_scaleout_rank_idx) {
+                gin.rail_put_tail_add(
+                    scaleout_recv_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
+                    scaleout_send_channel_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
+                    compact_batch_count * tma_buffer.get_num_bytes<false>(),
+                    remote_scaleout_rank_idx,
+                    channel_idx,
+                    scaleout_rank_idx,
+                    compact_batch_count,
+                    channel_idx);
+            }
+            if (finish_flag and lane_idx == remote_scaleout_rank_idx) {
+                gin.rail_tail_add(channel_idx, scaleout_rank_idx, remote_scaleout_rank_idx,
+                                  0, true, channel_idx);
+            }
+            compact_batch_count = 0;
+            __syncwarp();
+        };
+#endif
 
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
@@ -364,7 +422,10 @@ hybrid_dispatch_impl(
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
                 const auto tail_delta = stored_scaleout_tail - stored_old_scaleout_tail;
 #ifdef DEEPEP_USE_UCCL_GIN
-                gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx, tail_delta, finish_flag, channel_idx);
+                if (lane_idx == scaleout_rank_idx) {
+                    gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx, tail_delta, finish_flag, channel_idx);
+                    stored_old_scaleout_tail = stored_scaleout_tail;
+                }
 #else
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
@@ -373,8 +434,8 @@ hybrid_dispatch_impl(
                 // NOTES: the "release" scope will be `sys` for the local rank (we may involve NVLink so not `gpu`)
                 // For RDMA requests, "release" is ensured by "atomic"
                 gin.red_add_rel<ncclTeamTagRail>(ptr, signaled_tail - old_signaled_tail, lane_idx);
-#endif
                 stored_old_scaleout_tail = stored_scaleout_tail;
+#endif
             }
             __syncwarp();
         };
@@ -439,6 +500,9 @@ hybrid_dispatch_impl(
 
             // Deduplicate ranks and assign slots
             int stored_dst_slot_idx = -1;
+#ifdef DEEPEP_USE_UCCL_GIN
+            const int compact_remote_slot_idx = ptx::exchange(stored_scaleout_tail, remote_scaleout_rank_idx);
+#endif
             const auto stored_old_slot_idx = ptx::exchange(
                 stored_scaleout_tail, stored_dst_scaleout_rank_idx >= 0 ? stored_dst_scaleout_rank_idx : 0);
             if (ptx::deduplicate(stored_dst_scaleout_rank_idx, lane_idx) and stored_dst_scaleout_rank_idx >= 0)
@@ -453,13 +517,25 @@ hybrid_dispatch_impl(
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
 
+#ifndef DEEPEP_USE_UCCL_GIN
                 // So if no ranks will go by RDMA, we skip the send buffer stores
                 if (scaleout_rank_mask ^ (1 << scaleout_rank_idx)) {
                     ptx::tma_store_1d(scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
                                       tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
                 }
+#endif
             }
             __syncwarp();
+
+#ifdef DEEPEP_USE_UCCL_GIN
+            const bool has_remote_scaleout_token = ((scaleout_rank_mask >> remote_scaleout_rank_idx) & 1) != 0;
+            if (lane_idx == remote_scaleout_rank_idx and has_remote_scaleout_token) {
+                EP_DEVICE_ASSERT(compact_remote_slot_idx >= 0 and compact_remote_slot_idx < kNumMaxTokensPerChannel);
+                ptx::tma_store_1d(scaleout_send_channel_buffer.get_token_buffer(compact_remote_slot_idx).get_base_ptr(),
+                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+            }
+            __syncwarp();
+#endif
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
@@ -474,25 +550,28 @@ hybrid_dispatch_impl(
             preload_next_token(token_idx + kNumChannels);
 
             // Issue IBGDA requests
-            if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
 #ifdef DEEPEP_USE_UCCL_GIN
-                gin.put<ncclTeamTagRail>(
-                        scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                        scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                        tma_buffer.get_num_bytes<false>(),
-                        stored_dst_scaleout_rank_idx,
-                        ncclGinOptFlagsAggregateRequests,
-                        ncclGin_None(),
-                        channel_idx);
+            if (has_remote_scaleout_token) {
+                if (compact_batch_count == 0) {
+                    compact_batch_first_slot = compact_remote_slot_idx;
+                } else if (compact_batch_first_slot + compact_batch_count != compact_remote_slot_idx) {
+                    flush_compact_remote_batch();
+                    compact_batch_first_slot = compact_remote_slot_idx;
+                }
+                ++compact_batch_count;
+                if (compact_batch_count >= kUCCLGinCompactChunkTokens)
+                    flush_compact_remote_batch();
+            }
 #else
+            if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
                 gin.put<ncclTeamTagRail>(
                         scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                         scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
                         tma_buffer.get_num_bytes<false>(),
                         stored_dst_scaleout_rank_idx,
                         ncclGinOptFlagsAggregateRequests);
-#endif
             }
+#endif
             __syncwarp();
 
             // Issue scale-out tail update
@@ -500,6 +579,9 @@ hybrid_dispatch_impl(
         }
 
         // Flush unflushed tails
+#ifdef DEEPEP_USE_UCCL_GIN
+        flush_compact_remote_batch(true);
+#endif
         update_scaleout_tail(true);
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -586,11 +668,12 @@ hybrid_dispatch_impl(
                 const auto token_buffer = recv_buffer.get_token_buffer(slot_idx);
 
 #ifdef DEEPEP_USE_UCCL_GIN
-                // EFA/SRD does not give payload-before-tail ordering.  Mirror
-                // UCCL-EP's receiver-side epoch-tag idea using V2's native
-                // source-token metadata: within one (channel, source rank) stream
-                // the source token index must become strictly increasing before
-                // the forwarder consumes this slot.
+                // EFA/SRD completion ordering alone is not a strong receiver-side
+                // payload-ready proof.  Keep the original UCCL/EP philosophy:
+                // the tail publishes the available slot range, while each slot's
+                // native V2 metadata proves that the payload for this
+                // (channel, source-rank) stream is visible before the forwarder
+                // consumes it.
                 comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                     const auto expected_rank_idx = recv_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                     const auto old_src_token_idx = ptx::exchange(last_forward_src_token_global_idx, recv_scaleout_rank_idx);
@@ -605,10 +688,10 @@ hybrid_dispatch_impl(
                         return true;
                     }
                     if (is_last_check and lane_idx == recv_scaleout_rank_idx) {
-                        printf("DeepEP UCCL-GIN ready metadata timeout, scale-out: %d, scale-up: %d, "
+                        printf("DeepEP UCCL-GIN ready metadata timeout, scale-out: %d/%d, scale-up: %d/%d, "
                                "channel: %d, src scale-out: %d, slot: %d, observed: %d, prev: %d, expected rank: %d\n",
-                               scaleout_rank_idx, scaleup_rank_idx, channel_idx,
-                               recv_scaleout_rank_idx, slot_idx, observed_src_token_idx,
+                               scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                               channel_idx, recv_scaleout_rank_idx, slot_idx, observed_src_token_idx,
                                old_src_token_idx, expected_rank_idx);
                     }
                     return false;

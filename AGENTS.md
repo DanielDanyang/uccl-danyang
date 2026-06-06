@@ -7,12 +7,12 @@
 ## 远端主机
 
 - `p5en_0`
-  - hostname: `ip-172-31-78-36`
-  - 内网 IP: `172.31.78.36`
+  - hostname: `ip-172-31-70-225`
+  - 当前内网 IP: `172.31.70.225`
   - 实例类型: `p5en.48xlarge`
 - `p5en_1`
-  - hostname: `ip-172-31-72-96`
-  - 内网 IP: `172.31.72.96`
+  - hostname: `ip-172-31-71-140`
+  - 当前内网 IP: `172.31.71.140`
   - 实例类型: `p5en.48xlarge`
 
 ## 已确认设备信息
@@ -67,6 +67,18 @@
 - V2 wrapper 默认从 `thirdparty/DeepEP-v2-d4f41e4/deep_ep` 取 DeepEP V2 Python/JIT 资源。
 - V2 C++ JIT bridge 默认 include `thirdparty/DeepEP-v2-d4f41e4/csrc/jit/*`。
 - 服务器构建统一使用 `/usr/local/cuda-13.0`，不要依赖 `/usr/local/cuda` 软链。
+- 当前 UCCL-GIN/DeepEP V2 服务器验证 venv:
+  `/home/ubuntu/.venvs/uccl-gin-cu13`。
+  - `torch==2.12.0+cu130`
+  - `nvidia-nccl-cu13==2.30.4`
+  - `cuda-toolkit==13.0.2`
+  - 注意:PyTorch wheel 默认 pin `nvidia-nccl-cu13==2.29.7`,但 vendored DeepEP V2
+    `_C` 是按 NCCL `2.30.4` 编译的；运行时必须让 `LD_LIBRARY_PATH` 优先指向
+    2.30.4 的 `nvidia/nccl/lib`,否则会报
+    `NCCL library version is too old ... compiled with 23004, running 22907`。
+  - 不再使用错误创建的 `/home/ubuntu/uccl-gin-cu13-venv`。EFS 上曾有一个半成品
+    `/home/ubuntu/efs/yzhou/playground/daniel/.venvs/uccl-gin-cu13`,遇到 stale file
+    handle,不要继续依赖它。
 
 ## 当前验证结果
 
@@ -122,7 +134,8 @@
 关键多机环境变量：
 
 ```bash
-export LD_LIBRARY_PATH=/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib:/opt/amazon/efa/lib:/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/ubuntu/local-lib:/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib:/opt/amazon/efa/lib:/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+export MASTER_ADDR=172.31.70.225
 unset EP_DISABLE_GIN
 unset OFI_NCCL_GIN_GDAKI
 export NCCL_NET_PLUGIN=ofi
@@ -184,15 +197,20 @@ export NCCL_SOCKET_IFNAME=enp71s0
 - 不要 commit 一段“只跑通 correctness、性能明显不对”的 fallback 路径作为完成状态。
   代码可以分阶段，但每个阶段都应服务于最终 DeepEP V2 + UCCL-GIN + UCCL proxy
   substrate 方案。
-- `worklog.md` 需要持续记录操作、测试命令、benchmark 数据和重要设计结论。
+- `worklog.md` 是强制记录项：每次有重要代码改动、源码阅读结论、profiling 假设、
+  benchmark/测试结果、远端环境变化、bug 根因判断或路线调整，都必须同步写入
+  `worklog.md`。不要只在对话里总结；如果还没跑服务器，也要明确记录“仅本地修改/未验证”。
 - 重要开发进度应在本地及时 commit，使用用户的 git/GitHub 身份，不添加 Codex
   co-author。
 
 ## 约束
 
-- 不污染别人环境：使用用户目录下专用 venv `/home/ubuntu/.venvs/deepep-danyang-cu13`。
-- 不打断别人任务：在任何服务器上的构建、测试、profiling、benchmark、采样或排查操作之前，必须先确认
-  `p5en_0` 和 `p5en_1` 的 GPU 空闲。至少执行：
+- 不污染别人环境：UCCL-GIN/DeepEP V2 当前使用用户目录下专用 venv
+  `/home/ubuntu/.venvs/uccl-gin-cu13`。旧 DeepEP-danyang 实验才使用
+  `/home/ubuntu/.venvs/deepep-danyang-cu13`。
+- 不打断别人任务：用户已说明最近服务器一般没人用，后续服务器构建、测试、profiling、benchmark
+  默认不需要每次都执行 GPU 空闲检查。仅在看到异常占用、长时间/重负载实验前、用户特别要求、
+  或不确定是否有人在用时，再执行：
   - `ssh p5en_0 nvidia-smi`
   - `ssh p5en_1 nvidia-smi`
   - 必要时补充 `ssh p5en_0 "ps -eo user,pid,ppid,stat,pcpu,pmem,cmd | grep -E 'python|torch|cuda|nccl|deepep|uccl' | grep -v grep"`，

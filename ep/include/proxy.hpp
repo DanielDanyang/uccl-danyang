@@ -95,6 +95,13 @@ class Proxy {
 
  private:
   friend class FifoProxy;  // Allow FifoProxy to access private methods
+  struct PendingAtomicBatch {
+    std::vector<uint64_t> wrs;
+    std::vector<TransferCmd> cmds;
+    std::vector<uint64_t> dep_wrs;
+    size_t pending_writes = 0;
+  };
+
   ProxyCtx ctx_;
   EPAdaptiveSleeper adaptive_sleeper_;
   void init_common();
@@ -105,6 +112,9 @@ class Proxy {
   void post_gpu_command(uint64_t& my_tail, size_t& seen);
   void post_gpu_commands_mixed(std::vector<uint64_t> const& wrs_to_post,
                                std::vector<TransferCmd> const& cmds_to_post);
+  void profile_write_batching_opportunity(
+      std::vector<uint64_t> const& wrs_to_post,
+      std::vector<TransferCmd> const& cmds_to_post);
   void dump_command_profile() const;
   void post_barrier_msg(int dst_rank, bool ack, uint64_t seq);
   void send_barrier(uint64_t wr);
@@ -112,6 +122,16 @@ class Proxy {
   void quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds,
              std::vector<uint64_t> release_wrs);
   void quiet_cq(std::vector<uint64_t> release_wrs);
+  void wait_for_cq(std::vector<uint64_t> release_wrs, bool include_all_writes);
+  void retire_inflight_write(uint64_t wr_id);
+  void clear_atomic_batch_deps(PendingAtomicBatch& batch);
+  void enqueue_pending_atomics(std::vector<uint64_t>& wrs,
+                               std::vector<TransferCmd>& cmds,
+                               std::vector<uint64_t>& deps);
+  void coalesce_atomic_batch(PendingAtomicBatch& batch);
+  void expand_atomic_completion_aliases();
+  void progress_pending_atomics(bool force = false);
+  void drain_pending_atomics();
   RDMAConnectionInfo local_info_{}, remote_info_{};
 
   // Reuse across multiple calls to avoid reallocations
@@ -135,10 +155,31 @@ class Proxy {
   uint64_t profile_post_cmds_ = 0;
   uint64_t profile_write_cmds_ = 0;
   uint64_t profile_write_bytes_ = 0;
+  uint64_t profile_piggyback_atomic_write_cmds_ = 0;
   uint64_t profile_atomic_cmds_ = 0;
   uint64_t profile_quiet_cmds_ = 0;
   uint64_t profile_barrier_cmds_ = 0;
   uint64_t profile_completed_wrs_ = 0;
+  uint64_t profile_posted_atomic_wrs_ = 0;
+  uint64_t profile_coalesced_atomic_wrs_ = 0;
+  uint64_t profile_poll_us_ = 0;
+  uint64_t profile_progress_atomic_us_ = 0;
+  uint64_t profile_post_gpu_us_ = 0;
+  uint64_t profile_stream_remote_runs_ = 0;
+  uint64_t profile_stream_remote_run_tokens_ = 0;
+  uint64_t profile_stream_remote_run_max_ = 0;
+  uint64_t profile_stream_local_contig_runs_ = 0;
+  uint64_t profile_stream_local_contig_tokens_ = 0;
+  uint64_t profile_stream_local_contig_max_ = 0;
+  uint64_t profile_semantic_remote_runs_ = 0;
+  uint64_t profile_semantic_remote_run_tokens_ = 0;
+  uint64_t profile_semantic_remote_run_max_ = 0;
+  uint64_t profile_semantic_local_contig_runs_ = 0;
+  uint64_t profile_semantic_local_contig_tokens_ = 0;
+  uint64_t profile_semantic_local_contig_max_ = 0;
+  uint64_t profile_semantic_gather_runs_ = 0;
+  uint64_t profile_semantic_gather_tokens_ = 0;
+  uint64_t profile_semantic_gather_max_ = 0;
 
   // Sender loop aggregates
   std::chrono::duration<double, std::micro> total_rdma_write_durations_ =
@@ -155,6 +196,13 @@ class Proxy {
   void* atomic_buffer_ptr_;
   std::vector<TransferCmd> postponed_atomics_;
   std::vector<uint64_t> postponed_wr_ids_;
+
+  std::deque<PendingAtomicBatch> pending_atomic_batches_;
+  std::unordered_map<uint64_t, PendingAtomicBatch*> atomic_dep_by_wr_;
+  std::unordered_map<uint64_t, std::vector<uint64_t>> atomic_completion_aliases_;
+  std::vector<uint64_t> atomic_dependency_wrs_;
+  std::vector<uint64_t> coalesced_atomic_wrs_;
+  std::vector<TransferCmd> coalesced_atomic_cmds_;
 
 #ifdef USE_MSCCLPP_FIFO_BACKEND
   std::vector<uint64_t> fifo_seq_;

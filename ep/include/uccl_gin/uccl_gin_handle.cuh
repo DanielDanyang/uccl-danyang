@@ -170,6 +170,29 @@ struct UCCLGin {
     return reinterpret_cast<int64_t*>(res.atomic_tail_base + rail_tail_offset(channel_idx, src_rank_idx));
   }
 
+  __device__ __forceinline__ void rail_put_tail_add(
+      void* recv_sym_ptr, void* send_sym_ptr, int num_bytes, int dst_scaleout,
+      int channel_idx, int src_rank_idx, int count_delta, int lane_hint = 0) const {
+    if (dst_scaleout < 0 || dst_scaleout >= res.num_scaleout_ranks ||
+        count_delta <= 0 || count_delta > 0xFF) {
+      __trap();
+    }
+    if (dst_scaleout == res.scaleout_rank) {
+      put<ncclTeamTagRail>(recv_sym_ptr, send_sym_ptr, num_bytes, dst_scaleout,
+                           0, ncclGin_None(), lane_hint);
+      atomicAdd_system(reinterpret_cast<unsigned long long*>(
+                           res.atomic_tail_base + rail_tail_offset(channel_idx, src_rank_idx)),
+                       static_cast<unsigned long long>(count_delta));
+      return;
+    }
+    const uint32_t loff = uccl_gin::window_off(reinterpret_cast<uint64_t>(send_sym_ptr), res.window_base);
+    const uint32_t roff = uccl_gin::window_off(reinterpret_cast<uint64_t>(recv_sym_ptr), res.window_base);
+    uccl_gin::rail_put_tail_add(
+        lane(lane_hint), rail_global_rank(dst_scaleout), static_cast<uint32_t>(num_bytes),
+        loff, roff, static_cast<uint32_t>(count_delta),
+        rail_tail_offset(channel_idx, src_rank_idx));
+  }
+
   __device__ __forceinline__ void decode_rail_tail(int64_t raw, int& finish, int& count) const {
     finish = raw >= kUCCLGinTailFinishDelta;
     count = static_cast<int>(raw - (finish ? kUCCLGinTailFinishDelta : 0));

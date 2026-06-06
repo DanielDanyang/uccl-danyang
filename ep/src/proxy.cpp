@@ -545,9 +545,34 @@ void Proxy::run_sender() {
   size_t seen = 0;
   uint64_t my_tail = 0;
   while (ctx_.progress_run.load(std::memory_order_acquire)) {
+    std::chrono::steady_clock::time_point poll_start;
+    if (profile_commands_) poll_start = std::chrono::steady_clock::now();
     local_poll_completions(ctx_, acked_wrs_, cfg_.thread_idx, ctx_by_tag_);
+    if (profile_commands_) {
+      profile_poll_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - poll_start)
+              .count());
+    }
     notify_gpu_completion(my_tail);
+    std::chrono::steady_clock::time_point progress_start;
+    if (profile_commands_) progress_start = std::chrono::steady_clock::now();
+    progress_pending_atomics();
+    if (profile_commands_) {
+      profile_progress_atomic_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - progress_start)
+              .count());
+    }
+    std::chrono::steady_clock::time_point post_start;
+    if (profile_commands_) post_start = std::chrono::steady_clock::now();
     post_gpu_command(my_tail, seen);
+    if (profile_commands_) {
+      profile_post_gpu_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - post_start)
+              .count());
+    }
   }
   dump_command_profile();
 }
@@ -596,12 +621,37 @@ void Proxy::run_dual() {
   while (ctx_.progress_run.load(std::memory_order_acquire)) {
     adaptive_sleeper_.maybe_sleep(ctx_);
 
+    std::chrono::steady_clock::time_point poll_start;
+    if (profile_commands_) poll_start = std::chrono::steady_clock::now();
     poll_cq_dual(ctx_, acked_wrs_, cfg_.thread_idx, ring, ctx_by_tag_,
                  atomic_buffer_ptr_, cfg_.num_ranks, cfg_.num_experts,
                  pending_atomic_updates, cfg_.rank, cfg_.num_nodes,
                  adaptive_sleeper_, cfg_.use_normal_mode);
+    if (profile_commands_) {
+      profile_poll_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - poll_start)
+              .count());
+    }
     notify_gpu_completion(my_tail);
+    std::chrono::steady_clock::time_point progress_start;
+    if (profile_commands_) progress_start = std::chrono::steady_clock::now();
+    progress_pending_atomics();
+    if (profile_commands_) {
+      profile_progress_atomic_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - progress_start)
+              .count());
+    }
+    std::chrono::steady_clock::time_point post_start;
+    if (profile_commands_) post_start = std::chrono::steady_clock::now();
     post_gpu_command(my_tail, seen);
+    if (profile_commands_) {
+      profile_post_gpu_us_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - post_start)
+              .count());
+    }
 #ifdef USE_RECEIVER_BARRIER
     if (!cfg_.use_normal_mode) {
       apply_pending_updates(ctx_, pending_atomic_updates, atomic_buffer_ptr_,
@@ -629,6 +679,7 @@ void Proxy::run_dual() {
 }
 
 void Proxy::notify_gpu_completion(uint64_t& my_tail) {
+  expand_atomic_completion_aliases();
   if (profile_commands_) {
     profile_completed_wrs_ += acked_wrs_.size();
   }
@@ -645,7 +696,7 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
       auto [front_wr, front_bytes] = pend.front();
       if (acked_wrs_.find(front_wr) == acked_wrs_.end()) break;
       acked_wrs_.erase(front_wr);  // consume this completion
-      inflight_write_wrs_.erase(front_wr);
+      retire_inflight_write(front_wr);
       pend.pop_front();            // retire pending entry
 
       if (front_bytes) {
@@ -668,7 +719,7 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
   }
 #else
   for (auto wr_id : acked_wrs_) {
-    inflight_write_wrs_.erase(wr_id);
+    retire_inflight_write(wr_id);
     size_t const rb_idx = (wr_id >> 32) & 0xFFFFFFFF;
     size_t const cmd_idx = wr_id & 0xFFFFFFFF;
 
@@ -695,6 +746,198 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
 #endif
 
   adaptive_sleeper_.update_timer();
+}
+
+void Proxy::retire_inflight_write(uint64_t wr_id) {
+  if (inflight_write_wrs_.erase(wr_id) == 0) return;
+  auto it = atomic_dep_by_wr_.find(wr_id);
+  if (it == atomic_dep_by_wr_.end()) return;
+  PendingAtomicBatch* batch = it->second;
+  if (batch != nullptr && batch->pending_writes > 0) {
+    --batch->pending_writes;
+  }
+  atomic_dep_by_wr_.erase(it);
+}
+
+void Proxy::clear_atomic_batch_deps(PendingAtomicBatch& batch) {
+  if (batch.dep_wrs.empty()) {
+    batch.pending_writes = 0;
+    return;
+  }
+  for (uint64_t wr_id : batch.dep_wrs) {
+    auto it = atomic_dep_by_wr_.find(wr_id);
+    if (it != atomic_dep_by_wr_.end() && it->second == &batch) {
+      atomic_dep_by_wr_.erase(it);
+    }
+  }
+  batch.dep_wrs.clear();
+  batch.pending_writes = 0;
+}
+
+void Proxy::enqueue_pending_atomics(std::vector<uint64_t>& wrs,
+                                    std::vector<TransferCmd>& cmds,
+                                    std::vector<uint64_t>& deps) {
+  if (wrs.empty()) return;
+  pending_atomic_batches_.emplace_back();
+  PendingAtomicBatch& batch = pending_atomic_batches_.back();
+  batch.wrs.swap(wrs);
+  batch.cmds.swap(cmds);
+  batch.pending_writes = 0;
+  for (uint64_t wr_id : deps) {
+    if (inflight_write_wrs_.find(wr_id) == inflight_write_wrs_.end()) continue;
+    ++batch.pending_writes;
+    batch.dep_wrs.push_back(wr_id);
+    atomic_dep_by_wr_[wr_id] = &batch;
+  }
+  deps.clear();
+}
+
+void Proxy::coalesce_atomic_batch(PendingAtomicBatch& batch) {
+  if (batch.wrs.size() <= 1) return;
+  coalesced_atomic_wrs_.clear();
+  coalesced_atomic_cmds_.clear();
+  coalesced_atomic_wrs_.reserve(batch.wrs.size());
+  coalesced_atomic_cmds_.reserve(batch.cmds.size());
+  std::vector<std::vector<uint64_t>> alias_groups;
+  alias_groups.reserve(batch.wrs.size());
+
+  auto same_target = [](uint64_t lhs_wr, TransferCmd const& lhs,
+                        uint64_t rhs_wr, TransferCmd const& rhs) {
+    if (get_base_cmd(lhs.cmd_type) != CmdType::ATOMIC ||
+        get_base_cmd(rhs.cmd_type) != CmdType::ATOMIC) {
+      return false;
+    }
+    if (get_low_latency(lhs.cmd_type) || get_low_latency(rhs.cmd_type)) {
+      return false;
+    }
+    if (lhs.atomic_offset == 0 || rhs.atomic_offset == 0) {
+      return false;
+    }
+    return ((lhs_wr >> 32) == (rhs_wr >> 32)) &&
+           lhs.dst_rank == rhs.dst_rank &&
+           lhs.cmd_type == rhs.cmd_type &&
+           lhs.req_rptr == rhs.req_rptr &&
+           lhs.atomic_offset == rhs.atomic_offset;
+  };
+
+  for (size_t i = 0; i < batch.wrs.size(); ++i) {
+    uint64_t const next_wr = batch.wrs[i];
+    TransferCmd const& next_cmd = batch.cmds[i];
+    bool merged = false;
+    for (size_t j = 0; j < coalesced_atomic_wrs_.size(); ++j) {
+      int64_t const merged_value =
+          static_cast<int64_t>(coalesced_atomic_cmds_[j].value) +
+          static_cast<int64_t>(next_cmd.value);
+      if (!same_target(coalesced_atomic_wrs_[j], coalesced_atomic_cmds_[j],
+                       next_wr, next_cmd) ||
+          merged_value < -kMaxSendAtomicValue ||
+          merged_value > kMaxSendAtomicValue) {
+        continue;
+      }
+      alias_groups[j].push_back(coalesced_atomic_wrs_[j]);
+      coalesced_atomic_wrs_[j] = next_wr;
+      coalesced_atomic_cmds_[j] = next_cmd;
+      coalesced_atomic_cmds_[j].value = static_cast<int>(merged_value);
+      merged = true;
+      break;
+    }
+    if (!merged) {
+      coalesced_atomic_wrs_.push_back(next_wr);
+      coalesced_atomic_cmds_.push_back(next_cmd);
+      alias_groups.emplace_back();
+    }
+  }
+
+  for (size_t i = 0; i < coalesced_atomic_wrs_.size(); ++i) {
+    if (!alias_groups[i].empty()) {
+      auto& dst = atomic_completion_aliases_[coalesced_atomic_wrs_[i]];
+      dst.insert(dst.end(), alias_groups[i].begin(), alias_groups[i].end());
+      if (profile_commands_) {
+        profile_coalesced_atomic_wrs_ += alias_groups[i].size();
+      }
+    }
+  }
+
+  if (coalesced_atomic_wrs_.size() == batch.wrs.size()) return;
+  batch.wrs.swap(coalesced_atomic_wrs_);
+  batch.cmds.swap(coalesced_atomic_cmds_);
+}
+
+void Proxy::expand_atomic_completion_aliases() {
+  if (acked_wrs_.empty() || atomic_completion_aliases_.empty()) return;
+  std::vector<uint64_t> aliases_to_ack;
+  for (uint64_t wr_id : acked_wrs_) {
+    auto it = atomic_completion_aliases_.find(wr_id);
+    if (it == atomic_completion_aliases_.end()) continue;
+    aliases_to_ack.insert(aliases_to_ack.end(), it->second.begin(),
+                          it->second.end());
+    atomic_completion_aliases_.erase(it);
+  }
+  for (uint64_t alias_wr : aliases_to_ack) {
+    acked_wrs_.insert(alias_wr);
+  }
+}
+
+void Proxy::progress_pending_atomics(bool force) {
+  while (!pending_atomic_batches_.empty()) {
+    PendingAtomicBatch& batch = pending_atomic_batches_.front();
+    if (!force && batch.pending_writes != 0) break;
+    if (force) {
+      clear_atomic_batch_deps(batch);
+    }
+    coalesce_atomic_batch(batch);
+    if (profile_commands_) {
+      profile_posted_atomic_wrs_ += batch.wrs.size();
+    }
+    post_atomic_operations(ctx_, batch.wrs, batch.cmds, ctxs_for_all_ranks_,
+                           cfg_.rank, cfg_.thread_idx, acked_wrs_,
+                           cfg_.use_normal_mode);
+    clear_atomic_batch_deps(batch);
+    pending_atomic_batches_.pop_front();
+  }
+}
+
+void Proxy::drain_pending_atomics() {
+  uint64_t dummy_tail = 0;
+  ibv_wc wc[kMaxOutstandingSends];
+  std::set<PendingUpdate> pending_atomic_updates;
+  using clock = std::chrono::steady_clock;
+  auto last_log = clock::now();
+  while (!pending_atomic_batches_.empty()) {
+    progress_pending_atomics();
+    if (pending_atomic_batches_.empty()) break;
+    int ne = poll_cq_once(get_cq(ctx_), wc, kMaxOutstandingSends);
+    if (ne > 0) {
+      local_process_completions(ctx_, acked_wrs_, cfg_.thread_idx, wc, ne,
+                                ctx_by_tag_);
+      remote_process_completions(
+          ctx_, cfg_.thread_idx, ring, ne, wc, ctx_by_tag_, atomic_buffer_ptr_,
+          cfg_.num_ranks, cfg_.num_experts, pending_atomic_updates, cfg_.rank,
+          cfg_.num_nodes, cfg_.use_normal_mode);
+#ifdef USE_RECEIVER_BARRIER
+      if (!cfg_.use_normal_mode) {
+        apply_pending_updates(ctx_, pending_atomic_updates, atomic_buffer_ptr_,
+                              cfg_.num_experts, cfg_.num_ranks);
+      }
+#endif
+      notify_gpu_completion(dummy_tail);
+      progress_pending_atomics();
+    } else {
+      cpu_relax();
+    }
+    auto now = clock::now();
+    if (now - last_log > std::chrono::milliseconds(1000)) {
+      fprintf(stderr,
+              "[pending atomics] waiting... batches=%zu deps_front=%zu "
+              "inflight_writes=%zu\n",
+              pending_atomic_batches_.size(),
+              pending_atomic_batches_.empty()
+                  ? 0
+                  : pending_atomic_batches_.front().pending_writes,
+              inflight_write_wrs_.size());
+      last_log = now;
+    }
+  }
 }
 
 void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
@@ -990,6 +1233,9 @@ void Proxy::post_gpu_commands_mixed(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post) {
   if (cmds_to_post.empty()) return;
+  if (profile_commands_) {
+    profile_write_batching_opportunity(wrs_to_post, cmds_to_post);
+  }
   rdma_wrs.clear();
   rdma_cmds.clear();
   atomic_wrs.clear();
@@ -1004,17 +1250,20 @@ void Proxy::post_gpu_commands_mixed(
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
                             cfg_.thread_idx, cfg_.use_normal_mode);
     inflight_write_wrs_.insert(rdma_wrs.begin(), rdma_wrs.end());
+    atomic_dependency_wrs_.insert(atomic_dependency_wrs_.end(),
+                                  rdma_wrs.begin(), rdma_wrs.end());
     rdma_wrs.clear();
     rdma_cmds.clear();
   };
 
-  auto flush_atomics = [&]() {
+  auto enqueue_atomics_ordered = [&]() {
     if (atomic_wrs.empty()) return;
-    post_atomic_operations(ctx_, atomic_wrs, atomic_cmds, ctxs_for_all_ranks_,
-                           cfg_.rank, cfg_.thread_idx, acked_wrs_,
-                           cfg_.use_normal_mode);
-    atomic_wrs.clear();
-    atomic_cmds.clear();
+    // Keep NCCL-GIN's payload-before-tail semantics without stopping the WRITE
+    // pipeline.  Each tail batch records the payload WRs posted before it; the
+    // main proxy loop posts the ATOMIC only after those WRs complete, while
+    // later WRITE commands may keep flowing.
+    enqueue_pending_atomics(atomic_wrs, atomic_cmds, atomic_dependency_wrs_);
+    progress_pending_atomics();
   };
 
   for (size_t i = 0; i < cmds_to_post.size(); ++i) {
@@ -1028,6 +1277,9 @@ void Proxy::post_gpu_commands_mixed(
         case CmdType::WRITE:
           ++profile_write_cmds_;
           profile_write_bytes_ += static_cast<uint64_t>(cmds_to_post[i].bytes);
+          if (cmds_to_post[i].atomic_val > 0) {
+            ++profile_piggyback_atomic_write_cmds_;
+          }
           break;
         case CmdType::ATOMIC:
           ++profile_atomic_cmds_;
@@ -1105,28 +1357,32 @@ void Proxy::post_gpu_commands_mixed(
         break;
       }
       case (CmdType::WRITE): {
-        flush_atomics();
+        enqueue_atomics_ordered();
         rdma_wrs.push_back(wrs_to_post[i]);
         rdma_cmds.push_back(cmds_to_post[i]);
         break;
       }
       case (CmdType::QUIET): {
         flush_writes();
-        flush_atomics();
+        enqueue_atomics_ordered();
+        drain_pending_atomics();
 #ifdef USE_MSCCLPP_FIFO_BACKEND
         assert(ctx_.quiet_wr == -1);
 #endif
         ctx_.quiet_wr = wrs_to_post[i];
         quiet({wrs_to_post[i]}, {cmds_to_post[i]}, {});
+        atomic_dependency_wrs_.clear();
         break;
       }
       case (CmdType::BARRIER): {
         flush_writes();
-        flush_atomics();
+        enqueue_atomics_ordered();
+        drain_pending_atomics();
 #ifdef USE_MSCCLPP_FIFO_BACKEND
         assert(ctx_.barrier_wr == -1);
 #endif
         send_barrier(wrs_to_post[i]);
+        atomic_dependency_wrs_.clear();
         break;
       }
       default: {
@@ -1140,7 +1396,122 @@ void Proxy::post_gpu_commands_mixed(
     ++profile_post_batches_;
   }
   flush_writes();
-  flush_atomics();
+  enqueue_atomics_ordered();
+}
+
+void Proxy::profile_write_batching_opportunity(
+    std::vector<uint64_t> const& wrs_to_post,
+    std::vector<TransferCmd> const& cmds_to_post) {
+  struct RunState {
+    bool valid = false;
+    uint64_t ring = 0;
+    uint32_t dst = 0;
+    uint32_t bytes = 0;
+    uint64_t last_remote_end = 0;
+    uint64_t last_local_end = 0;
+    uint64_t remote_run = 0;
+    uint64_t local_contig_run = 0;
+  };
+
+  auto finish_stream_run = [&](RunState& st) {
+    if (!st.valid || st.remote_run <= 1) return;
+    ++profile_stream_remote_runs_;
+    profile_stream_remote_run_tokens_ += st.remote_run;
+    profile_stream_remote_run_max_ =
+        std::max(profile_stream_remote_run_max_, st.remote_run);
+    if (st.local_contig_run > 1) {
+      ++profile_stream_local_contig_runs_;
+      profile_stream_local_contig_tokens_ += st.local_contig_run;
+      profile_stream_local_contig_max_ =
+          std::max(profile_stream_local_contig_max_, st.local_contig_run);
+    }
+  };
+
+  auto finish_semantic_run = [&](RunState const& st) {
+    if (!st.valid || st.remote_run <= 1) return;
+    ++profile_semantic_remote_runs_;
+    profile_semantic_remote_run_tokens_ += st.remote_run;
+    profile_semantic_remote_run_max_ =
+        std::max(profile_semantic_remote_run_max_, st.remote_run);
+    if (st.local_contig_run > 1) {
+      ++profile_semantic_local_contig_runs_;
+      profile_semantic_local_contig_tokens_ += st.local_contig_run;
+      profile_semantic_local_contig_max_ =
+          std::max(profile_semantic_local_contig_max_, st.local_contig_run);
+    } else {
+      ++profile_semantic_gather_runs_;
+      profile_semantic_gather_tokens_ += st.remote_run;
+      profile_semantic_gather_max_ =
+          std::max(profile_semantic_gather_max_, st.remote_run);
+    }
+  };
+
+  RunState stream;
+  std::unordered_map<uint64_t, RunState> semantic_by_ring_dst;
+
+  for (size_t i = 0; i < cmds_to_post.size(); ++i) {
+    TransferCmd const& cmd = cmds_to_post[i];
+    if (get_base_cmd(cmd.cmd_type) != CmdType::WRITE || cmd.bytes == 0) {
+      finish_stream_run(stream);
+      stream = RunState{};
+      continue;
+    }
+
+    uint64_t const ring = (wrs_to_post[i] >> 32) & 0xFFFFFFFFull;
+    uint64_t const remote = decode_write_offset(cmd.req_rptr,
+                                                get_low_latency(cmd.cmd_type));
+    uint64_t const local = decode_write_offset(cmd.req_lptr,
+                                               get_low_latency(cmd.cmd_type));
+    uint64_t const remote_end = remote + cmd.bytes;
+    uint64_t const local_end = local + cmd.bytes;
+
+    auto update_run = [&](RunState& st) {
+      bool const same_stream =
+          st.valid && st.ring == ring && st.dst == cmd.dst_rank &&
+          st.bytes == cmd.bytes && st.last_remote_end == remote;
+      bool const local_contig = same_stream && st.last_local_end == local;
+      if (!same_stream) {
+        st.valid = true;
+        st.ring = ring;
+        st.dst = cmd.dst_rank;
+        st.bytes = cmd.bytes;
+        st.remote_run = 1;
+        st.local_contig_run = 1;
+      } else {
+        ++st.remote_run;
+        st.local_contig_run = local_contig ? st.local_contig_run + 1 : 1;
+      }
+      st.last_remote_end = remote_end;
+      st.last_local_end = local_end;
+    };
+
+    if (stream.valid) {
+      bool const extends_stream =
+          stream.ring == ring && stream.dst == cmd.dst_rank &&
+          stream.bytes == cmd.bytes && stream.last_remote_end == remote;
+      if (!extends_stream) {
+        finish_stream_run(stream);
+        stream = RunState{};
+      }
+    }
+    update_run(stream);
+
+    uint64_t const key = (ring << 8) | static_cast<uint64_t>(cmd.dst_rank);
+    auto& semantic = semantic_by_ring_dst[key];
+    if (semantic.valid) {
+      bool const extends_semantic =
+          semantic.ring == ring && semantic.dst == cmd.dst_rank &&
+          semantic.bytes == cmd.bytes && semantic.last_remote_end == remote;
+      if (!extends_semantic) {
+        finish_semantic_run(semantic);
+        semantic = RunState{};
+      }
+    }
+    update_run(semantic);
+  }
+
+  finish_stream_run(stream);
+  for (auto const& kv : semantic_by_ring_dst) finish_semantic_run(kv.second);
 }
 
 void Proxy::dump_command_profile() const {
@@ -1153,23 +1524,55 @@ void Proxy::dump_command_profile() const {
       seconds > 0.0
           ? static_cast<double>(profile_write_bytes_) / seconds / 1.0e9
           : 0.0;
-  char line[1024];
+  char line[2048];
   int const n = std::snprintf(
       line, sizeof(line),
       "UCCL_PROXY_PROFILE rank=%d thread=%d normal=%d rings=%zu "
       "seconds=%.6f post_batches=%llu post_cmds=%llu write_cmds=%llu "
-      "write_bytes=%llu write_GBps=%.3f atomic_cmds=%llu quiet_cmds=%llu "
-      "barrier_cmds=%llu completed_wrs=%llu cmds_per_sec=%.3f\n",
+      "write_bytes=%llu write_GBps=%.3f piggyback_atomic_write_cmds=%llu "
+      "atomic_cmds=%llu quiet_cmds=%llu "
+      "barrier_cmds=%llu completed_wrs=%llu posted_atomic_wrs=%llu "
+      "coalesced_atomic_wrs=%llu poll_us=%llu progress_atomic_us=%llu "
+      "post_gpu_us=%llu stream_remote_runs=%llu stream_remote_tokens=%llu "
+      "stream_remote_max=%llu stream_local_runs=%llu stream_local_tokens=%llu "
+      "stream_local_max=%llu semantic_remote_runs=%llu "
+      "semantic_remote_tokens=%llu semantic_remote_max=%llu "
+      "semantic_local_runs=%llu semantic_local_tokens=%llu "
+      "semantic_local_max=%llu semantic_gather_runs=%llu "
+      "semantic_gather_tokens=%llu semantic_gather_max=%llu "
+      "cmds_per_sec=%.3f\n",
       cfg_.rank, cfg_.thread_idx, cfg_.use_normal_mode ? 1 : 0,
       cfg_.d2h_queues.size(), seconds,
       static_cast<unsigned long long>(profile_post_batches_),
       static_cast<unsigned long long>(profile_post_cmds_),
       static_cast<unsigned long long>(profile_write_cmds_),
       static_cast<unsigned long long>(profile_write_bytes_), write_gbps,
+      static_cast<unsigned long long>(profile_piggyback_atomic_write_cmds_),
       static_cast<unsigned long long>(profile_atomic_cmds_),
       static_cast<unsigned long long>(profile_quiet_cmds_),
       static_cast<unsigned long long>(profile_barrier_cmds_),
-      static_cast<unsigned long long>(profile_completed_wrs_), cmds_per_sec);
+      static_cast<unsigned long long>(profile_completed_wrs_),
+      static_cast<unsigned long long>(profile_posted_atomic_wrs_),
+      static_cast<unsigned long long>(profile_coalesced_atomic_wrs_),
+      static_cast<unsigned long long>(profile_poll_us_),
+      static_cast<unsigned long long>(profile_progress_atomic_us_),
+      static_cast<unsigned long long>(profile_post_gpu_us_),
+      static_cast<unsigned long long>(profile_stream_remote_runs_),
+      static_cast<unsigned long long>(profile_stream_remote_run_tokens_),
+      static_cast<unsigned long long>(profile_stream_remote_run_max_),
+      static_cast<unsigned long long>(profile_stream_local_contig_runs_),
+      static_cast<unsigned long long>(profile_stream_local_contig_tokens_),
+      static_cast<unsigned long long>(profile_stream_local_contig_max_),
+      static_cast<unsigned long long>(profile_semantic_remote_runs_),
+      static_cast<unsigned long long>(profile_semantic_remote_run_tokens_),
+      static_cast<unsigned long long>(profile_semantic_remote_run_max_),
+      static_cast<unsigned long long>(profile_semantic_local_contig_runs_),
+      static_cast<unsigned long long>(profile_semantic_local_contig_tokens_),
+      static_cast<unsigned long long>(profile_semantic_local_contig_max_),
+      static_cast<unsigned long long>(profile_semantic_gather_runs_),
+      static_cast<unsigned long long>(profile_semantic_gather_tokens_),
+      static_cast<unsigned long long>(profile_semantic_gather_max_),
+      cmds_per_sec);
   if (n > 0) {
     size_t const len =
         static_cast<size_t>(std::min(n, static_cast<int>(sizeof(line) - 1)));
@@ -1177,16 +1580,23 @@ void Proxy::dump_command_profile() const {
   }
 }
 
-void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
-  std::unordered_set<uint64_t> pending_release_wrs(release_wrs.begin(),
-                                                   release_wrs.end());
-  pending_release_wrs.insert(inflight_write_wrs_.begin(),
-                             inflight_write_wrs_.end());
+void Proxy::wait_for_cq(std::vector<uint64_t> release_wrs,
+                        bool include_all_writes) {
+  std::unordered_set<uint64_t> pending_release_wrs;
+  pending_release_wrs.reserve(release_wrs.size() + inflight_write_wrs_.size());
+  for (uint64_t wr_id : release_wrs) {
+    if (inflight_write_wrs_.find(wr_id) != inflight_write_wrs_.end()) {
+      pending_release_wrs.insert(wr_id);
+    }
+  }
+  if (include_all_writes) {
+    pending_release_wrs.insert(inflight_write_wrs_.begin(),
+                               inflight_write_wrs_.end());
+  }
+  if (pending_release_wrs.empty()) return;
   auto outstanding_batches = [&]() -> size_t {
     return pending_release_wrs.size();
   };
-  constexpr int kConsecutiveEmptyToExit = 3;
-  int empty_iters = 0;
   ibv_wc wc[kMaxOutstandingSends];
   using clock = std::chrono::steady_clock;
   auto last_log = clock::now();
@@ -1195,7 +1605,6 @@ void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
   for (;;) {
     int ne = poll_cq_once(get_cq(ctx_), wc, kMaxOutstandingSends);
     if (ne > 0) {
-      empty_iters = 0;
       local_process_completions(ctx_, acked_wrs_, cfg_.thread_idx, wc, ne,
                                 ctx_by_tag_);
       remote_process_completions(
@@ -1208,18 +1617,21 @@ void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
                               cfg_.num_experts, cfg_.num_ranks);
       }
 #endif
-    } else {
-      ++empty_iters;
     }
     for (auto it = pending_release_wrs.begin(); it != pending_release_wrs.end();) {
       if (acked_wrs_.find(*it) != acked_wrs_.end()) {
+        // Keep the inflight set bounded: a completed write must leave
+        // inflight_write_wrs_, otherwise the set grows without bound and a later
+        // quiet_cq can dead-wait on a WR whose ack was already drained from
+        // acked_wrs_.
+        retire_inflight_write(*it);
         it = pending_release_wrs.erase(it);
       } else {
         ++it;
       }
     }
     notify_gpu_completion(dummy_tail);
-    if (outstanding_batches() == 0 && empty_iters >= kConsecutiveEmptyToExit) {
+    if (outstanding_batches() == 0) {
       break;
     }
     auto now = clock::now();
@@ -1229,6 +1641,10 @@ void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
       last_log = now;
     }
   }
+}
+
+void Proxy::quiet_cq(std::vector<uint64_t> release_wrs) {
+  wait_for_cq(std::move(release_wrs), /*include_all_writes=*/true);
 }
 
 void Proxy::quiet(std::vector<uint64_t> wrs, std::vector<TransferCmd> cmds,

@@ -1490,7 +1490,7 @@ static void post_rdma_async_batched_normal_mode(
           std::abort();
         }
         // Optionally send an inline "atomic" via imm, else use imm only on tail
-        if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
+        if (cmd.atomic_val > 0) {
           int v = static_cast<int>(cmd.atomic_val);
           if (v < -kMaxSendAtomicValue || v > kMaxSendAtomicValue) {
             fprintf(stderr, "[EFA] atomic value=%d won't fit in 15 bits\n", v);
@@ -1636,7 +1636,7 @@ static void post_rdma_async_batched_normal_mode(
 #endif
 
           // Put IMM on the last sub-WR of this command (if applicable).
-          if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
+          if (cmd.atomic_val > 0) {
             int v = static_cast<int>(cmd.atomic_val);
             if (v < -kMaxSendAtomicValue || v > kMaxSendAtomicValue) {
               fprintf(stderr, "atomic value=%d won't fit in 15 bits\n", v);
@@ -1783,7 +1783,7 @@ static void post_rdma_async_batched_normal_mode(
 #endif
 
           // Put IMM on the last sub-WR of this command (if applicable).
-          if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
+          if (cmd.atomic_val > 0) {
             int v = static_cast<int>(cmd.atomic_val);
             if (v < -kMaxSendAtomicValue || v > kMaxSendAtomicValue) {
               fprintf(stderr, "atomic value=%d won't fit in 15 bits\n", v);
