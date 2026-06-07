@@ -1498,15 +1498,7 @@ static void post_rdma_async_batched_normal_mode(
           }
           size_t index =
               static_cast<size_t>(cmd.atomic_offset / sizeof(int64_t));
-          // Initialize missing entries lazily
-          auto key = ctx->seq_key(dst_rank, index);
-          if (ctx->next_seq_per_index.find(key) ==
-              ctx->next_seq_per_index.end())
-            ctx->next_seq_per_index[key] = 0;
-
-          uint8_t seq = ctx->next_seq_per_index[key];
-          ctx->next_seq_per_index[key] =
-              (seq + 1) % kReorderingBufferSize;  // 4-bit wrap (0–15)
+          uint8_t seq = ctx->take_next_atomic_seq(index);
           uint32_t imm =
               AtomicsImm::PackAtomicWithSeq(v, cmd.atomic_offset, seq, true)
                   .GetImmData();
@@ -1644,15 +1636,7 @@ static void post_rdma_async_batched_normal_mode(
             }
             size_t index =
                 static_cast<size_t>(cmd.atomic_offset / sizeof(int64_t));
-            // Initialize missing entries lazily
-            auto key = ctx->seq_key(dst_rank, index);
-            if (ctx->next_seq_per_index.find(key) ==
-                ctx->next_seq_per_index.end())
-              ctx->next_seq_per_index[key] = 0;
-
-            uint8_t seq = ctx->next_seq_per_index[key];
-            ctx->next_seq_per_index[key] =
-                (seq + 1) % kReorderingBufferSize;  // 4-bit wrap (0–15)
+            uint8_t seq = ctx->take_next_atomic_seq(index);
             uint32_t imm =
                 AtomicsImm::PackAtomicWithSeq(v, cmd.atomic_offset, seq, true)
                     .GetImmData();
@@ -2304,15 +2288,12 @@ void remote_process_completions_normal_mode(
         assert(false &&
                "Reorderable atomic operations should not be triggered");
 #endif
-        struct SeqBuf {
-          uint8_t expected = 0;       // next seq expected
-          uint16_t present_mask = 0;  // bitmask of buffered seqs
-          int vals[kReorderingBufferSize] = {0};
-        };
-
-        // Thread-local map to maintain per-index state
-        static thread_local std::unordered_map<size_t, SeqBuf> seqbufs;
-        auto& sb = seqbufs[index];
+        if (index >= S.ordered_atomic_seqbufs.size()) {
+          fprintf(stderr, "Error: ordered atomic index %zu out of range\n", index);
+          std::abort();
+        }
+        auto& sb = S.ordered_atomic_seqbufs[index];
+        if (S.profile_receiver_atomics) ++S.profile_receiver_atomic_cqes;
 
         auto commit = [&](int delta) {
           addr64->fetch_add(delta, std::memory_order_release);
@@ -2323,6 +2304,7 @@ void remote_process_completions_normal_mode(
           std::abort();
         }
         if (seq == sb.expected) {
+          if (S.profile_receiver_atomics) ++S.profile_receiver_atomic_in_order;
           commit(value);
           sb.expected = (sb.expected + 1) % kReorderingBufferSize;
 
@@ -2334,6 +2316,7 @@ void remote_process_completions_normal_mode(
             commit(sb.vals[e]);
             sb.present_mask &= static_cast<uint16_t>(~bit);
             sb.expected = (sb.expected + 1) % kReorderingBufferSize;
+            if (S.profile_receiver_atomics) ++S.profile_receiver_atomic_drained;
           }
         } else {
           // Out-of-order arrival — buffer it
@@ -2354,6 +2337,13 @@ void remote_process_completions_normal_mode(
           } else {
             sb.present_mask |= bit;
             sb.vals[seq] = value;
+            if (S.profile_receiver_atomics) {
+              ++S.profile_receiver_atomic_buffered;
+              S.profile_receiver_atomic_max_buffered =
+                  std::max<uint64_t>(S.profile_receiver_atomic_max_buffered,
+                                     static_cast<uint64_t>(
+                                         __builtin_popcount(sb.present_mask)));
+            }
           }
         }
       }
@@ -2922,12 +2912,7 @@ static void post_atomic_operations_normal_mode(
             std::abort();
           }
           size_t index = static_cast<size_t>(offset / sizeof(int64_t));
-          auto key = ctx->seq_key(dst_rank, index);
-          if (ctx->next_seq_per_index.find(key) == ctx->next_seq_per_index.end())
-            ctx->next_seq_per_index[key] = 0;
-          uint8_t seq = ctx->next_seq_per_index[key];
-          ctx->next_seq_per_index[key] =
-              (seq + 1) % kReorderingBufferSize;
+          uint8_t seq = ctx->take_next_atomic_seq(index);
           imm = AtomicsImm::PackAtomicWithSeq(v, static_cast<uint16_t>(offset),
                                               seq, true)
                     .GetImmData();

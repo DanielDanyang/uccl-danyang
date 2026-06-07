@@ -89,6 +89,7 @@ Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
   profile_commands_ = std::getenv("UCCL_PROXY_PROFILE_COMMANDS") != nullptr;
+  ctx_.profile_receiver_atomics = profile_commands_;
   profile_merge_opportunity_ =
       std::getenv("UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY") != nullptr;
   profile_start_ = std::chrono::steady_clock::now();
@@ -1648,6 +1649,9 @@ void Proxy::dump_command_profile() const {
       "coalesced_atomic_wrs=%llu poll_us=%llu progress_atomic_us=%llu "
       "post_gpu_us=%llu mixed_ns=%llu dependency_scan_ns=%llu "
       "dependency_candidates=%llu dependency_active=%llu dependency_max=%llu "
+      "receiver_atomic_cqes=%llu receiver_atomic_in_order=%llu "
+      "receiver_atomic_buffered=%llu receiver_atomic_drained=%llu "
+      "receiver_atomic_max_buffered=%llu "
       "merge_profile_enabled=%d stream_remote_runs=%llu stream_remote_tokens=%llu "
       "stream_remote_max=%llu stream_local_runs=%llu stream_local_tokens=%llu "
       "stream_local_max=%llu semantic_remote_runs=%llu "
@@ -1682,6 +1686,11 @@ void Proxy::dump_command_profile() const {
       static_cast<unsigned long long>(profile_dependency_candidates_),
       static_cast<unsigned long long>(profile_dependency_active_),
       static_cast<unsigned long long>(profile_dependency_max_),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_cqes),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_in_order),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_buffered),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_drained),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_max_buffered),
       profile_merge_opportunity_ ? 1 : 0,
       static_cast<unsigned long long>(profile_stream_remote_runs_),
       static_cast<unsigned long long>(profile_stream_remote_run_tokens_),

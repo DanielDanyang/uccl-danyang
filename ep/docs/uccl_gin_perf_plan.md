@@ -156,6 +156,64 @@ dependency_max:         72 -> 2
 finish,但它不是剩余 `~2x` V1/V2 gap 的主因。下一优先级转向 receiver
 WRITE_WITH_IMM CQE/reorder/apply 与 forward tail/load critical path。
 
+### 已完成:receiver sequence profile 与 compact chunk sweep
+
+receiver ordered atomic profile 显示:
+
+```text
+32-token chunk, rank0/thread0:
+  receiver_atomic_cqes=22320
+  receiver_atomic_in_order=20438
+  receiver_atomic_buffered=1882     # 8.4%
+  receiver_atomic_max_buffered=2
+
+4-token chunk, rank0/thread0:
+  receiver_atomic_cqes=120528
+  receiver_atomic_in_order=115181
+  receiver_atomic_buffered=5347     # 4.4%
+  receiver_atomic_max_buffered=5
+```
+
+即使 4-token 让 CQE 数增加约 `5.4x`,dispatch 仍明显更快。当前瓶颈不是 receiver
+处理 CQE 的总吞吐,而是 payload/count 首次可见和 forward warp 流式消费的延迟。
+
+compact chunk sweep:
+
+```text
+tokens/chunk   cached dispatch SO BW   dispatch_impl
+64             ~27 GB/s                2.23-2.31 ms
+32             ~31-32 GB/s             1.93-2.00 ms
+16             ~33-34 GB/s             1.79-1.83 ms
+8              ~35-36 GB/s             1.70-1.73 ms
+4              ~37-38 GB/s             1.59-1.64 ms
+2              ~32 GB/s                1.90-1.93 ms
+```
+
+4-token 是当前 README-like EP8x2/H200/EFA 配置的最佳点。2-token 开始进入 EFA
+小消息效率下降区,64-token 则因等待 chunk 填满而损失 streaming overlap。
+
+同时把 ordered atomic sender/receiver sequence 状态从 `unordered_map` 改成由
+`ProxyCtx` 持有的 1024 项直接索引数组:
+
+- 1024 项上界直接来自 wire ABI 的 13-bit byte offset / 8-byte tail word。
+- 不改变 sequence、reorder 或 apply 语义。
+- 避免 4-token 高命令率下每个 ordered operation 的哈希查找。
+
+当前基线:
+
+```text
+cached dispatch: ~38 GB/s (SO), 1.60-1.63 ms
+```
+
+下一步:
+
+- 继续优化 payload 首次可见和 forward 消费重叠,而不是减少 WR/CQE。
+- 检查能否让 scaleout warp 更早发布首个 4-token chunk,并减少 compact store 到 D2H
+  publish 之间的等待。
+- 重新拆 4-token 配置下的 `scaleout_store_wait`, `scaleout_d2h`,
+  `forward_tail_wait`, `forward_load`,但应使用采样式 profile 避免 full clock profile
+  把 headline BW 改写。
+
 ## 当前数据
 
 ### V2 UCCL-GIN

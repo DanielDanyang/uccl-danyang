@@ -434,7 +434,7 @@ hybrid_dispatch_impl(
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
 #ifdef DEEPEP_USE_UCCL_GIN
         const auto scaleout_send_channel_buffer = scaleout_send_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
-        constexpr int kUCCLGinCompactChunkTokens = 32;
+        constexpr int kUCCLGinCompactChunkTokens = 4;
         EP_STATIC_ASSERT(kUCCLGinCompactChunkTokens <= 0xFF,
                          "UCCL-GIN piggyback count delta must fit TransferCmd::atomic_val");
         EP_STATIC_ASSERT(handle::kUCCLGinTailFinishDelta <= uccl_gin::kAtomicValueMax,

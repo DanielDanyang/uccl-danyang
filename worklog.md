@@ -4233,3 +4233,107 @@ progress_atomic_us       45328        19360
 - finish dependency 不是剩余 V1/V2 gap 的主因。
 - 下一步应集中在 receiver WRITE_WITH_IMM CQE/reorder/apply 和 forward
   tail/load critical path,而不是继续微调 dependency container。
+
+## 2026-06-07: receiver sequence 状态优化与 compact chunk sweep
+
+### receiver ordered atomic profile
+
+新增轻量 profile 字段:
+
+```text
+receiver_atomic_cqes
+receiver_atomic_in_order
+receiver_atomic_buffered
+receiver_atomic_drained
+receiver_atomic_max_buffered
+```
+
+仅在 `UCCL_PROXY_PROFILE_COMMANDS=1` 时计数。
+
+32-token profile 日志:
+
+```text
+/tmp/uccl_gin_receiver_array_profile_rank0.log
+/tmp/uccl_gin_receiver_array_profile_rank1.log
+```
+
+代表性数据:
+
+```text
+rank0/thread0:
+receiver_atomic_cqes=22320
+receiver_atomic_in_order=20438
+receiver_atomic_buffered=1882
+receiver_atomic_drained=1882
+receiver_atomic_max_buffered=2
+```
+
+约 `92%` ordered atomic CQE 直接按序到达,乱序深度很浅。因此 reorder lookup 不是
+当前主瓶颈。
+
+### sequence 状态固定数组
+
+代码改动:
+
+- receiver `thread_local unordered_map<size_t, SeqBuf>` 改为
+  `ProxyCtx::ordered_atomic_seqbufs[1024]`。
+- sender `next_seq_per_index unordered_map` 改为 `ProxyCtx` 内 1024 项数组。
+- 1024 来自 ordered atomic immediate 的 13-bit byte offset 和 8-byte tail word:
+  `(1 << 13) / 8`。
+- sequence/reorder/apply 语义不变。
+
+构建日志:
+
+```text
+/tmp/uccl_gin_receiver_array_build.log
+/tmp/uccl_gin_seq_array_build.log
+```
+
+### compact chunk sweep
+
+所有配置均运行完整 correctness check,两节点均 `EXIT:0`:
+
+```text
+chunk  logs                                  cached dispatch
+64     /tmp/uccl_gin_chunk64_rank{0,1}.log  ~27 GB/s, 2.23-2.31 ms
+16     /tmp/uccl_gin_chunk16_rank{0,1}.log  ~33-34 GB/s, 1.79-1.83 ms
+8      /tmp/uccl_gin_chunk8_rank{0,1}.log   ~35-36 GB/s, 1.70-1.73 ms
+4      /tmp/uccl_gin_chunk4_rank{0,1}.log   ~37-38 GB/s, 1.59-1.64 ms
+2      /tmp/uccl_gin_chunk2_rank{0,1}.log   ~32 GB/s, 1.90-1.93 ms
+```
+
+保留配置:
+
+```text
+kUCCLGinCompactChunkTokens = 4
+```
+
+4-token + sender/receiver sequence array 最终验证:
+
+```text
+/tmp/uccl_gin_seq_array_rank0.log
+/tmp/uccl_gin_seq_array_rank1.log
+
+cached dispatch: ~38 GB/s (SO), 1.60-1.63 ms
+```
+
+4-token profile:
+
+```text
+/tmp/uccl_gin_chunk4_profile_rank0.log
+/tmp/uccl_gin_chunk4_profile_rank1.log
+
+rank0/thread0:
+receiver_atomic_cqes=120528
+receiver_atomic_in_order=115181
+receiver_atomic_buffered=5347
+receiver_atomic_max_buffered=5
+```
+
+结论:
+
+- 虽然 4-token 让 receiver atomic CQE 数增加约 `5.4x`,dispatch 仍比 32-token 快约
+  `20-25%`。
+- 当前关键限制是 payload/count 首次可见和 forward 流式消费延迟,不是 CQE 总吞吐。
+- 2-token 开始受到 EFA 小消息效率/命令压力限制;4-token 是当前测试配置的最佳点。
+- 相比本轮开始时约 `30-31 GB/s`,当前达到约 `38 GB/s`。
