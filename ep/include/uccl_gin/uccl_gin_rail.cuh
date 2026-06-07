@@ -57,7 +57,7 @@ __device__ __forceinline__ uint64_t rail_put(d2hq::D2HHandle* q, int dst_rank,
   cmd.req_lptr = local_off_shifted;
   cmd.req_rptr = remote_off_shifted;
   uint64_t slot = 0;
-  q->atomic_set_and_commit(cmd, &slot);
+  q->atomic_set_and_commit(cmd, &slot, kUCCLGinMaxInflightNormal);
   return slot;
 }
 
@@ -87,7 +87,7 @@ __device__ __forceinline__ uint64_t rail_put_tail_add(
   cmd.req_rptr = remote_off_shifted;
   cmd.atomic_offset = static_cast<uint16_t>(atomic_byte_off);
   uint64_t slot = 0;
-  q->atomic_set_and_commit(cmd, &slot);
+  q->atomic_set_and_commit(cmd, &slot, kUCCLGinMaxInflightNormal);
   return slot;
 }
 
@@ -110,7 +110,7 @@ __device__ __forceinline__ uint64_t rail_red_add(d2hq::D2HHandle* q, int dst_ran
   cmd.req_rptr = atomic_byte_off;  // RAW byte offset into receiver atomic buffer
   cmd.atomic_offset = 1;           // non-zero => ordered (PackAtomicWithSeq) path
   uint64_t slot = 0;
-  q->atomic_set_and_commit(cmd, &slot);
+  q->atomic_set_and_commit(cmd, &slot, kUCCLGinMaxInflightNormal);
   return slot;
 }
 

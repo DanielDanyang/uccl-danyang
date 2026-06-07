@@ -40,6 +40,13 @@ enum DispatchClockCounter : uint32_t {
   kDispatchClockScaleoutD2HMaxPacked,
   kDispatchClockForwardTailWaitMaxPacked,
   kDispatchClockForwardLoadMaxPacked,
+  // Tail-delivery discriminator: was the next tail already visible when the
+  // forward warp first looked (ready) or did it have to spin (stall)?
+  // ready-dominant  => forward not starved => not delivery/first-visibility bound
+  // stall-dominant  => forward starved waiting for the count tail to appear
+  kDispatchClockForwardTailReadyEvents,
+  kDispatchClockForwardTailStallEvents,
+  kDispatchClockForwardTailStallCycles,
   kDispatchClockNumCounters
 };
 

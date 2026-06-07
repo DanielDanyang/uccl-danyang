@@ -4337,3 +4337,136 @@ receiver_atomic_max_buffered=5
 - 当前关键限制是 payload/count 首次可见和 forward 流式消费延迟,不是 CQE 总吞吐。
 - 2-token 开始受到 EFA 小消息效率/命令压力限制;4-token 是当前测试配置的最佳点。
 - 相比本轮开始时约 `30-31 GB/s`,当前达到约 `38 GB/s`。
+
+## 2026-06-07: tail wait discriminator 与 V1-style inflight cap
+
+### profiling code review
+
+检查了新增 profiling:
+
+- `ep/include/uccl_gin/resources.cuh` 新增
+  `forward_tail_ready_events`, `forward_tail_stall_events`,
+  `forward_tail_stall_cycles`。
+- `hybrid_dispatch.cuh` 在 forward warp 进入 `timeout_while` 前,复用已有
+  `stored_scaleout_tail_idx / stored_scaleout_old_tail_idx / stored_finish_flag`
+  做一次 ready/stall 判别。
+- 该判别不额外重读 tail word,不改变 `timeout_while` 控制流,适合作为 tail 首次可见
+  的 discriminator。
+
+### tail discriminator run
+
+同步文件:
+
+```text
+ep/include/uccl_gin/resources.cuh
+thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh
+```
+
+重新安装:
+
+```text
+/tmp/uccl_gin_taildisc_build.log
+```
+
+运行命令要点:
+
+```text
+EP_JIT_CACHE_DIR=/tmp/deepep_jit_uccl_taildisc
+UCCL_GIN_DISPATCH_CLOCK_PROFILE=1
+UCCL_PROXY_PROFILE_COMMANDS=1
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic --skip-check
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_taildisc_rank0.log
+/tmp/uccl_gin_taildisc_rank1.log
+```
+
+汇总:
+
+```text
+rank0:
+  avg scaleout_d2h cycles/event        85.5k
+  avg forward_tail_wait cycles/event   24.4k
+  tail stall fraction                  23.3%
+  avg stalled tail wait cycles/event  104.1k
+  avg forward_load cycles/event        18.0k
+
+rank1:
+  avg scaleout_d2h cycles/event        68.0k
+  avg forward_tail_wait cycles/event   53.3k
+  tail stall fraction                  29.4%
+  avg stalled tail wait cycles/event  180.7k
+  avg forward_load cycles/event         8.1k
+```
+
+结论:
+
+- forward warp 约 `70-77%` tail check 第一次看时已经 ready。
+- stall 事件占比不是多数,但单次 stall 很重,仍然是 critical path 的一部分。
+- clock profile 很侵入,本 run cached dispatch 只有 `10-12 GB/s`;headline BW 不作为优化
+  对比,只看 counters。
+
+### P1 inflight cap implementation
+
+实现 V1-style cap:
+
+- `RingBuffer::atomic_set_and_commit` 增加可选 `max_inflight` 参数。
+- `d2hq::D2HHandle::atomic_set_and_commit` 透传该参数。
+- UCCL-GIN Rail 的 `rail_put`, `rail_put_tail_add`, `rail_red_add` 传
+  `kUCCLGinMaxInflightNormal`。
+- `common.hpp` 新增 `UCCL_GIN_MAX_INFLIGHT_NORMAL`,默认 `8`,和 V1 normal path 的
+  `kMaxInflightNormal` 对齐。
+- `ep/Makefile` 新增 `GIN_MAX_INFLIGHT_NORMAL` 变量。注意 DeepEP JIT 也包含 header,
+  因此改变该值需要同步 header/JIT flags 或清 JIT cache。
+
+第一次远端运行失败:
+
+```text
+/tmp/uccl_gin_cap8_rank0.log
+/tmp/uccl_gin_cap8_rank1.log
+```
+
+原因:
+
+- JIT 编译 `uccl_gin_rail.cuh` 时调用的是 `d2hq::D2HHandle::atomic_set_and_commit`,
+  不是底层 `RingBuffer::atomic_set_and_commit`。
+- 只改底层签名会导致 `too many arguments in function call`。
+
+修复:
+
+- 给 `D2HHandle::atomic_set_and_commit` 同步增加可选 `max_inflight` 参数并透传到底层
+  ring。
+
+构建日志:
+
+```text
+/tmp/uccl_gin_cap8_build.log
+/tmp/uccl_gin_cap8_build2.log
+```
+
+最终验证:
+
+```text
+/tmp/uccl_gin_cap8_rank0.log
+/tmp/uccl_gin_cap8_rank1.log
+```
+
+结果:
+
+```text
+correctness: pass
+cached dispatch: 37-38 GB/s (SO), 1.62-1.64 ms
+```
+
+结论:
+
+- cap=8 正确,但没有可见性能提升;和当前 best baseline `~38 GB/s` 基本持平。
+- 当前 `38 -> 59 GB/s` gap 不能主要归因于 D2H ring 允许 inflight 到 2048。
+- P1 inflight cap 保留为可调机制,但优化优先级降低。下一步应聚焦 tail stall 长尾、
+  payload 首次可见、forward source/channel 调度与 V1 receiver ready/tag 消费方式。

@@ -746,6 +746,14 @@ hybrid_dispatch_impl(
             // Wait for this rank to have data (or finish)
 #if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
             const auto profile_tail_wait_start = lane_idx == 0 ? clock64() : 0;
+            // Discriminator: replicate the timeout_while first check WITHOUT
+            // re-reading the tail. If the chosen src rank already has data/finish
+            // visible from the previous round, the forward warp is NOT starved
+            // (delivery kept up); otherwise it must stall waiting for the tail.
+            uint32_t profile_arrived_or_finished =
+                stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
+            const bool profile_tail_ready =
+                ptx::exchange(profile_arrived_or_finished, recv_scaleout_rank_idx);
 #endif
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 const uint32_t arrived_or_finished =
@@ -785,6 +793,12 @@ hybrid_dispatch_impl(
                 const auto profile_cycles = clock64() - profile_tail_wait_start;
                 profile_add(uccl_gin::kDispatchClockForwardTailWaitCycles, profile_cycles);
                 profile_inc(uccl_gin::kDispatchClockForwardTailWaitEvents);
+                if (profile_tail_ready) {
+                    profile_inc(uccl_gin::kDispatchClockForwardTailReadyEvents);
+                } else {
+                    profile_inc(uccl_gin::kDispatchClockForwardTailStallEvents);
+                    profile_add(uccl_gin::kDispatchClockForwardTailStallCycles, profile_cycles);
+                }
                 profile_max(
                     uccl_gin::kDispatchClockForwardTailWaitMaxPacked,
                     profile_cycles,
@@ -1044,7 +1058,9 @@ hybrid_dispatch_impl(
                "forward_scaleup_store_cycles=%llu forward_scaleup_store_events=%llu "
                "forward_tokens=%llu scaleout_remote_tokens=%llu scaleout_local_tokens=%llu "
                "scaleout_d2h_max_packed=%llu forward_tail_wait_max_packed=%llu "
-               "forward_load_max_packed=%llu\n",
+               "forward_load_max_packed=%llu "
+               "forward_tail_ready_events=%llu forward_tail_stall_events=%llu "
+               "forward_tail_stall_cycles=%llu\n",
                rank_idx,
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutPreloadCycles]),
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutPreloadEvents]),
@@ -1071,7 +1087,10 @@ hybrid_dispatch_impl(
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutLocalTokens]),
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutD2HMaxPacked]),
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailWaitMaxPacked]),
-               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardLoadMaxPacked]));
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardLoadMaxPacked]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailReadyEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailStallEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailStallCycles]));
     }
 #endif
 

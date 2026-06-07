@@ -112,22 +112,27 @@ clock profile on: cached dispatch 11-14 GB/s, 4.4-5.6 ms
 
 ### 当前执行顺序
 
-1. 核对 receiver software-atomic sequence/reorder 语义:
+1. 保持 4-token compact chunk 作为当前默认基线:
+   - 当前最佳 verified baseline 是 `~38 GB/s, 1.60-1.64 ms`。
+   - 32/64-token chunk 虽减少 WR/CQE,但损失 streaming overlap;2-token 又进入小消息开销区。
+2. 继续优化 receiver/forward 首次可见路径:
+   - tail discriminator 显示 forward warp 有一部分事件确实在等 tail 首次可见,但 ready
+     事件占多数;这不是“所有 forward 都饿死”等单一瓶颈。
+   - 需要把 tail wait 与后续 payload load 的时序继续拆开,确认是否是 EFA DMA 到 HBM
+     的到达延迟、receiver CQE apply 延迟,还是 forward 轮询策略本身。
+3. 核对 receiver software-atomic sequence/reorder 语义:
    - piggyback count 与 standalone finish 是否共享同一 `(dst, atomic_offset)` seq。
    - receiver 是否只有按序 apply 完同一 tail-word 的 payload count 后才 apply finish。
    - 若成立,删除或收窄 sender 侧过度保守的全 batch completion dependency。
-2. 继续拆 `progress_pending_atomics` 与 receiver CQE/apply:
+4. 继续拆 `progress_pending_atomics` 与 receiver CQE/apply:
    - 区分等待 dependency、post atomic、receiver WRITE_WITH_IMM decode/reorder/apply。
    - 关注它是否延迟关键 finish,而不是只看累计 CPU 时间。
-3. 测量/优化 receiver critical path:
-   - forward tail wait 和 forward load 是当前更可信的 kernel 热点。
-   - profile 必须使用轻量采样或单独实验,避免 clock counters 改变整体性能。
-4. 每轮必须同时观察:
+5. 每轮必须同时观察:
    - dispatch SO BW / dispatch_impl wall time。
    - `post_gpu_ns_per_cmd`, `progress_atomic_ns_per_atomic`。
    - `scaleout_d2h cycles/event`。
    - command/WR/CQE 数量。
-5. dependency container fast path 和 inflight cap 都降为后续实验,不作为当前首要修复。
+6. dependency container fast path 和 inflight cap 都降为后续实验,不作为当前首要修复。
 
 ### 已完成:收窄 standalone finish dependency
 
@@ -205,14 +210,86 @@ tokens/chunk   cached dispatch SO BW   dispatch_impl
 cached dispatch: ~38 GB/s (SO), 1.60-1.63 ms
 ```
 
+### 已完成:tail wait discriminator 与 V1-style inflight cap
+
+新增 tail-delivery discriminator:
+
+```text
+forward_tail_ready_events
+forward_tail_stall_events
+forward_tail_stall_cycles
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_taildisc_rank0.log
+/tmp/uccl_gin_taildisc_rank1.log
+```
+
+结果（clock profile 侵入性很强,只看相对热点）:
+
+```text
+rank0:
+  avg scaleout_d2h        85.5k cycles/event
+  avg forward_tail_wait   24.4k cycles/event
+  tail stall fraction     23.3%
+  avg stalled tail wait  104.1k cycles/event
+  avg forward_load        18.0k cycles/event
+
+rank1:
+  avg scaleout_d2h        68.0k cycles/event
+  avg forward_tail_wait   53.3k cycles/event
+  tail stall fraction     29.4%
+  avg stalled tail wait  180.7k cycles/event
+  avg forward_load         8.1k cycles/event
+```
+
+解释:
+
+- forward warp 不是每次都饿在 tail 上;约 `70-77%` tail check 第一次看时已经 ready。
+- 但一旦不 ready,stall 事件很重,平均 `~100-180k cycles`。这说明 tail 首次可见仍在
+  critical path 中占一部分,但不是单靠减少 D2H backlog 就能解决的单点瓶颈。
+- full clock profile 会把 headline BW 压到 `10-12 GB/s`,不能用该 run 的 BW 评价优化。
+
+P1 inflight cap 实验:
+
+- 实现方式:把 `RingBuffer::atomic_set_and_commit` 增加可选 `max_inflight`,并让
+  UCCL-GIN Rail 的 `rail_put`, `rail_put_tail_add`, `rail_red_add` 使用
+  `kUCCLGinMaxInflightNormal`。默认值为 `8`,与 V1 normal path 的
+  `kMaxInflightNormal` 对齐。
+- 范围:只影响 UCCL-GIN Rail push;V1 调用点和 quiet 仍使用默认 queue-capacity 行为。
+- 构建变量: `make -C ep GIN_MAX_INFLIGHT_NORMAL=<N>`;`0` 表示退回 queue-capacity。
+
+验证日志:
+
+```text
+/tmp/uccl_gin_cap8_rank0.log
+/tmp/uccl_gin_cap8_rank1.log
+```
+
+结果:
+
+```text
+cached dispatch: 37-38 GB/s (SO), 1.62-1.64 ms
+correctness check: pass
+```
+
+结论:
+
+- V1-style `inflight=8` cap 没有带来可见性能提升,也没有明显恶化。
+- “GPU 一路灌到 2048 再撞墙”不是当前 `38 -> 59 GB/s` gap 的直接主因。至少把
+  D2H push 侧改成 V1 normal cap 不能解决剩余性能差距。
+- 下一步应回到 tail/payload 首次可见和 forward 消费重叠:减少 tail stall 的长尾、
+  降低 payload load 等待,以及研究是否能更早发布首个 chunk,而不是继续优先调 cap。
+
 下一步:
 
-- 继续优化 payload 首次可见和 forward 消费重叠,而不是减少 WR/CQE。
-- 检查能否让 scaleout warp 更早发布首个 4-token chunk,并减少 compact store 到 D2H
-  publish 之间的等待。
-- 重新拆 4-token 配置下的 `scaleout_store_wait`, `scaleout_d2h`,
-  `forward_tail_wait`, `forward_load`,但应使用采样式 profile 避免 full clock profile
-  把 headline BW 改写。
+- 对 tail stall 事件做轻量采样,区分“receiver CQE apply 晚”与“payload DMA 晚”。
+- 检查 forward warp 的 source/channel 调度策略,避免少数 source stall 拖住已 ready 的
+  source。
+- 对比 V1 的 receiver-side epoch/tag 消费方式,看是否能减少 forward 对 tail word 的
+  串行等待。
 
 ## 当前数据
 

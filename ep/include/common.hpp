@@ -69,6 +69,13 @@ static_assert((kQueueSize & kQueueMask) == 0, "UCCL_QUEUE_SIZE must be a power o
 // imm for reordering buffer sequence tracking.
 #define kMaxInflightLowLatency 32
 #define kMaxInflightNormal 8
+#ifndef UCCL_GIN_MAX_INFLIGHT_NORMAL
+#define UCCL_GIN_MAX_INFLIGHT_NORMAL 8
+#endif
+#define kUCCLGinMaxInflightNormal UCCL_GIN_MAX_INFLIGHT_NORMAL
+static_assert(kUCCLGinMaxInflightNormal == 0 ||
+                  kUCCLGinMaxInflightNormal <= kQueueSize,
+              "UCCL_GIN_MAX_INFLIGHT_NORMAL must be 0 or <= UCCL_QUEUE_SIZE");
 #ifndef UCCL_CHANNEL_PER_PROXY
 #define UCCL_CHANNEL_PER_PROXY 8
 #endif
