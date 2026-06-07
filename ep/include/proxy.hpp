@@ -166,6 +166,11 @@ class Proxy {
   uint64_t profile_poll_us_ = 0;
   uint64_t profile_progress_atomic_us_ = 0;
   uint64_t profile_post_gpu_us_ = 0;
+  uint64_t profile_mixed_ns_ = 0;
+  uint64_t profile_dependency_scan_ns_ = 0;
+  uint64_t profile_dependency_candidates_ = 0;
+  uint64_t profile_dependency_active_ = 0;
+  uint64_t profile_dependency_max_ = 0;
   uint64_t profile_stream_remote_runs_ = 0;
   uint64_t profile_stream_remote_run_tokens_ = 0;
   uint64_t profile_stream_remote_run_max_ = 0;

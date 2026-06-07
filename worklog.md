@@ -4034,3 +4034,122 @@ V2 write_bytes_per_cmd:
   - 用 per-ring/per-channel completion watermark 替代 per-WR unordered_map;
   - 或实现 last-payload finish piggyback;
   - 或先复用 V1 精简 WRITE post path。
+
+## 2026-06-07: dependency 成本核对与 finish-piggyback 实验
+
+### 批判性核对外部 review
+
+外部 review 正确指出:
+
+- 当前 piggyback payload WRITE 仍进入 `atomic_dependency_wrs_`,供后续 standalone
+  finish ATOMIC 建 completion dependency。
+- 旧 profile 的 `post_gpu_us` 不能继续泛泛地当作一个整体,需要拆出真正处理非空
+  command batch 的 active cost。
+
+但以下推断不成立或尚未被数据支持:
+
+- `atomic_dependency_wrs_` 不会增长到全 dispatch 历史。每次
+  `enqueue_pending_atomics()` 都会 `deps.clear()`。
+- `post_gpu_us/post_cmds ~= 8 us` 不是 active per-command post cost。`post_gpu_us`
+  包含大量没有 command 的 proxy loop 时间,与 V1 的计时口径不对称。
+- dependency bookkeeping 是主瓶颈只是一个假设,不能直接据此删除 ordering。
+
+### 提交当前已验证 profiling 基线
+
+本地提交:
+
+```text
+25fc179b Profile UCCL-GIN dispatch bottlenecks
+```
+
+### 实验:最后一个 payload 同时 piggyback finish
+
+实验性实现:
+
+- 最后一个非空 compact payload WRITE 的 immediate value 同时携带 `count + finish`。
+- 空 channel 保留 standalone finish ATOMIC。
+- piggyback WRITE 不再进入 standalone atomic dependency list。
+
+实验结果:
+
+- 构建通过:
+  - `/tmp/uccl_gin_finish_piggyback_build.log`
+- 运行通过:
+  - `/tmp/uccl_gin_finish_piggyback_rank0.log`
+  - `/tmp/uccl_gin_finish_piggyback_rank1.log`
+- `atomic_cmds=0`,dependency 计数归零,证明行为确实生效。
+- 该实验没有证明 headline BW 收益,并把 finish 可见性绑定到最后一个大 payload
+  WRITE 的完成/receiver apply。已撤销行为改动,不提交该路径。
+
+### 新增 active/dependency profile
+
+保留的 profiling 字段:
+
+```text
+mixed_ns
+dependency_scan_ns
+dependency_candidates
+dependency_active
+dependency_max
+merge_profile_enabled
+```
+
+构建日志:
+
+```text
+/tmp/uccl_gin_dependency_profile_build.log
+```
+
+clock + proxy profile 日志:
+
+```text
+/tmp/uccl_gin_dependency_profile_rank0.log
+/tmp/uccl_gin_dependency_profile_rank1.log
+```
+
+代表性 `rank0/thread0`:
+
+```text
+post_cmds=22568
+mixed_ns=14027030                 # 约 622 ns/command
+dependency_scan_ns=795170
+dependency_candidates=18104       # 约 43.9 ns/candidate
+dependency_active=11399
+dependency_max=72
+progress_atomic_us=45328
+```
+
+跨线程观察:
+
+- active mixed path 约 `0.55-0.75 us/command`。
+- dependency max fan-in 约 `48-93`。
+- dependency scan 约 `35-50 ns/candidate`,每线程整个测试累计约 `0.4-0.8 ms`。
+- `progress_pending_atomics` 累计约 `35-50 ms / 23 s`;虽然单 atomic 平均值看起来高,
+  总量不足以解释 dispatch kernel 的毫秒级差距。
+
+结论:
+
+- dependency vector/container CPU 扫描不是当前主瓶颈。
+- 旧的“V2 active post 比 V1 慢 48x”结论来自不对称计时,需要撤销。
+- 下一步应核对同一 tail-word 的 receiver sequence/reorder 是否足以保证 finish 顺序,
+  并重点看 receiver tail wait/load critical path。
+
+### profiling 开销核对
+
+关闭所有 profiling 的恢复基线:
+
+```text
+/tmp/uccl_gin_restored_noprofile_rank0.log
+/tmp/uccl_gin_restored_noprofile_rank1.log
+
+cached dispatch: 30-31 GB/s (SO), 2.00-2.02 ms
+```
+
+打开 kernel clock profile:
+
+```text
+cached dispatch: 11-14 GB/s (SO), 4.4-5.6 ms
+```
+
+因此 kernel clock profile 是侵入式诊断工具,只能比较 counter 内部相对分布,不能拿其
+headline BW 评价优化是否回归。

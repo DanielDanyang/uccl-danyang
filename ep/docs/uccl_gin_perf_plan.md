@@ -23,8 +23,10 @@ V2 full 32-token chunk fraction:  75%
 V2 non-contiguous flushes:        0
 
 V1 proxy post_gpu:                ~166 ns/command
-V2 proxy post_gpu:                ~7,949 ns/command
-V2 progress_pending_atomics:      ~11,181 ns/atomic
+V2 proxy post_gpu/command:        ~7,949 ns/command（包含大量空轮询，不能视为 active cost）
+V2 active mixed path:             ~0.55-0.75 us/command
+V2 dependency scan:               ~35-50 ns/candidate
+V2 dependency max fan-in:         ~48-93 writes
 ```
 
 因此需要修正旧优先级:
@@ -32,10 +34,13 @@ V2 progress_pending_atomics:      ~11,181 ns/atomic
 - compact32 已经正常工作。平均 `25.49 tokens/WRITE` 来自每 channel 的
   `3 x 32-token full chunk + 1 x 5-8-token finish partial chunk`,不是 slot
   不连续或中途 flush。
-- 当前最明确的主问题是 V2 proxy hot path。V2 `post_gpu` 单 command 成本约为
-  V1 的 `48x`。
-- D2H `scaleout_d2h ~153k cycles/event` 和 proxy `~8 us/command` 应视作同一根因
-  的 GPU/CPU 两侧表现,而不是两个独立问题。
+- 旧的 V2 `post_gpu_us/post_cmds ~= 8 us` 会把没有 command 的 proxy loop 也算入
+  分子,不能与 V1 active post 直接比较。新增 `mixed_ns` 后,真正处理非空 command
+  batch 的成本约为 `0.55-0.75 us/command`。
+- dependency vector 不会无界增长,扫描本身也不是主瓶颈:单个 finish 前最大 fan-in
+  约 `48-93`,扫描约 `35-50 ns/candidate`,每线程整个测试累计通常不足 `1 ms`。
+- `progress_pending_atomics ~= 10-13 us/atomic` 仍值得继续拆分,但其整个测试累计仅约
+  `35-50 ms / 23 s`,不能解释 dispatch 的 `~2 ms` kernel wall time。
 - dispatch 优化目标以 V1 8192-token FP8 的 `~59 GB/s` 为第一阶段对标值。
 
 ### 对 dependency-tracking 根因假设的核对
@@ -66,26 +71,63 @@ enqueue_pending_atomics():
   bit piggyback 到该 channel 的最后 payload chunk,否则不能直接删除 dependency
   tracking。
 
+### 2026-06-07 dependency / finish 实验结论
+
+新增 profile:
+
+```text
+mixed_ns
+dependency_scan_ns
+dependency_candidates
+dependency_active
+dependency_max
+merge_profile_enabled
+```
+
+代表性数据:
+
+```text
+rank0/thread0:
+  post_cmds=22568
+  mixed_ns=14.027 ms              => 622 ns/command
+  dependency_scan_ns=0.795 ms
+  dependency_candidates=18104     => 43.9 ns/candidate
+  dependency_active=11399
+  dependency_max=72
+```
+
+还实验过“最后一个非空 payload WRITE 同时 piggyback finish,空 channel 才发 standalone
+finish”。该实验确实把 `atomic_cmds` 和 dependency 计数降为 0,但没有证明性能收益,
+而且把 finish 可见性绑定到最后一个大 payload 的完成/receiver apply。该行为已撤销,
+只保留 profiling。
+
+注意 kernel clock profile 很侵入:
+
+```text
+profiling off: cached dispatch 30-31 GB/s, 2.00-2.02 ms
+clock profile on: cached dispatch 11-14 GB/s, 4.4-5.6 ms
+```
+
+因此 clock counters 只能用于定位相对热点,不能拿其 headline BW 判断优化收益。
+
 ### 当前执行顺序
 
-1. 增加 dependency profile:
-   - 每个 standalone ATOMIC 的 dependency count histogram/max。
-   - `enqueue_pending_atomics` 扫描、`atomic_dep_by_wr_` insert/erase、
-     `retire_inflight_write`、`coalesce_atomic_batch` 各自耗时。
-   - 区分 finish ATOMIC 和其他 ATOMIC。
-2. 根据 profile 选择修复:
-   - 如果 dependency map/container 是主成本:改为 per-ring/per-channel completion
-     watermark,避免 per-WR `unordered_map`。
-   - 如果 standalone finish 占主成本:设计 last-payload finish piggyback,让 receiver
-     从最后一个 WRITE_WITH_IMM 同时得到 count + finish。
-   - 如果 post batching/vector 分流本身是主成本:复用 V1 精简 WRITE post path,
-     将 standalone control/atomic 留在慢路径。
-3. 每轮必须同时观察:
+1. 核对 receiver software-atomic sequence/reorder 语义:
+   - piggyback count 与 standalone finish 是否共享同一 `(dst, atomic_offset)` seq。
+   - receiver 是否只有按序 apply 完同一 tail-word 的 payload count 后才 apply finish。
+   - 若成立,删除或收窄 sender 侧过度保守的全 batch completion dependency。
+2. 继续拆 `progress_pending_atomics` 与 receiver CQE/apply:
+   - 区分等待 dependency、post atomic、receiver WRITE_WITH_IMM decode/reorder/apply。
+   - 关注它是否延迟关键 finish,而不是只看累计 CPU 时间。
+3. 测量/优化 receiver critical path:
+   - forward tail wait 和 forward load 是当前更可信的 kernel 热点。
+   - profile 必须使用轻量采样或单独实验,避免 clock counters 改变整体性能。
+4. 每轮必须同时观察:
    - dispatch SO BW / dispatch_impl wall time。
    - `post_gpu_ns_per_cmd`, `progress_atomic_ns_per_atomic`。
    - `scaleout_d2h cycles/event`。
    - command/WR/CQE 数量。
-4. inflight cap 继续保留为后续排队形态实验,不作为当前首要修复。
+5. dependency container fast path 和 inflight cap 都降为后续实验,不作为当前首要修复。
 
 ## 当前数据
 

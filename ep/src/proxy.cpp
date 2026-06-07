@@ -780,6 +780,13 @@ void Proxy::enqueue_pending_atomics(std::vector<uint64_t>& wrs,
                                     std::vector<TransferCmd>& cmds,
                                     std::vector<uint64_t>& deps) {
   if (wrs.empty()) return;
+  std::chrono::steady_clock::time_point profile_start;
+  if (profile_commands_) {
+    profile_start = std::chrono::steady_clock::now();
+    profile_dependency_candidates_ += deps.size();
+    profile_dependency_max_ = std::max<uint64_t>(
+        profile_dependency_max_, static_cast<uint64_t>(deps.size()));
+  }
   pending_atomic_batches_.emplace_back();
   PendingAtomicBatch& batch = pending_atomic_batches_.back();
   batch.wrs.swap(wrs);
@@ -788,10 +795,17 @@ void Proxy::enqueue_pending_atomics(std::vector<uint64_t>& wrs,
   for (uint64_t wr_id : deps) {
     if (inflight_write_wrs_.find(wr_id) == inflight_write_wrs_.end()) continue;
     ++batch.pending_writes;
+    if (profile_commands_) ++profile_dependency_active_;
     batch.dep_wrs.push_back(wr_id);
     atomic_dep_by_wr_[wr_id] = &batch;
   }
   deps.clear();
+  if (profile_commands_) {
+    profile_dependency_scan_ns_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - profile_start)
+            .count());
+  }
 }
 
 void Proxy::coalesce_atomic_batch(PendingAtomicBatch& batch) {
@@ -1235,6 +1249,8 @@ void Proxy::post_gpu_commands_mixed(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post) {
   if (cmds_to_post.empty()) return;
+  std::chrono::steady_clock::time_point profile_mixed_start;
+  if (profile_commands_) profile_mixed_start = std::chrono::steady_clock::now();
   if (profile_commands_ && profile_merge_opportunity_) {
     profile_write_batching_opportunity(wrs_to_post, cmds_to_post);
   }
@@ -1399,6 +1415,12 @@ void Proxy::post_gpu_commands_mixed(
   }
   flush_writes();
   enqueue_atomics_ordered();
+  if (profile_commands_) {
+    profile_mixed_ns_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - profile_mixed_start)
+            .count());
+  }
 }
 
 void Proxy::profile_write_batching_opportunity(
@@ -1606,7 +1628,7 @@ void Proxy::dump_command_profile() const {
       seconds > 0.0
           ? static_cast<double>(profile_write_bytes_) / seconds / 1.0e9
           : 0.0;
-  char line[3072];
+  char line[4096];
   int const n = std::snprintf(
       line, sizeof(line),
       "UCCL_PROXY_PROFILE rank=%d thread=%d normal=%d rings=%zu "
@@ -1615,7 +1637,9 @@ void Proxy::dump_command_profile() const {
       "atomic_cmds=%llu quiet_cmds=%llu "
       "barrier_cmds=%llu completed_wrs=%llu posted_atomic_wrs=%llu "
       "coalesced_atomic_wrs=%llu poll_us=%llu progress_atomic_us=%llu "
-      "post_gpu_us=%llu stream_remote_runs=%llu stream_remote_tokens=%llu "
+      "post_gpu_us=%llu mixed_ns=%llu dependency_scan_ns=%llu "
+      "dependency_candidates=%llu dependency_active=%llu dependency_max=%llu "
+      "merge_profile_enabled=%d stream_remote_runs=%llu stream_remote_tokens=%llu "
       "stream_remote_max=%llu stream_local_runs=%llu stream_local_tokens=%llu "
       "stream_local_max=%llu semantic_remote_runs=%llu "
       "semantic_remote_tokens=%llu semantic_remote_max=%llu "
@@ -1644,6 +1668,12 @@ void Proxy::dump_command_profile() const {
       static_cast<unsigned long long>(profile_poll_us_),
       static_cast<unsigned long long>(profile_progress_atomic_us_),
       static_cast<unsigned long long>(profile_post_gpu_us_),
+      static_cast<unsigned long long>(profile_mixed_ns_),
+      static_cast<unsigned long long>(profile_dependency_scan_ns_),
+      static_cast<unsigned long long>(profile_dependency_candidates_),
+      static_cast<unsigned long long>(profile_dependency_active_),
+      static_cast<unsigned long long>(profile_dependency_max_),
+      profile_merge_opportunity_ ? 1 : 0,
       static_cast<unsigned long long>(profile_stream_remote_runs_),
       static_cast<unsigned long long>(profile_stream_remote_run_tokens_),
       static_cast<unsigned long long>(profile_stream_remote_run_max_),
