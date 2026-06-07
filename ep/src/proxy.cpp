@@ -1268,8 +1268,17 @@ void Proxy::post_gpu_commands_mixed(
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
                             cfg_.thread_idx, cfg_.use_normal_mode);
     inflight_write_wrs_.insert(rdma_wrs.begin(), rdma_wrs.end());
-    atomic_dependency_wrs_.insert(atomic_dependency_wrs_.end(),
-                                  rdma_wrs.begin(), rdma_wrs.end());
+    // A WRITE_WITH_IMM piggyback count and a later ordered finish ATOMIC use
+    // the same per-(dst, tail word) sequence. The receiver applies the finish
+    // only after those payload counts, and each count arrives with its payload
+    // WRITE completion. Only plain WRITEs lack that ordering and must remain
+    // sender-side completion dependencies.
+    assert(rdma_wrs.size() == rdma_cmds.size());
+    for (size_t i = 0; i < rdma_wrs.size(); ++i) {
+      if (rdma_cmds[i].atomic_val == 0) {
+        atomic_dependency_wrs_.push_back(rdma_wrs[i]);
+      }
+    }
     rdma_wrs.clear();
     rdma_cmds.clear();
   };

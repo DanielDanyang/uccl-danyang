@@ -4153,3 +4153,83 @@ cached dispatch: 11-14 GB/s (SO), 4.4-5.6 ms
 
 因此 kernel clock profile 是侵入式诊断工具,只能比较 counter 内部相对分布,不能拿其
 headline BW 评价优化是否回归。
+
+## 2026-06-07:用 receiver sequence 收窄 finish dependency
+
+### 设计依据
+
+继续核对 transport 后确认:
+
+- compact payload `WRITE_WITH_IMM` 在 `post_rdma_async_batched_normal_mode()` 中按
+  `(dst_rank, tail_index)` 从 `next_seq_per_index` 分配 sequence。
+- standalone ordered finish ATOMIC 在 `post_atomic_operations()` 中使用同一个
+  `(dst_rank, tail_index)` sequence 空间。
+- receiver `remote_process_completions_normal_mode()` 的 `SeqBuf` 会缓存乱序到达的
+  delta,只按 sequence 连续 apply。
+- payload count 的 CQE 与 payload WRITE 到达绑定。因此 receiver apply finish 前,
+  同 tail-word 的 payload count 及其 payload 已经到达。
+
+所以 sender 不必等待带 ordered piggyback count 的 payload WRITE CQE。仍需要保留
+plain WRITE dependency,因为 plain WRITE 没有进入该 tail-word sequence。
+
+### 代码改动
+
+`ep/src/proxy.cpp::flush_writes()`:
+
+- 所有 WRITE 仍进入 `inflight_write_wrs_`,保留 quiet/completion accounting。
+- 只有 `atomic_val == 0` 的 plain WRITE 进入 `atomic_dependency_wrs_`。
+- standalone finish 语义和 receiver reorder 协议不变。
+
+### 构建与验证
+
+构建日志:
+
+```text
+/tmp/uccl_gin_ordered_finish_build.log
+```
+
+带完整 correctness check:
+
+```text
+/tmp/uccl_gin_ordered_finish_rank0.log
+/tmp/uccl_gin_ordered_finish_rank1.log
+```
+
+结果:
+
+```text
+EXIT:0 on both nodes
+cached dispatch: 31-32 GB/s (SO), 1.93-2.00 ms
+```
+
+对照恢复基线:
+
+```text
+/tmp/uccl_gin_restored_noprofile_rank0.log
+/tmp/uccl_gin_restored_noprofile_rank1.log
+cached dispatch: 30-31 GB/s (SO), 2.00-2.02 ms
+```
+
+轻量 proxy profile:
+
+```text
+/tmp/uccl_gin_ordered_finish_profile_rank0.log
+/tmp/uccl_gin_ordered_finish_profile_rank1.log
+```
+
+代表性 `rank0/thread0` 前后:
+
+```text
+                         before       after
+dependency_candidates    18104        248
+dependency_active        11399        63
+dependency_max           72           2
+progress_atomic_us       45328        19360
+```
+
+结论:
+
+- 收窄 dependency 正确且有约 `2-4%` 性能收益。
+- finish dependency 不是剩余 V1/V2 gap 的主因。
+- 下一步应集中在 receiver WRITE_WITH_IMM CQE/reorder/apply 和 forward
+  tail/load critical path,而不是继续微调 dependency container。

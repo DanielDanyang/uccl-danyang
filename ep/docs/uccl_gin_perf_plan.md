@@ -129,6 +129,33 @@ clock profile on: cached dispatch 11-14 GB/s, 4.4-5.6 ms
    - command/WR/CQE 数量。
 5. dependency container fast path 和 inflight cap 都降为后续实验,不作为当前首要修复。
 
+### 已完成:收窄 standalone finish dependency
+
+代码核对确认:
+
+- payload `WRITE_WITH_IMM` 和 standalone finish ATOMIC 都通过
+  `next_seq_per_index[(dst_rank, tail_index)]` 分配 sequence。
+- receiver 的 `SeqBuf` 只会按 sequence 顺序 apply 同一 tail-word 的 delta。
+- payload count 只有在相应 payload WRITE 到达 receiver 后才进入 `SeqBuf`。
+
+因此 finish 不需要等待已经携带 ordered piggyback count 的 payload CQE。现在只把
+`atomic_val == 0` 的 plain WRITE 留作 sender-side completion dependency。
+
+结果:
+
+```text
+dependency_candidates: 18104 -> 248   (rank0/thread0)
+dependency_active:      11399 -> 63
+dependency_max:         72 -> 2
+
+恢复基线:               30-31 GB/s, 2.00-2.02 ms
+收窄 dependency:         31-32 GB/s, 1.93-2.00 ms
+```
+
+完整 correctness check 通过。收益约 `2-4%`,说明过度保守 dependency 确实延迟了
+finish,但它不是剩余 `~2x` V1/V2 gap 的主因。下一优先级转向 receiver
+WRITE_WITH_IMM CQE/reorder/apply 与 forward tail/load critical path。
+
 ## 当前数据
 
 ### V2 UCCL-GIN
