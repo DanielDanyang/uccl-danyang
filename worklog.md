@@ -4470,3 +4470,355 @@ cached dispatch: 37-38 GB/s (SO), 1.62-1.64 ms
 - 当前 `38 -> 59 GB/s` gap 不能主要归因于 D2H ring 允许 inflight 到 2048。
 - P1 inflight cap 保留为可调机制,但优化优先级降低。下一步应聚焦 tail stall 长尾、
   payload 首次可见、forward source/channel 调度与 V1 receiver ready/tag 消费方式。
+
+## 2026-06-07: 更新 UCCL-GIN overview
+
+Review 并修正 `ep/docs/uccl_gin_overview.md`:
+
+- 明确文档描述的是当前 EP8x2 dispatch 主路径;compact path 仍使用
+  `remote_scaleout_rank_idx = scaleout_rank_idx ^ 1`,尚未泛化到两个以上 scaleout rank。
+- 将 FP8 hidden=7168 的 token payload 从错误的 `~14KB` 修正为 `~7-8KiB`;
+  chunk=4 payload 约 `30KiB`,不是 `56KB`。
+- 将 CPU receiver apply 从容易误解为 CUDA atomic 的 `atomicAdd` 修正为
+  `std::atomic<int64_t>::fetch_add`。
+- 将“payload 和 count 原子到达”改为准确语义:payload WRITE 和 immediate 属于同一
+  WR,receiver 收到 CQE 后才 apply count。
+- 分离当前 chunk=4 基线与历史 chunk=32 profiling 数据,删除将
+  `post_gpu_us/post_cmds` 误当 active cost 的 `8 us/cmd / 48x` 结论。
+- 补入 tail discriminator 结果、cap=8 验证结果,并删除“V2 无 cap”的陈旧描述。
+- 记录 forward 每轮最多消费 `kNumSlotsPerForwardChunk=3`,与 payload compact chunk=4
+  是不同粒度。
+- 记录 ordered immediate sequence 只有 16 个值;默认 cap=8 能限制 sender/network
+  侧单 ring inflight 并降低 sequence alias 风险,但不能单独证明 receiver CPU 已及时
+  apply CQE。`GIN_MAX_INFLIGHT_NORMAL=0` 只能用于受控诊断,不应视为安全生产配置。
+
+## 2026-06-07: combine → UCCL-GIN 转换(代码完成,运行时 fault 未定位)
+
+### 改动(已 compile 验证,未跑通)
+
+镜像 dispatch 的接法把 combine scale-out 接到 UCCL-GIN:
+- `hybrid_combine.cuh`: `#ifdef DEEPEP_USE_UCCL_GIN` 下 gin=`handle::UCCLGin` + 清
+  atomic_tail_base + grid sync;两处 `gin.put<Rail>` 经 `issue_rail_put` 走 UCCL D2H
+  (lane_hint=channel_idx);finish 信号从 `flush+red_add_rel` 改为 `rail_tail_add(finish)`;
+  receiver 等待从 workspace signaled_tail 改为 `rail_tail_ptr`/`decode_rail_tail`。
+- `combine.hpp`: Args 加 `use_uccl_gin_resources`+`uccl_gin_resources`,launch_impl 加
+  UCCL 分支,launch_combine 签名加 resources 指针(复用 dispatch.hpp 的 NativeUCCLGinResources)。
+- `buffer.hpp`: launch_combine 调用传 `uccl_gin_resources_enabled ? &... : nullptr`。
+
+### 编译验证(通过)
+
+- host `make install`: BUILD_RC:0(combine.hpp/buffer.hpp host 侧 OK)。
+- 独立 nvcc -cubin 编 `hybrid_combine_impl<...>`,带和不带 `-DDEEPEP_USE_UCCL_GIN`
+  都成功(device codegen OK,NCCL 路径未破坏)。
+
+### 运行时 fault(未解决)
+
+EP8x2 correctness(README config 和 small smoke 64-token 都一样)在 combine 调用处
+crash:`Cuda failure 700/716`,报在 `symmetric.hpp:136`(`ncclMemFree` 析构,属
+sticky error 滞后上报,真正 fault 在 combine kernel 内)。
+
+基线对照:
+- pristine(UCCL dispatch + NCCL combine)同 config **通过**(RANK0_EXIT:0)。
+- 我的 UCCL combine **crash**。
+
+二分(每步重编 JIT header,fresh cache;注意 NOFINISH 会移除必需的 scaleout 同步,
+是污染因子,所以 NOPUT-only 那次才是干净信号):
+- NOPUT(保留真实 clear/finish/wait):仍 crash → **不是 put 路径**。
+- 小 config 也 crash → **非 scale 相关,是 fundamental**。
+- NOREGADJUST(关掉 combine 的 warpgroup_reg_alloc):仍 crash → **不是寄存器重分配**。
+- dispatch/combine 的 `kNumChannels` 都是 32(JIT cache 实测),atomic tail 64 words →
+  **无 channel 数不匹配、clear 无越界、tail offset 无溢出**。
+- clear / rail_tail_add / rail_tail_ptr 三段和 dispatch **逐字节相同**,dispatch 跑得通 →
+  机制本身没问题(含 by-value resources 参数的 ABI marshalling,dispatch 已证明)。
+
+结论:combine kernel 的 UCCL 路径有一个运行时非法访问,但所有"和 dispatch 不同"的
+单点都被排除,且 dispatch 用相同的 op 跑得通。需要 cuda-gdb 级别定位(compute-sanitizer
+在本 EFA/GDR + symmetric memory 设置下会因 cuMemCreate/cuMemGetHandleForAddressRange
+800/801 破坏 setup,无法干净复现)。
+
+server 已恢复 pristine 工作态 .so;本地保留 combine 干净 WIP(去掉所有 bisect/printf
+scaffolding)。下一步候选:cuda-gdb 单 pair 跑;或逐段在 combine 里二分 reduce/TMA/
+get_sym_ptr<Lsa> 路径(这些是 combine 独有、用 UCCLGin 跑但我没改的代码)。
+
+## 2026-06-07: UCCL-GIN combine WIP code review 与本地修复
+
+### Review 结论
+
+重新对照了:
+
+- 当前 UCCL-GIN combine WIP；
+- 已跑通的 UCCL-GIN dispatch；
+- 上游 `hybrid_combine.cuh`；
+- `UCCLGin` / `uccl_gin_rail.cuh`；
+- proxy normal-mode WRITE / ordered atomic / receiver sequence 路径。
+
+确认前一轮二分尚未排除两个代码层问题:
+
+1. **初步判断，后续 normal-mode 路径核对后已推翻: combine phase bit**
+
+   `uccl_gin_rail.cuh` 的 `rail_put`、`rail_put_tail_add`、`rail_red_add` 原来都硬编码:
+
+   ```text
+   make_cmd_type(..., is_combine=false, ...)
+   ```
+
+   后续逐个核对 consumer 后确认，这个判断不适用于当前 UCCL-GIN normal-mode:
+   ordered atomic 的 bit 30 被 `PackAtomicWithSeq` 复用为 `seq[3]`，normal-mode
+   receiver 只调用 `GetSeq()`；WRITE-with-imm receiver 也不读取 phase。当前路径传递
+   combine phase 完全不可观察，反而会误导后续设计。
+
+2. **高概率 crash 候选: combine 独有的 device-side 状态膨胀**
+
+   当前 `UCCLGin` 每个 GPU 线程都复制一整份 `UCCLGinResources`，同时 combine WIP
+   又在上游本来已经很重的 reduce/TMA lambda 链中增加了一层 `issue_rail_put` lambda。
+   NOPUT 只让 lambda 内不真正发 WR，并不会消除 handle/resource copy、lambda capture
+   和可能的 local-memory spill；NOREGADJUST 也只关闭 warpgroup register reallocation，
+   不能排除普通 register spill/local stack fault。
+
+   dispatch 使用相同 handle 能跑通，只证明较轻的 dispatch kernel 能承受，不能证明
+   combine 的 reduce/TMA kernel 也能承受。因此这是当前最值得先消除的 combine 独有
+   差异，但尚不能在没有服务器运行的情况下宣称它就是根因。
+
+额外核对:
+
+- combine launch 本来就是 cooperative launch；新增 `this_grid().sync()` 不是因为
+  非 cooperative launch 直接非法。
+- UCCL combine 的 tail offset 当前 EP8x2/32-channel 配置没有越界，但此前缺少和
+  dispatch 对齐的编译期 ordered-atomic offset 上限检查。
+- finish wait 清零 host-mapped tail 后此前没有 system fence；下一轮复用前存在可见性
+  风险，虽然它不像当前首次 combine crash 的直接根因。
+
+### 本地代码修复
+
+- `ep/include/uccl_gin/uccl_gin_handle.cuh`
+  - `UCCLGin::res` 从逐线程 value copy 改为引用 kernel 参数中已有的 resources；
+- `ep/include/uccl_gin/uccl_gin_rail.cuh`
+  - 后续 review 已删除无效的 `rail_is_combine` 传递；ordered Rail atomic 明确只支持
+    normal-mode sequence receiver。
+- `hybrid_combine.cuh`
+  - 删除新增的嵌套 `issue_rail_put` lambda，两处 put 恢复为贴近上游的直接 call
+    site，只在 UCCL 分支追加 `ncclGin_None()` 和 `channel_idx`；
+  - 增加 compact tail 区域必须装入 ordered-atomic offset field 的静态检查；
+  - wait 成功后清 tail，并补 `__threadfence_system()`。
+
+### 本地验证
+
+```text
+git diff --check: pass
+调用点 grep: pass，rail helper 新参数均有默认值，standalone microbench 调用未破坏
+本机 nvcc: unavailable
+```
+
+因此本轮只完成本地静态 review/修复，尚未做 CUDA compile 或服务器 runtime 验证。
+
+下一次服务器验证必须使用 fresh `EP_JIT_CACHE_DIR`，并先看:
+
+1. UCCL combine 是否不再出现 700/716；
+2. 若仍失败，fault 前是否出现
+   `DeepEP combine (scale-out wait all, UCCL-GIN) timeout`，以区分主动
+   `ptx::trap()` 和真正非法地址；
+3. 保存 JIT compile 输出中的 registers / stack / spill 数据，对比修改前后的
+   combine cubin；若 fault 消失且 spill 明显下降，才能坐实 device-state 膨胀根因。
+
+## 2026-06-07: UCCL-GIN combine 修复服务器验证
+
+### 同步与构建
+
+只同步本轮涉及的五个代码文件到共享 EFS 工作区:
+
+```text
+ep/include/uccl_gin/uccl_gin_handle.cuh
+ep/include/uccl_gin/uccl_gin_rail.cuh
+thirdparty/DeepEP-v2-d4f41e4/csrc/elastic/buffer.hpp
+thirdparty/DeepEP-v2-d4f41e4/csrc/kernels/elastic/combine.hpp
+thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_combine.cuh
+```
+
+UCCL extension 在两台机器上安装成功:
+
+```bash
+make -C ep install PYTHON=$VIRTUAL_ENV/bin/python \
+  CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j16
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_combine_review_build.log
+/tmp/uccl_gin_combine_review_install.log
+```
+
+重新 build vendored DeepEP `_C` 时遇到并处理了两个环境问题:
+
+1. ABI static assertion 引入 `ep/include` 后缺少 `util/gpu_rt.h`，补入仓库
+   `include` 路径；
+2. link 阶段找不到 `libnccl.so.2`，补入 venv 的 NCCL `LIBRARY_PATH` 和
+   `LD_LIBRARY_PATH`。
+
+最终 `_C` build 成功，说明新增 host/device resources ABI 检查可编译。
+
+```text
+失败日志:
+  /tmp/uccl_gin_combine_review_deepep_build.log
+  /tmp/uccl_gin_combine_review_deepep_build2.log
+成功日志:
+  /tmp/uccl_gin_combine_review_deepep_build3.log
+```
+
+### Fresh-cache small correctness
+
+先跑之前稳定触发 combine `Cuda failure 700/716` 的 EP8x2 小配置:
+
+```text
+num_processes=8, num_sms=8, num_tokens=64, hidden=2048,
+num_topk=6, num_experts=256
+```
+
+两端均退出 `0`，完整 dispatch/combine correctness 通过，原 fault 未复现。
+
+```text
+/tmp/uccl_gin_combine_review_smoke_rank0.log
+/tmp/uccl_gin_combine_review_smoke_rank1.log
+/tmp/deepep_jit_combine_review_rank0
+/tmp/deepep_jit_combine_review_rank1
+```
+
+### Fresh-cache README 对齐 EP8x2
+
+使用完整 correctness 检查运行:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+配置使用 CUDA 13.0、aws-ofi-nccl master proxy、`DEEPEP_USE_UCCL_GIN=1`，
+并为两个节点分别使用 fresh JIT cache。两端均退出 `0`，没有 timeout、
+`Cuda failure 700/716`、Traceback 或 assertion:
+
+```text
+dispatch:          37-38 GB/s (SO), 1.60-1.64 ms
+expanded dispatch: 37-38 GB/s (SO), 1.61-1.64 ms
+cached dispatch:   37-38 GB/s (SO), 1.60-1.63 ms
+combine:           28-29 GB/s (SO), 4.00-4.18 ms
+reduced combine:   31-32 GB/s (SO), 3.72-3.80 ms
+```
+
+日志和 JIT cache:
+
+```text
+/tmp/uccl_gin_combine_review_readme_rank0.log
+/tmp/uccl_gin_combine_review_readme_rank1.log
+/tmp/deepep_jit_combine_review_readme_rank0
+/tmp/deepep_jit_combine_review_readme_rank1
+```
+
+### 结论
+
+- UCCL-GIN combine 现在不仅能编译，而且 small 与 README 对齐 EP8x2 的完整
+  correctness、普通 combine、reduced combine 都已跑通；此前稳定出现的
+  `700/716` fault 已消失。
+- 当前验证同时包含 resources 改引用、移除额外 lambda、compact tail bound 和清 tail
+  system fence，因此不能仅凭这次整体通过把 crash
+  唯一归因到其中某一项。
+- `rail_is_combine` 后续确认在当前 normal-mode 下无效并已删除。resources 引用和
+  移除 lambda 同时降低了 combine kernel 的 device-side 状态压力；其中 resources
+  value-copy 是旧 crash 的最强嫌疑，但仍未做单变量重现。若需要精确定位旧 crash 根因，应分别
+  revert 单项并用 fresh JIT cache 重跑，而不是根据整体通过过度推断。
+- combine 已进入可工作的主路径，但 `28-29 GB/s SO` 仍明显低于当前 dispatch
+  `37-38 GB/s SO`，后续性能 profiling 应单独分解 combine scaleout send、receiver
+  wait、reduce/TMA 和 D2H/proxy 背压。
+
+## 2026-06-07: combine follow-up review: phase bit、跨轮清零与 uncompacted puts
+
+### Review 结论
+
+1. `rail_is_combine` 在当前 UCCL-GIN EFA normal-mode 确实无效:
+
+   - ordered ATOMIC 经 `PackAtomicWithSeq`，legacy `is_combine` bit 被改写为
+     `seq[3]`；
+   - normal-mode receiver 对 ATOMIC 只读取 `GetSeq()`；
+   - normal-mode WRITE-with-imm receiver 不读取 phase；
+   - sender barrier 和 fast-mode 的 `get_is_combine()` consumer 不在当前路径执行。
+
+   因此删除 `rail_is_combine` 和 Rail helper 的 phase 参数，并在 `AtomicsImm` 与
+   `rail_red_add` 处注明:ordered UCCL-GIN atomic 必须留在 normal-mode sequence
+   receiver；若误入 fast-mode，bit 30 会被错误解释成 combine phase。
+
+2. “跨 iteration 的 late finish 会在下一轮 clear 后落地，因此 launch 前必须 host
+   quiet”不适用于当前协议:
+
+   - 每个 receiver warp 必须观察到每个来源的 finish 已由 CPU receiver apply，才会
+     清对应槽并退出 kernel；
+   - finish ATOMIC 又依赖该 lane 之前的 plain payload WRITE CQE；
+   - 所以 receiver kernel 返回时，本地不存在尚未 apply 的旧 finish，也不存在旧
+     payload 仍会在 finish 后落地。
+
+   kernel-start reset 保留为防御性初始化，并补充上述生命周期注释；不加入会串行化
+   transport 的 host quiet。这个结论依赖当前“每个来源都 wait + clear”协议，未来若
+   改成异步跨 iteration pipeline，必须重新设计 epoch/double-buffer，而不是补一个
+   粗粒度 quiet。
+
+3. combine payload 目前确实未 compact:
+
+   - 两处 scale-out put 都是每 token 一个 plain WRITE；
+   - finish ATOMIC 通过 proxy dependency tracking 等待这些 WRITE CQE；
+   - 这与当前 correctness 一致，也能解释 combine `28-29 GB/s SO` 低于 dispatch
+     `37-38 GB/s SO`。
+
+   本轮不改变 combine batching；后续性能阶段应实现保留 V2 combine layout 的 compact
+   payload/piggyback 路径，并单独验证 WR 数量、message size 和 finish dependency。
+
+### Follow-up 服务器验证
+
+同步上述精简后，首次在两台节点上并行执行 `make -C ep install` 失败:
+
+```text
+p5en_0: ld: final link failed: Stale file handle
+p5en_1: ld: cannot find -lnuma
+```
+
+这不是代码编译错误，而是两台机器同时链接共享 EFS 上同一个 `ep/ep.abi3.so`，以及
+非 login shell 未带 `/home/ubuntu/local-lib`。改为顺序构建，并显式设置:
+
+```bash
+export LIBRARY_PATH=/home/ubuntu/local-lib:/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/ubuntu/local-lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+```
+
+随后 p5en_0 build/install 和 p5en_1 install 均通过。后续共享 EFS 产物不得在两节点
+并行链接。
+
+构建日志:
+
+```text
+/tmp/uccl_gin_combine_followup_build.log       # 首次并行失败
+/tmp/uccl_gin_combine_followup_build2.log      # p5en_0 顺序构建成功
+/tmp/uccl_gin_combine_followup_install.log     # p5en_1 安装成功
+```
+
+使用 fresh JIT cache 再跑 README 对齐 EP8x2 完整 correctness:
+
+```text
+rank0 exit: 0
+rank1 exit: 0
+dispatch/cached dispatch: 37-38 GB/s (SO)
+combine:                  28-30 GB/s (SO)
+reduced combine:          31 GB/s (SO)
+```
+
+没有 timeout、CUDA 700/716、Traceback 或 assertion。测试本身包含多次 dispatch /
+combine 调用，因此也覆盖了当前同步执行模型下的跨 iteration tail 复用。删除
+`rail_is_combine` 后 correctness 和性能均未变化，进一步确认它在当前 normal-mode
+路径中是 inert 的。
+
+验证日志和 fresh JIT cache:
+
+```text
+/tmp/uccl_gin_combine_followup_rank0.log
+/tmp/uccl_gin_combine_followup_rank1.log
+/tmp/deepep_jit_combine_followup_rank0
+/tmp/deepep_jit_combine_followup_rank1
+```

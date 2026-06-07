@@ -103,6 +103,9 @@ __device__ __forceinline__ uint64_t rail_red_add(d2hq::D2HHandle* q, int dst_ran
     __trap();
   }
   TransferCmd cmd{};
+  // UCCL-GIN Rail ordered atomics run only in normal mode. PackAtomicWithSeq
+  // consumes the legacy is_combine bit as seq[3], so phase labeling here would
+  // be inert and unsafe if this command were accidentally routed to fast mode.
   cmd.cmd_type = make_cmd_type(CmdType::ATOMIC, /*is_combine=*/false,
                                /*low_latency=*/false);
   cmd.dst_rank = static_cast<uint8_t>(dst_rank);

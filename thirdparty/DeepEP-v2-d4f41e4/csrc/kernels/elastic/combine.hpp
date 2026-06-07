@@ -7,6 +7,10 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+// For NativeUCCLGinResources (host-side ABI mirror). dispatch.hpp uses #pragma
+// once and is always included before combine.hpp via api.hpp, but include it
+// explicitly so combine.hpp is self-contained.
+#include "dispatch.hpp"
 
 namespace deep_ep::elastic {
 
@@ -34,6 +38,8 @@ public:
         int* channel_linked_list;
         ncclDevComm_t nccl_dev_comm;
         ncclWindow_t nccl_window;
+        bool use_uccl_gin_resources;
+        NativeUCCLGinResources uccl_gin_resources;
         void* buffer;
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
@@ -91,6 +97,18 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleup_rank_idx,
                                                      args.num_reduced_tokens));
+        } else if (args.use_uccl_gin_resources) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.x, args.topk_weights,
+                                                     args.src_metadata,
+                                                     args.psum_num_recv_tokens_per_scaleup_rank,
+                                                     args.token_metadata_at_forward,
+                                                     args.channel_linked_list,
+                                                     args.nccl_dev_comm, args.nccl_window,
+                                                     args.uccl_gin_resources,
+                                                     args.buffer, args.workspace,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                     args.num_reduced_tokens));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
                                                      args.x, args.topk_weights,
@@ -129,6 +147,7 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const NativeUCCLGinResources* uccl_gin_resources,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -167,6 +186,8 @@ static void* launch_combine(void* x,
         .token_metadata_at_forward = token_metadata_at_forward,
         .channel_linked_list = channel_linked_list,
         .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
+        .use_uccl_gin_resources = uccl_gin_resources != nullptr,
+        .uccl_gin_resources = uccl_gin_resources == nullptr ? NativeUCCLGinResources{} : *uccl_gin_resources,
         .buffer = buffer, .workspace = workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,

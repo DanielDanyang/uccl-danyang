@@ -6,6 +6,11 @@
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/impls/combine_utils.cuh>
 
+#ifdef DEEPEP_USE_UCCL_GIN
+#include <cooperative_groups.h>
+#include <uccl_gin/uccl_gin_handle.cuh>
+#endif
+
 namespace deep_ep::elastic {
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
@@ -37,6 +42,9 @@ hybrid_combine_impl(nv_bfloat16* x,
                     int* token_metadata_at_forward,
                     int* channel_linked_list,
                     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
+#ifdef DEEPEP_USE_UCCL_GIN
+                    const uccl_gin::UCCLGinResources uccl_gin_resources,
+#endif
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
                     int num_reduced_tokens) {
@@ -88,7 +96,23 @@ hybrid_combine_impl(nv_bfloat16* x,
     // Each warp is a channel
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM>(sm_idx, warp_idx % kNumChannelsPerSM);
+#ifdef DEEPEP_USE_UCCL_GIN
+    const auto gin = handle::UCCLGin(
+        nccl_dev_comm, nccl_window, uccl_gin_resources, qp_idx, sharing_mode);
+    EP_STATIC_ASSERT(kNumChannels * kNumScaleoutRanks * sizeof(int64_t) <= uccl_gin::kAtomicOffMask + 1,
+                     "UCCL-GIN combine tail buffer must fit the ordered atomic offset field");
+    // Combine reuses the dispatch compact (channel, source-rank) tail buffer.
+    // The previous receiver kernel waits until every incoming finish has been
+    // applied, then clears its slots before returning. Therefore no old remote
+    // finish can race this reset; a host-side quiet here would only serialize
+    // the transport. Keep the start reset as defensive initialization.
+    for (int i = sm_idx * kNumThreads + thread_idx; i < kNumChannels * kNumScaleoutRanks; i += kNumSMs * kNumThreads)
+        reinterpret_cast<int64_t*>(uccl_gin_resources.atomic_tail_base)[i] = 0;
+    __threadfence_system();
+    cooperative_groups::this_grid().sync();
+#else
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+#endif
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
@@ -368,6 +392,17 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx) {
+#ifdef DEEPEP_USE_UCCL_GIN
+                    gin.put<ncclTeamTagRail>(
+                        last_recv_token_buffer_ptr,
+                        last_send_token_buffer_ptr,
+                        token_layout.get_num_bytes<false>(),
+                        last_src_scaleout_rank_idx,
+                        last_is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests,
+                        ncclGin_None(),
+                        channel_idx
+                    );
+#else
                     gin.put<ncclTeamTagRail>(
                         last_recv_token_buffer_ptr,
                         last_send_token_buffer_ptr,
@@ -375,6 +410,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                         last_src_scaleout_rank_idx,
                         last_is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests
                     );
+#endif
                 }
             }
             __syncwarp();
@@ -475,6 +511,17 @@ hybrid_combine_impl(nv_bfloat16* x,
                         // Issue IBGDA
                         topk_valid_mask ^= 1u << k;
                         if (src_scaleout_rank_idx != scaleout_rank_idx) {
+#ifdef DEEPEP_USE_UCCL_GIN
+                            gin.put<ncclTeamTagRail>(
+                                recv_buffer_ptr,
+                                send_buffer_ptr,
+                                token_layout.get_num_bytes<false>(),
+                                src_scaleout_rank_idx,
+                                topk_valid_mask == 0 and is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests,
+                                ncclGin_None(),
+                                channel_idx
+                            );
+#else
                             gin.put<ncclTeamTagRail>(
                                 recv_buffer_ptr,
                                 send_buffer_ptr,
@@ -482,6 +529,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                                 src_scaleout_rank_idx,
                                 topk_valid_mask == 0 and is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests
                             );
+#endif
                         }
                     }
                 }
@@ -580,6 +628,41 @@ hybrid_combine_impl(nv_bfloat16* x,
 
         // Update, wait and clean
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
+#ifdef DEEPEP_USE_UCCL_GIN
+        // One-shot finish signal per (channel, scale-out rank). The payload puts
+        // above are plain WRITEs tracked by the proxy on lane=channel_idx; the
+        // finish ATOMIC posts on the same lane only after those WRITEs complete,
+        // so no device-side flush is needed (proxy enforces payload-before-tail).
+        if (lane_idx < kNumScaleoutRanks) {
+            gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx,
+                              /*count_delta=*/0, /*finish=*/true, channel_idx);
+        }
+        __syncwarp();
+
+        // Wait finish signal arrival from the corresponding source rank.
+        if (lane_idx < kNumScaleoutRanks) {
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                int finish = 0, count = 0;
+                gin.decode_rail_tail(
+                    ptx::ld_acquire_sys<int64_t>(gin.rail_tail_ptr(channel_idx, lane_idx)),
+                    finish, count);
+                if (finish) {
+                    // Clean for next usages
+                    *gin.rail_tail_ptr(channel_idx, lane_idx) = 0;
+                    __threadfence_system();
+                    return true;
+                }
+                if (is_last_check) {
+                    printf("DeepEP combine (scale-out wait all, UCCL-GIN) timeout, "
+                           "scale-out: %d/%d, scale-up: %d/%d, channel: %d, lane: %d\n",
+                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                           channel_idx, lane_idx);
+                }
+                return false;
+            });
+        }
+        __syncwarp();
+#else
         const auto expected_signal = math::pack2<int, int64_t>(1, 0);
         gin.flush<ncclCoopWarp>();
         if (lane_idx < kNumScaleoutRanks) {
@@ -612,6 +695,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             });
         }
         __syncwarp();
+#endif
     }
 
     // No barrier at epilogue

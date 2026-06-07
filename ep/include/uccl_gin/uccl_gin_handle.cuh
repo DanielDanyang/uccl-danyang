@@ -41,7 +41,7 @@ struct UCCLGin {
   const ncclDevComm_t& nccl_dev_comm;      // comm.cuh compatibility
   const ncclWindow_t& nccl_window;         // comm.cuh / offset compatibility
   NCCLGin nccl;                          // Lsa / World / barrier / members (reuse upstream)
-  uccl_gin::UCCLGinResources res;        // Rail backend resources
+  const uccl_gin::UCCLGinResources& res; // Rail backend resources owned by the kernel parameter
 
   __device__ __forceinline__
   UCCLGin(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,

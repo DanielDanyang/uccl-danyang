@@ -1363,6 +1363,7 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            uccl_gin_resources_enabled ? &uccl_gin_resources : nullptr,
             comm_stream);
 
         // Allocate output tensors
