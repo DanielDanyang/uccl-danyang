@@ -277,6 +277,18 @@ class ElasticBuffer:
         extra_flags = os.environ.get('EP_JIT_EXTRA_FLAGS', '')
         if '-DDEEPEP_USE_UCCL_GIN' not in extra_flags:
             os.environ['EP_JIT_EXTRA_FLAGS'] = (extra_flags + ' -DDEEPEP_USE_UCCL_GIN').strip()
+            extra_flags = os.environ['EP_JIT_EXTRA_FLAGS']
+        dispatch_clock_profile = os.environ.get('UCCL_GIN_DISPATCH_CLOCK_PROFILE', '') not in ('', '0')
+        if dispatch_clock_profile and '-DDEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (
+                extra_flags + ' -DDEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE'
+            ).strip()
+            extra_flags = os.environ['EP_JIT_EXTRA_FLAGS']
+        chunk_profile = os.environ.get('UCCL_GIN_CHUNK_PROFILE', '') not in ('', '0')
+        if chunk_profile and '-DDEEPEP_UCCL_GIN_CHUNK_PROFILE' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (
+                extra_flags + ' -DDEEPEP_UCCL_GIN_CHUNK_PROFILE'
+            ).strip()
 
         resources = self.runtime.get_native_v2_resources()
         window_base = int(resources['workspace_ptr'])

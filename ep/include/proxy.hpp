@@ -149,6 +149,7 @@ class Proxy {
   uint64_t wr_time_total_us_ = 0;
 
   bool profile_commands_ = false;
+  bool profile_merge_opportunity_ = false;
   std::chrono::steady_clock::time_point profile_start_;
   std::chrono::steady_clock::time_point profile_end_;
   uint64_t profile_post_batches_ = 0;
@@ -180,6 +181,17 @@ class Proxy {
   uint64_t profile_semantic_gather_runs_ = 0;
   uint64_t profile_semantic_gather_tokens_ = 0;
   uint64_t profile_semantic_gather_max_ = 0;
+  uint64_t profile_merge_adjacent_pairs_ = 0;
+  uint64_t profile_mergeable_pairs_ = 0;
+  uint64_t profile_merge_runs_ = 0;
+  uint64_t profile_merge_run_cmds_ = 0;
+  uint64_t profile_merge_run_max_ = 0;
+  uint64_t profile_merge_saved_wrs_ = 0;
+  uint64_t profile_merge_fail_ring_ = 0;
+  uint64_t profile_merge_fail_target_ = 0;
+  uint64_t profile_merge_fail_local_gap_ = 0;
+  uint64_t profile_merge_fail_remote_gap_ = 0;
+  uint64_t profile_merge_fail_atomic_ = 0;
 
   // Sender loop aggregates
   std::chrono::duration<double, std::micro> total_rdma_write_durations_ =

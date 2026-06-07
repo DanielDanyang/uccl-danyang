@@ -89,6 +89,8 @@ Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
   profile_commands_ = std::getenv("UCCL_PROXY_PROFILE_COMMANDS") != nullptr;
+  profile_merge_opportunity_ =
+      std::getenv("UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY") != nullptr;
   profile_start_ = std::chrono::steady_clock::now();
   profile_end_ = profile_start_;
 #ifndef USE_MSCCLPP_FIFO_BACKEND
@@ -1233,7 +1235,7 @@ void Proxy::post_gpu_commands_mixed(
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post) {
   if (cmds_to_post.empty()) return;
-  if (profile_commands_) {
+  if (profile_commands_ && profile_merge_opportunity_) {
     profile_write_batching_opportunity(wrs_to_post, cmds_to_post);
   }
   rdma_wrs.clear();
@@ -1412,6 +1414,17 @@ void Proxy::profile_write_batching_opportunity(
     uint64_t remote_run = 0;
     uint64_t local_contig_run = 0;
   };
+  struct MergeRunState {
+    bool valid = false;
+    uint64_t ring = 0;
+    uint32_t dst = 0;
+    CmdType cmd_type = CmdType::EMPTY;
+    uint64_t last_remote_end = 0;
+    uint64_t last_local_end = 0;
+    uint16_t atomic_offset = 0;
+    uint32_t atomic_sum = 0;
+    uint64_t run_cmds = 0;
+  };
 
   auto finish_stream_run = [&](RunState& st) {
     if (!st.valid || st.remote_run <= 1) return;
@@ -1448,12 +1461,40 @@ void Proxy::profile_write_batching_opportunity(
 
   RunState stream;
   std::unordered_map<uint64_t, RunState> semantic_by_ring_dst;
+  MergeRunState merge_run;
+
+  auto finish_merge_run = [&]() {
+    if (!merge_run.valid || merge_run.run_cmds <= 1) {
+      merge_run = MergeRunState{};
+      return;
+    }
+    ++profile_merge_runs_;
+    profile_merge_run_cmds_ += merge_run.run_cmds;
+    profile_merge_run_max_ = std::max(profile_merge_run_max_,
+                                      merge_run.run_cmds);
+    profile_merge_saved_wrs_ += merge_run.run_cmds - 1;
+    merge_run = MergeRunState{};
+  };
+
+  auto start_merge_run = [&](uint64_t ring, TransferCmd const& cmd,
+                             uint64_t remote_end, uint64_t local_end) {
+    merge_run.valid = true;
+    merge_run.ring = ring;
+    merge_run.dst = cmd.dst_rank;
+    merge_run.cmd_type = cmd.cmd_type;
+    merge_run.last_remote_end = remote_end;
+    merge_run.last_local_end = local_end;
+    merge_run.atomic_offset = cmd.atomic_val > 0 ? cmd.atomic_offset : 0;
+    merge_run.atomic_sum = cmd.atomic_val;
+    merge_run.run_cmds = 1;
+  };
 
   for (size_t i = 0; i < cmds_to_post.size(); ++i) {
     TransferCmd const& cmd = cmds_to_post[i];
     if (get_base_cmd(cmd.cmd_type) != CmdType::WRITE || cmd.bytes == 0) {
       finish_stream_run(stream);
       stream = RunState{};
+      finish_merge_run();
       continue;
     }
 
@@ -1464,6 +1505,46 @@ void Proxy::profile_write_batching_opportunity(
                                                get_low_latency(cmd.cmd_type));
     uint64_t const remote_end = remote + cmd.bytes;
     uint64_t const local_end = local + cmd.bytes;
+    if (!merge_run.valid) {
+      start_merge_run(ring, cmd, remote_end, local_end);
+    } else {
+      ++profile_merge_adjacent_pairs_;
+      bool mergeable = true;
+      if (merge_run.ring != ring) {
+        ++profile_merge_fail_ring_;
+        mergeable = false;
+      } else if (merge_run.dst != cmd.dst_rank ||
+                 merge_run.cmd_type != cmd.cmd_type) {
+        ++profile_merge_fail_target_;
+        mergeable = false;
+      } else if (merge_run.last_local_end != local) {
+        ++profile_merge_fail_local_gap_;
+        mergeable = false;
+      } else if (merge_run.last_remote_end != remote) {
+        ++profile_merge_fail_remote_gap_;
+        mergeable = false;
+      } else {
+        uint16_t const next_atomic_offset =
+            cmd.atomic_val > 0 ? cmd.atomic_offset : 0;
+        uint32_t const merged_atomic = merge_run.atomic_sum + cmd.atomic_val;
+        if (merge_run.atomic_offset != next_atomic_offset ||
+            merged_atomic > 0xFFu) {
+          ++profile_merge_fail_atomic_;
+          mergeable = false;
+        }
+      }
+
+      if (mergeable) {
+        ++profile_mergeable_pairs_;
+        merge_run.last_remote_end = remote_end;
+        merge_run.last_local_end = local_end;
+        merge_run.atomic_sum += cmd.atomic_val;
+        ++merge_run.run_cmds;
+      } else {
+        finish_merge_run();
+        start_merge_run(ring, cmd, remote_end, local_end);
+      }
+    }
 
     auto update_run = [&](RunState& st) {
       bool const same_stream =
@@ -1512,6 +1593,7 @@ void Proxy::profile_write_batching_opportunity(
 
   finish_stream_run(stream);
   for (auto const& kv : semantic_by_ring_dst) finish_semantic_run(kv.second);
+  finish_merge_run();
 }
 
 void Proxy::dump_command_profile() const {
@@ -1524,7 +1606,7 @@ void Proxy::dump_command_profile() const {
       seconds > 0.0
           ? static_cast<double>(profile_write_bytes_) / seconds / 1.0e9
           : 0.0;
-  char line[2048];
+  char line[3072];
   int const n = std::snprintf(
       line, sizeof(line),
       "UCCL_PROXY_PROFILE rank=%d thread=%d normal=%d rings=%zu "
@@ -1540,6 +1622,11 @@ void Proxy::dump_command_profile() const {
       "semantic_local_runs=%llu semantic_local_tokens=%llu "
       "semantic_local_max=%llu semantic_gather_runs=%llu "
       "semantic_gather_tokens=%llu semantic_gather_max=%llu "
+      "merge_adjacent_pairs=%llu mergeable_pairs=%llu merge_runs=%llu "
+      "merge_run_cmds=%llu merge_run_max=%llu merge_saved_wrs=%llu "
+      "merge_fail_ring=%llu merge_fail_target=%llu "
+      "merge_fail_local_gap=%llu merge_fail_remote_gap=%llu "
+      "merge_fail_atomic=%llu "
       "cmds_per_sec=%.3f\n",
       cfg_.rank, cfg_.thread_idx, cfg_.use_normal_mode ? 1 : 0,
       cfg_.d2h_queues.size(), seconds,
@@ -1572,6 +1659,17 @@ void Proxy::dump_command_profile() const {
       static_cast<unsigned long long>(profile_semantic_gather_runs_),
       static_cast<unsigned long long>(profile_semantic_gather_tokens_),
       static_cast<unsigned long long>(profile_semantic_gather_max_),
+      static_cast<unsigned long long>(profile_merge_adjacent_pairs_),
+      static_cast<unsigned long long>(profile_mergeable_pairs_),
+      static_cast<unsigned long long>(profile_merge_runs_),
+      static_cast<unsigned long long>(profile_merge_run_cmds_),
+      static_cast<unsigned long long>(profile_merge_run_max_),
+      static_cast<unsigned long long>(profile_merge_saved_wrs_),
+      static_cast<unsigned long long>(profile_merge_fail_ring_),
+      static_cast<unsigned long long>(profile_merge_fail_target_),
+      static_cast<unsigned long long>(profile_merge_fail_local_gap_),
+      static_cast<unsigned long long>(profile_merge_fail_remote_gap_),
+      static_cast<unsigned long long>(profile_merge_fail_atomic_),
       cmds_per_sec);
   if (n > 0) {
     size_t const len =

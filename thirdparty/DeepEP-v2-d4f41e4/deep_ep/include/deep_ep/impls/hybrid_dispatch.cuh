@@ -91,12 +91,38 @@ hybrid_dispatch_impl(
     EP_STATIC_ASSERT(kNumChannels * kNumScaleoutRanks * sizeof(int64_t) <= uccl_gin::kAtomicOffMask + 1,
                      "UCCL-GIN compact tail buffer must fit the ordered atomic offset field");
     const auto gin = handle::UCCLGin(nccl_dev_comm, nccl_window, uccl_gin_resources, qp_idx, sharing_mode);
+    constexpr int kUCCLGinAtomicTailWords = kNumChannels * kNumScaleoutRanks;
+
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+    auto* dispatch_profile_counters =
+        reinterpret_cast<uint64_t*>(uccl_gin_resources.atomic_tail_base) +
+        kUCCLGinAtomicTailWords;
+#endif
+#if defined(DEEPEP_UCCL_GIN_CHUNK_PROFILE)
+    constexpr int kUCCLGinChunkProfileOffsetWords =
+        kUCCLGinAtomicTailWords
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+        + uccl_gin::kDispatchClockNumCounters
+#endif
+        ;
+    auto* dispatch_chunk_counters =
+        reinterpret_cast<uint64_t*>(uccl_gin_resources.atomic_tail_base) +
+        kUCCLGinChunkProfileOffsetWords;
+#endif
 
     // The receiver forward warp reads compact software-atomic tails from the
     // host-mapped atomic buffer. Clear the compact slots at kernel start because
     // they are not part of DeepEP's normal workspace cleanup.
     for (int i = sm_idx * kNumThreads + thread_idx; i < kNumChannels * kNumScaleoutRanks; i += kNumSMs * kNumThreads)
         reinterpret_cast<int64_t*>(uccl_gin_resources.atomic_tail_base)[i] = 0;
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+    for (int i = sm_idx * kNumThreads + thread_idx; i < uccl_gin::kDispatchClockNumCounters; i += kNumSMs * kNumThreads)
+        dispatch_profile_counters[i] = 0;
+#endif
+#if defined(DEEPEP_UCCL_GIN_CHUNK_PROFILE)
+    for (int i = sm_idx * kNumThreads + thread_idx; i < uccl_gin::kDispatchChunkNumCounters; i += kNumSMs * kNumThreads)
+        dispatch_chunk_counters[i] = 0;
+#endif
     __threadfence_system();
     cooperative_groups::this_grid().sync();
 #else
@@ -112,6 +138,30 @@ hybrid_dispatch_impl(
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumScaleoutWarps + kNumForwardWarps, 1,
             math::advance_ptr<int>(smem, kNumSmemBytesForNotify)).get_rank_buffer(warp_idx - kNumNotifyWarps).get_token_buffer(0);
+
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+    uint64_t profile_local[uccl_gin::kDispatchClockNumCounters] = {};
+    uint64_t profile_scaleout_d2h_max = 0;
+    uint64_t profile_forward_tail_wait_max = 0;
+    uint64_t profile_forward_load_max = 0;
+    const auto profile_add = [&](const uccl_gin::DispatchClockCounter& counter, const uint64_t& value) {
+        profile_local[static_cast<uint32_t>(counter)] += value;
+    };
+    const auto profile_inc = [&](const uccl_gin::DispatchClockCounter& counter) {
+        profile_local[static_cast<uint32_t>(counter)] += 1;
+    };
+    const auto profile_max = [&](const uccl_gin::DispatchClockCounter& counter,
+                                 const uint64_t& cycles,
+                                 const uint64_t& detail) {
+        const auto packed = uccl_gin::dispatch_clock_pack_max(cycles, detail);
+        if (counter == uccl_gin::kDispatchClockScaleoutD2HMaxPacked)
+            profile_scaleout_d2h_max = packed > profile_scaleout_d2h_max ? packed : profile_scaleout_d2h_max;
+        else if (counter == uccl_gin::kDispatchClockForwardTailWaitMaxPacked)
+            profile_forward_tail_wait_max = packed > profile_forward_tail_wait_max ? packed : profile_forward_tail_wait_max;
+        else if (counter == uccl_gin::kDispatchClockForwardLoadMaxPacked)
+            profile_forward_load_max = packed > profile_forward_load_max ? packed : profile_forward_load_max;
+    };
+#endif
 
     // All the buffers
     auto scaleup_buffer = layout::BufferLayout<false>(
@@ -393,8 +443,22 @@ hybrid_dispatch_impl(
         int compact_batch_first_slot = 0;
         int compact_batch_count = 0;
 
-        const auto flush_compact_remote_batch = [&](const bool& finish_flag = false) {
+        const auto flush_compact_remote_batch = [&](
+                const bool& finish_flag = false,
+                const uint32_t& flush_reason = uccl_gin::kDispatchChunkFlushReasonFinish) {
             if (compact_batch_count > 0 and lane_idx == remote_scaleout_rank_idx) {
+#if defined(DEEPEP_UCCL_GIN_CHUNK_PROFILE)
+                const auto chunk_count = static_cast<uint32_t>(compact_batch_count);
+                uccl_gin::dispatch_chunk_add(dispatch_chunk_counters, uccl_gin::kDispatchChunkChunks, 1);
+                uccl_gin::dispatch_chunk_add(dispatch_chunk_counters, uccl_gin::kDispatchChunkTokens, chunk_count);
+                uccl_gin::dispatch_chunk_add(dispatch_chunk_counters,
+                                             uccl_gin::dispatch_chunk_size_bin(chunk_count), 1);
+                uccl_gin::dispatch_chunk_add(dispatch_chunk_counters,
+                                             uccl_gin::dispatch_chunk_reason_counter(flush_reason), 1);
+#endif
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_start = clock64();
+#endif
                 gin.rail_put_tail_add(
                     scaleout_recv_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
                     scaleout_send_channel_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
@@ -404,10 +468,29 @@ hybrid_dispatch_impl(
                     scaleout_rank_idx,
                     compact_batch_count,
                     channel_idx);
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_cycles = clock64() - profile_start;
+                profile_add(uccl_gin::kDispatchClockScaleoutD2HCycles, profile_cycles);
+                profile_inc(uccl_gin::kDispatchClockScaleoutD2HEvents);
+                profile_max(
+                    uccl_gin::kDispatchClockScaleoutD2HMaxPacked,
+                    profile_cycles,
+                    uccl_gin::dispatch_clock_detail(
+                        static_cast<uint32_t>(channel_idx),
+                        uccl_gin_resources.num_queues == 0 ? 0 :
+                            static_cast<uint32_t>(channel_idx) % uccl_gin_resources.num_queues));
+#endif
             }
             if (finish_flag and lane_idx == remote_scaleout_rank_idx) {
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_start = clock64();
+#endif
                 gin.rail_tail_add(channel_idx, scaleout_rank_idx, remote_scaleout_rank_idx,
                                   0, true, channel_idx);
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                profile_add(uccl_gin::kDispatchClockScaleoutTailCycles, clock64() - profile_start);
+                profile_inc(uccl_gin::kDispatchClockScaleoutTailEvents);
+#endif
             }
             compact_batch_count = 0;
             __syncwarp();
@@ -423,7 +506,14 @@ hybrid_dispatch_impl(
                 const auto tail_delta = stored_scaleout_tail - stored_old_scaleout_tail;
 #ifdef DEEPEP_USE_UCCL_GIN
                 if (lane_idx == scaleout_rank_idx) {
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                    const auto profile_start = clock64();
+#endif
                     gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx, tail_delta, finish_flag, channel_idx);
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                    profile_add(uccl_gin::kDispatchClockScaleoutTailCycles, clock64() - profile_start);
+                    profile_inc(uccl_gin::kDispatchClockScaleoutTailEvents);
+#endif
                     stored_old_scaleout_tail = stored_scaleout_tail;
                 }
 #else
@@ -445,6 +535,9 @@ hybrid_dispatch_impl(
             if (token_idx >= num_tokens)
                 return;
 
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            const auto profile_start = lane_idx == 0 ? clock64() : 0;
+#endif
             // Issue TMA load
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
             if (ptx::elect_one_sync()) {
@@ -472,6 +565,12 @@ hybrid_dispatch_impl(
                 ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
                 __syncwarp();
             }
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            if (lane_idx == 0) {
+                profile_add(uccl_gin::kDispatchClockScaleoutPreloadCycles, clock64() - profile_start);
+                profile_inc(uccl_gin::kDispatchClockScaleoutPreloadEvents);
+            }
+#endif
         };
 
         // Iterate all tokens
@@ -531,19 +630,44 @@ hybrid_dispatch_impl(
             const bool has_remote_scaleout_token = ((scaleout_rank_mask >> remote_scaleout_rank_idx) & 1) != 0;
             if (lane_idx == remote_scaleout_rank_idx and has_remote_scaleout_token) {
                 EP_DEVICE_ASSERT(compact_remote_slot_idx >= 0 and compact_remote_slot_idx < kNumMaxTokensPerChannel);
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_start = clock64();
+#endif
                 ptx::tma_store_1d(scaleout_send_channel_buffer.get_token_buffer(compact_remote_slot_idx).get_base_ptr(),
                                   tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                profile_add(uccl_gin::kDispatchClockScaleoutCompactStoreCycles, clock64() - profile_start);
+                profile_inc(uccl_gin::kDispatchClockScaleoutCompactStoreEvents);
+                profile_inc(uccl_gin::kDispatchClockScaleoutRemoteTokens);
+#endif
             }
             __syncwarp();
 #endif
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_start = clock64();
+#endif
                 ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                                   tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                profile_add(uccl_gin::kDispatchClockScaleoutLocalStoreCycles, clock64() - profile_start);
+                profile_inc(uccl_gin::kDispatchClockScaleoutLocalStoreEvents);
+                profile_inc(uccl_gin::kDispatchClockScaleoutLocalTokens);
+#endif
             }
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            const auto profile_store_wait_start = lane_idx == 0 ? clock64() : 0;
+#endif
             ptx::tma_store_commit();
             ptx::tma_store_wait();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            if (lane_idx == 0) {
+                profile_add(uccl_gin::kDispatchClockScaleoutStoreWaitCycles, clock64() - profile_store_wait_start);
+                profile_inc(uccl_gin::kDispatchClockScaleoutStoreWaitEvents);
+            }
+#endif
             __syncwarp();
 
             // Preload the next token (overlapping with the IBGDA issues)
@@ -555,12 +679,12 @@ hybrid_dispatch_impl(
                 if (compact_batch_count == 0) {
                     compact_batch_first_slot = compact_remote_slot_idx;
                 } else if (compact_batch_first_slot + compact_batch_count != compact_remote_slot_idx) {
-                    flush_compact_remote_batch();
+                    flush_compact_remote_batch(false, uccl_gin::kDispatchChunkFlushReasonNonContig);
                     compact_batch_first_slot = compact_remote_slot_idx;
                 }
                 ++compact_batch_count;
                 if (compact_batch_count >= kUCCLGinCompactChunkTokens)
-                    flush_compact_remote_batch();
+                    flush_compact_remote_batch(false, uccl_gin::kDispatchChunkFlushReasonFull);
             }
 #else
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
@@ -580,7 +704,7 @@ hybrid_dispatch_impl(
 
         // Flush unflushed tails
 #ifdef DEEPEP_USE_UCCL_GIN
-        flush_compact_remote_batch(true);
+        flush_compact_remote_batch(true, uccl_gin::kDispatchChunkFlushReasonFinish);
 #endif
         update_scaleout_tail(true);
     } else {
@@ -620,6 +744,9 @@ hybrid_dispatch_impl(
             recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
 
             // Wait for this rank to have data (or finish)
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            const auto profile_tail_wait_start = lane_idx == 0 ? clock64() : 0;
+#endif
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 const uint32_t arrived_or_finished =
                     stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
@@ -653,6 +780,19 @@ hybrid_dispatch_impl(
                 __syncwarp();
                 return false;
             });
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+            if (lane_idx == 0) {
+                const auto profile_cycles = clock64() - profile_tail_wait_start;
+                profile_add(uccl_gin::kDispatchClockForwardTailWaitCycles, profile_cycles);
+                profile_inc(uccl_gin::kDispatchClockForwardTailWaitEvents);
+                profile_max(
+                    uccl_gin::kDispatchClockForwardTailWaitMaxPacked,
+                    profile_cycles,
+                    uccl_gin::dispatch_clock_detail(
+                        static_cast<uint32_t>(channel_idx),
+                        static_cast<uint32_t>(recv_scaleout_rank_idx)));
+            }
+#endif
 
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
@@ -674,6 +814,9 @@ hybrid_dispatch_impl(
                 // native V2 metadata proves that the payload for this
                 // (channel, source-rank) stream is visible before the forwarder
                 // consumes it.
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_meta_wait_start = lane_idx == 0 ? clock64() : 0;
+#endif
                 comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                     const auto expected_rank_idx = recv_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                     const auto old_src_token_idx = ptx::exchange(last_forward_src_token_global_idx, recv_scaleout_rank_idx);
@@ -696,6 +839,12 @@ hybrid_dispatch_impl(
                     }
                     return false;
                 });
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                if (lane_idx == 0) {
+                    profile_add(uccl_gin::kDispatchClockForwardMetaWaitCycles, clock64() - profile_meta_wait_start);
+                    profile_inc(uccl_gin::kDispatchClockForwardMetaWaitEvents);
+                }
+#endif
                 __syncwarp();
 #endif
 
@@ -704,12 +853,28 @@ hybrid_dispatch_impl(
                 __syncwarp();
 
                 // TMA load into shared memory
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                const auto profile_forward_load_start = lane_idx == 0 ? clock64() : 0;
+#endif
                 if (ptx::elect_one_sync()) {
                     ptx::tma_load_1d(tma_buffer.get_base_ptr(), token_buffer.get_base_ptr(),
                                      mbarrier_ptr, token_layout.get_num_bytes<false>());
                     ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, token_layout.get_num_bytes<false>());
                     ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
                 }
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                if (lane_idx == 0) {
+                    const auto profile_cycles = clock64() - profile_forward_load_start;
+                    profile_add(uccl_gin::kDispatchClockForwardLoadCycles, profile_cycles);
+                    profile_inc(uccl_gin::kDispatchClockForwardLoadEvents);
+                    profile_max(
+                        uccl_gin::kDispatchClockForwardLoadMaxPacked,
+                        profile_cycles,
+                        uccl_gin::dispatch_clock_detail(
+                            static_cast<uint32_t>(channel_idx),
+                            static_cast<uint32_t>(slot_idx)));
+                }
+#endif
                 __syncwarp();
 
                 // Read top-k indices
@@ -755,8 +920,15 @@ hybrid_dispatch_impl(
                     const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
                         scaleup_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                         stored_dst_scaleup_rank_idx);
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                    const auto profile_scaleup_store_start = clock64();
+#endif
                     ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
                     ptx::tma_store_commit();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                    profile_add(uccl_gin::kDispatchClockForwardScaleupStoreCycles, clock64() - profile_scaleup_store_start);
+                    profile_inc(uccl_gin::kDispatchClockForwardScaleupStoreEvents);
+#endif
                 }
                 __syncwarp();
 
@@ -790,6 +962,10 @@ hybrid_dispatch_impl(
                     }
                 }
                 num_tokens_processed += 1;
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                if (lane_idx == 0)
+                    profile_inc(uccl_gin::kDispatchClockForwardTokens);
+#endif
                 __syncwarp();
             }
         }
@@ -827,11 +1003,103 @@ hybrid_dispatch_impl(
         __syncwarp();
     }
 
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+    for (int i = 0; i < uccl_gin::kDispatchClockNumCounters; ++i) {
+        if (profile_local[i] != 0)
+            uccl_gin::dispatch_clock_add(dispatch_profile_counters, i, profile_local[i]);
+    }
+    if (profile_scaleout_d2h_max != 0)
+        uccl_gin::dispatch_clock_max(dispatch_profile_counters, uccl_gin::kDispatchClockScaleoutD2HMaxPacked,
+                                     profile_scaleout_d2h_max >> 24,
+                                     profile_scaleout_d2h_max & ((1ull << 24) - 1));
+    if (profile_forward_tail_wait_max != 0)
+        uccl_gin::dispatch_clock_max(dispatch_profile_counters, uccl_gin::kDispatchClockForwardTailWaitMaxPacked,
+                                     profile_forward_tail_wait_max >> 24,
+                                     profile_forward_tail_wait_max & ((1ull << 24) - 1));
+    if (profile_forward_load_max != 0)
+        uccl_gin::dispatch_clock_max(dispatch_profile_counters, uccl_gin::kDispatchClockForwardLoadMaxPacked,
+                                     profile_forward_load_max >> 24,
+                                     profile_forward_load_max & ((1ull << 24) - 1));
+#endif
+
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
+
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+    if (sm_idx == 0 and thread_idx == 0) {
+        const auto* c = dispatch_profile_counters;
+        printf("UCCL_GIN_DISPATCH_CLOCK rank=%d "
+               "scaleout_preload_cycles=%llu scaleout_preload_events=%llu "
+               "scaleout_compact_store_cycles=%llu scaleout_compact_store_events=%llu "
+               "scaleout_local_store_cycles=%llu scaleout_local_store_events=%llu "
+               "scaleout_store_wait_cycles=%llu scaleout_store_wait_events=%llu "
+               "scaleout_d2h_cycles=%llu scaleout_d2h_events=%llu "
+               "scaleout_tail_cycles=%llu scaleout_tail_events=%llu "
+               "forward_tail_wait_cycles=%llu forward_tail_wait_events=%llu "
+               "forward_meta_wait_cycles=%llu forward_meta_wait_events=%llu "
+               "forward_load_cycles=%llu forward_load_events=%llu "
+               "forward_scaleup_store_cycles=%llu forward_scaleup_store_events=%llu "
+               "forward_tokens=%llu scaleout_remote_tokens=%llu scaleout_local_tokens=%llu "
+               "scaleout_d2h_max_packed=%llu forward_tail_wait_max_packed=%llu "
+               "forward_load_max_packed=%llu\n",
+               rank_idx,
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutPreloadCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutPreloadEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutCompactStoreCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutCompactStoreEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutLocalStoreCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutLocalStoreEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutStoreWaitCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutStoreWaitEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutD2HCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutD2HEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutTailCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutTailEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailWaitCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailWaitEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardMetaWaitCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardMetaWaitEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardLoadCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardLoadEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardScaleupStoreCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardScaleupStoreEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTokens]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutRemoteTokens]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutLocalTokens]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockScaleoutD2HMaxPacked]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailWaitMaxPacked]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardLoadMaxPacked]));
+    }
+#endif
+
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_CHUNK_PROFILE)
+    if (sm_idx == 0 and thread_idx == 0) {
+        const auto* c = dispatch_chunk_counters;
+        printf("UCCL_GIN_CHUNK_PROFILE rank=%d chunks=%llu tokens=%llu "
+               "bin_1=%llu bin_2=%llu bin_3_4=%llu bin_5_8=%llu "
+               "bin_9_16=%llu bin_17_24=%llu bin_25_31=%llu bin_32=%llu "
+               "bin_gt32=%llu flush_noncontig=%llu flush_full=%llu "
+               "flush_finish=%llu\n",
+               rank_idx,
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkChunks]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkTokens]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin1]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin2]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin3To4]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin5To8]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin9To16]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin17To24]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin25To31]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBin32]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkBinGt32]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkFlushNonContig]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkFlushFull]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchChunkFlushFinish]));
+    }
+#endif
 
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();

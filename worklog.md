@@ -2929,3 +2929,1108 @@ cmds_per_sec_sum              249,498.120
   - drain 路径 apply receiver atomic updates。
   - 非 UCCL-GIN 编译不再给上游 NCCL-GIN `put` 多传参数。
   - wait-for-CQ 去掉完成后的额外 3 次空 poll。
+
+## 2026-06-06: P4 per-batch WRITE merge opportunity profile
+
+目标:
+
+- 用户要求先不要直接实现 proxy WRITE 合并,而是先 profile 当前
+  `post_gpu_commands_mixed` batch 里是否真的存在可安全合并的相邻 WRITE。
+- 这个 profile 不改变传输行为,只回答 P4 的核心问题:如果按保守规则合并,理论上能省
+  多少 WR/CQE。
+
+本地修改:
+
+- `ep/include/proxy.hpp`
+  - 新增 merge opportunity counters:
+    `merge_adjacent_pairs`, `mergeable_pairs`, `merge_runs`,
+    `merge_run_cmds`, `merge_run_max`, `merge_saved_wrs`,
+    `merge_fail_ring`, `merge_fail_target`, `merge_fail_local_gap`,
+    `merge_fail_remote_gap`, `merge_fail_atomic`。
+- `ep/src/proxy.cpp`
+  - 扩展 `profile_write_batching_opportunity`。
+  - 保守可合并定义:
+    - 两条 WRITE 在同一个 D2H ring。
+    - `dst_rank` 和 `cmd_type` 相同。
+    - local offset 连续。
+    - remote offset 连续。
+    - piggyback atomic offset 相同,且合并后的 `atomic_val <= 255`。
+  - `UCCL_PROXY_PROFILE` 输出新增上述 counters。
+
+待服务器验证日志:
+
+- build: `/tmp/uccl_gin_mergeprof_build.log`
+- README-like:
+  - `/tmp/uccl_gin_mergeprof_readme_rank0.log`
+  - `/tmp/uccl_gin_mergeprof_readme_rank1.log`
+- profile:
+  - `/tmp/uccl_gin_mergeprof_profile_rank0.log`
+  - `/tmp/uccl_gin_mergeprof_profile_rank1.log`
+
+服务器验证结果:
+
+- build:
+  - 第一次链接失败: `cannot find -lnuma`。服务器只有 runtime `libnuma.so.1`,
+    但用户目录已有 `/home/ubuntu/local-lib/libnuma.so -> /usr/lib/x86_64-linux-gnu/libnuma.so.1`。
+  - 重新设置 `LIBRARY_PATH=/home/ubuntu/local-lib:$LIBRARY_PATH` 后 build 通过。
+  - 日志: `/tmp/uccl_gin_mergeprof_build.log`,最终 `BUILD_RC:0`。
+- profile:
+  - 命令: README-like EP8x2 first-case,额外设置
+    `UCCL_PROXY_PROFILE_COMMANDS=1`。
+  - 日志:
+    - `/tmp/uccl_gin_mergeprof_profile_rank0.log`
+    - `/tmp/uccl_gin_mergeprof_profile_rank1.log`
+  - 结果: 两端 `EXIT:0`。
+  - dispatch 仍约 `29-30 GB/s (SO)`,说明新增 profile 没有改变 benchmark 结果。
+  - 注意:新增 per-batch profile 使用 unordered map/run 扫描,proxy profile 的
+    `seconds_avg` 从约 `4.8s` 增到 `22.3s`;因此这次 profile 只能看
+    `merge_*` 机会比例,不能用来判断 proxy 真实吞吐。
+
+汇总 `64` 条 `UCCL_PROXY_PROFILE`:
+
+```text
+write_cmds_sum                    956,288
+piggyback_atomic_write_cmds_sum   952,320
+atomic_cmds_sum                   238,080
+merge_adjacent_pairs_sum          217,333
+mergeable_pairs_sum                   361
+merge_runs_sum                        361
+merge_run_cmds_sum                    722
+merge_run_max                           2
+merge_saved_wrs_sum                   361
+merge_fail_ring_sum               168,585
+merge_fail_local_gap_sum           48,387
+merge_fail_target_sum                   0
+merge_fail_remote_gap_sum               0
+merge_fail_atomic_sum                   0
+stream_remote_runs_sum                  8
+semantic_remote_runs_sum                8
+```
+
+结论:
+
+- 保守 proxy-side adjacent WRITE merge 基本没有收益:
+  `merge_saved_wrs_sum / write_cmds_sum = 361 / 956288 ≈ 0.038%`。
+- 可合并 run 最大只有 `2`,没有出现能把多个 compact32 chunk 串成大 WR 的长 run。
+- 失败原因主要是:
+  - `merge_fail_ring`:相邻 WRITE 来自不同 D2H ring,占多数。
+  - `merge_fail_local_gap`:同 ring 内也常常 local buffer 不连续。
+- `remote_gap=0`、`atomic=0` 说明 remote slot 和 piggyback encoding 不是主要阻塞;
+  真正阻塞是 D2H/ring interleaving 和 sender local compact buffer 顺序。
+- 因此 `uccl_gin_perf_plan.md` 里的 P4 不应该作为实现项继续推进。除非先重排
+  device-side command emission 或做更大的 sender-side semantic batching,否则在
+  proxy 侧扫相邻命令合并不会带来可见性能收益。
+
+## 2026-06-06: true-cost profile 拆分 dispatch/epilogue/proxy
+
+目标:
+
+- 用户要求先拆真实耗时,再更新 `ep/docs/uccl_gin_perf_plan.md` 指明下一步方向。
+- 本轮要回答两个问题:
+  - README-like dispatch 的 `~2 ms` 主要是不是 copy epilogue?
+  - proxy 侧 post/poll/software atomic 在真实 run 中占多少?
+
+本地修改:
+
+- `ep/include/proxy.hpp`
+  - 新增 `profile_merge_opportunity_` 开关。
+- `ep/src/proxy.cpp`
+  - `UCCL_PROXY_PROFILE_COMMANDS=1` 只输出轻量 proxy counters。
+  - 只有额外设置 `UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY=1` 时才跑昂贵的
+    per-batch merge-opportunity 扫描。
+- 原因:
+  - 上一轮 merge-opportunity profile 会把 proxy `seconds_avg` 从约 `4.8s` 增到
+    `22.3s`,不能作为真实 proxy 成本。
+
+服务器构建:
+
+- 同步文件:
+  - `ep/include/proxy.hpp`
+  - `ep/src/proxy.cpp`
+- build 命令里继续设置:
+  - `CUDA_HOME=/usr/local/cuda-13.0`
+  - `LIBRARY_PATH=/home/ubuntu/local-lib:$LIBRARY_PATH`
+- build 日志:
+  - `/tmp/uccl_gin_truecost_build.log`
+- 结果:
+  - `BUILD_RC:0`
+
+Trace profile:
+
+- 命令: README-like EP8x2 first-case,开启 PyTorch profiler trace 和
+  `UCCL_PROXY_PROFILE_COMMANDS=1`,不设置
+  `UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY`。
+- 日志:
+  - `/tmp/uccl_gin_truecost_profile_rank0.log`
+  - `/tmp/uccl_gin_truecost_profile_rank1.log`
+- trace 目录:
+  - `/tmp/uccl_gin_truecost_rank0_traces`
+  - `/tmp/uccl_gin_truecost_rank1_traces`
+- 本地临时解析目录:
+  - `/tmp/uccl_truecost_traces_local/rank0`
+  - `/tmp/uccl_truecost_traces_local/rank1`
+- 结果:
+  - 两端 `EXIT:0`。
+
+Trace 汇总:
+
+```text
+dispatch:
+  dispatch_impl                  avg 2049.748 us, p50 2050.634 us
+  dispatch_copy_epilogue_impl     avg  306.963 us, p50  306.623 us
+
+expanded_dispatch:
+  dispatch_impl                  avg 2050.016 us, p50 2048.736 us
+  dispatch_copy_epilogue_impl     avg  382.375 us, p50  385.119 us
+
+cached_dispatch:
+  dispatch_impl                  avg 2033.177 us, p50 2028.225 us
+  dispatch_copy_epilogue_impl     avg  299.743 us, p50  295.599 us
+
+combine:
+  combine_impl                   avg 12798.610 us, p50 13772.467 us
+  combine_reduce_epilogue_impl    avg    97.668 us, p50    97.728 us
+
+reduced_combine:
+  combine_impl                   avg 13140.050 us, p50 13913.870 us
+  combine_reduce_epilogue_impl    avg    96.528 us, p50    96.544 us
+```
+
+解读:
+
+- copy epilogue 不是 dispatch 主瓶颈:
+  - first dispatch:copy epilogue 约 `0.31 ms`,dispatch kernel 约 `2.05 ms`。
+  - expanded dispatch:copy epilogue 约 `0.38 ms`,dispatch kernel 约 `2.05 ms`。
+  - cached dispatch:copy epilogue 约 `0.30 ms`,dispatch kernel 约 `2.03 ms`。
+- 因此继续优化 dispatch 要优先看 `hybrid_dispatch` scaleout/control path,
+  而不是先重写 copy epilogue。
+- combine 更糟糕:
+  - `combine_impl` 约 `12.8-13.1 ms`。
+  - reduce epilogue 只有 `~0.1 ms`。
+  - 如果目标是完整 EP 性能,combine 需要独立成为高优先级主线。
+- `spin_kernel` 约 `10.1 ms`,是 profiler barrier/sleep,不是 dispatch 本体。
+- 注意:trace run 会放大 proxy 生命周期时间,所以 proxy `seconds` 不能用这组
+  trace 日志当真实吞吐判断。
+
+No-trace 轻量 proxy profile:
+
+- 命令: README-like EP8x2 first-case,只设置
+  `UCCL_PROXY_PROFILE_COMMANDS=1`,不 dump trace,不设置
+  `UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY`。
+- 日志:
+  - `/tmp/uccl_gin_truecost_light_rank0.log`
+  - `/tmp/uccl_gin_truecost_light_rank1.log`
+- 结果:
+  - 两端 `EXIT:0`。
+
+README-like line 汇总:
+
+```text
+dispatch          n=48 avg 2042.958 us, min 2023 us, max 2065 us
+expanded dispatch n=16 avg 2045.875 us, min 2027 us, max 2065 us
+cached dispatch   n=16 avg 2039.750 us, min 2023 us, max 2056 us
+combine           n=32 avg 13113.563 us, min 10603 us, max 16953 us
+reduced combine   n=16 avg 13095.500 us, min 10603 us, max 16907 us
+```
+
+轻量 proxy counters 汇总 `64` 条 `UCCL_PROXY_PROFILE`:
+
+```text
+post_batches_sum                  909,803
+post_cmds_sum                   1,194,368
+write_cmds_sum                    956,288
+write_bytes_sum           182,578,798,336
+piggyback_atomic_write_cmds_sum   952,320
+atomic_cmds_sum                   238,080
+quiet_cmds_sum                          0
+barrier_cmds_sum                        0
+completed_wrs_sum            120,118,206
+posted_atomic_wrs_sum             238,080
+coalesced_atomic_wrs_sum                0
+poll_us_sum                     5,836,513
+progress_atomic_us_sum          1,340,001
+post_gpu_us_sum                 4,872,288
+seconds_avg                         4.998
+write_GBps_sum                     36.529
+cmds_per_sec_sum              238,973.256
+```
+
+按 proxy thread 汇总:
+
+```text
+thread 0: post_cmds 361,088, write_bytes 54.786 GB, atomic_cmds 71,424
+thread 1: post_cmds 357,120, write_bytes 54.802 GB, atomic_cmds 71,424
+thread 2: post_cmds 238,080, write_bytes 36.539 GB, atomic_cmds 47,616
+thread 3: post_cmds 238,080, write_bytes 36.452 GB, atomic_cmds 47,616
+```
+
+结论:
+
+- 轻量 profile 下 proxy 全生命周期约 `5.0s`,回到上一轮真实量级;昂贵的
+  merge-opportunity 扫描已经被隔离到单独 env。
+- proxy 线程存在明显负载不均:
+  - thread 0/1 比 thread 2/3 多约 `50%` 命令和字节。
+  - 这值得继续用 per-ring counter 拆,但不是下一步唯一瓶颈。
+- proxy hot path 总 CPU 计时不是 `dispatch_impl ~2.05 ms/iter` 的全部来源:
+  - `post_gpu_us + poll_us + progress_atomic_us` 是 64 个 proxy 线程整个 run 的累计值。
+  - dispatch kernel 本身还在做 compact staging、scaleout emission、tail wait/forward 等
+    GPU 侧工作。
+- P4 adjacent WRITE merge 仍应下调/删除:
+  - 真实轻量 profile 默认不跑 merge 扫描。
+  - 上一轮 merge 机会只有 `0.038%` WR 可省,不值得进入主实现。
+- 下一步方向:
+  - dispatch:优先降低剩余 control/finish atomic 和 proxy thread imbalance,同时用
+    per-ring counters 找出 thread 0/1 偏重来源。
+  - combine:如果目标是完整 EP BW,必须单独 profile/优化 combine path;现在 combine
+    kernel 是 `~13 ms` 级别,远大于 dispatch。
+  - 不要先投大量工程到 copy epilogue 或 proxy adjacent WRITE merge。
+
+## 2026-06-06: P0.5 dispatch_impl kernel clock profile instrumentation
+
+背景:
+
+- 用户指出当前只知道 `dispatch_impl ~2.05 ms`,但没有 scaleout/forward/notify
+  的 kernel 内部分解。
+- 这个判断是对的。没有 kernel 内部分解就直接推进 P1/P2,容易只在 proxy 侧做微调,
+  但真实瓶颈可能在 GPU-side forward wait、D2H ring backpressure 或 compact/TMA
+  staging。
+
+最终本地修改:
+
+- `ep/include/uccl_gin/resources.cuh`
+  - 新增 `DispatchClockCounter` 枚举和 device helper:
+    `dispatch_clock_add`, `dispatch_clock_inc`。
+  - 没有改 `UCCLGinResources` ABI;profile counter 不再作为 `_C` resource 字段传入。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/buffers/elastic.py`
+  - 新增 env 开关 `UCCL_GIN_DISPATCH_CLOCK_PROFILE=1`。
+  - 开启时给 JIT flags 添加
+    `-DDEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE`。
+  - 不分配新的 Python tensor,避免需要 DeepEP `_C` ABI 同步。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - 仅在 `DEEPEP_USE_UCCL_GIN && DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE` 下埋点。
+  - counter buffer 从已有 UCCL atomic scratch 后半段切出来:
+    `atomic_tail_base + kNumChannels * kNumScaleoutRanks`。
+  - kernel start 清 counter。
+  - 每个 thread 用本地 `profile_local[]` 累计,最后一次性 `atomicAdd`,避免在 hot loop
+    里直接全局 atomic 导致 profile 自己把 kernel 拖慢。
+  - kernel end 由 `sm_idx==0 && thread_idx==0` 打一行:
+    `UCCL_GIN_DISPATCH_CLOCK rank=...`。
+
+被撤回的第一版设计:
+
+- 第一版曾把 `dispatch_profile_counters` 加进 `UCCLGinResources` /
+  `NativeUCCLGinResources`,并由 Python 分配 tensor 后传给 `_C`。
+- 这会要求 DeepEP `_C` 重新 build;如果只重编 `uccl.ep` 而不重编 `_C`,host/device ABI
+  会错位,profile counter 会读到垃圾地址。
+- 实际验证时出现过巨大 counter 和 correctness failure,因此改成“不改 `_C` ABI,
+  复用 atomic scratch”的最终设计。
+
+当前 counter:
+
+```text
+scaleout_preload_cycles/events
+scaleout_compact_store_cycles/events
+scaleout_local_store_cycles/events
+scaleout_store_wait_cycles/events
+scaleout_d2h_cycles/events
+scaleout_tail_cycles/events
+forward_tail_wait_cycles/events
+forward_meta_wait_cycles/events
+forward_load_cycles/events
+forward_scaleup_store_cycles/events
+forward_tokens
+scaleout_remote_tokens
+scaleout_local_tokens
+```
+
+使用方式:
+
+```bash
+export UCCL_GIN_DISPATCH_CLOCK_PROFILE=1
+export UCCL_PROXY_PROFILE_COMMANDS=1
+unset UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY
+```
+
+预期分析:
+
+- `forward_tail_wait_cycles` 大: receiver 等 tail/软件 atomic apply/control path。
+- `forward_meta_wait_cycles` 大: tail 已到但 payload metadata 不 ready,需要查
+  payload WR visibility/receiver ready protocol。
+- `scaleout_d2h_cycles` 大: scaleout warp 在 D2H ring reserve/commit 或 proxy
+  backpressure 上等。
+- `scaleout_compact_store_cycles + scaleout_store_wait_cycles` 大: compact staging/TMA
+  store 本身昂贵。
+- 如果这些都不大,再继续加 notify/barrier/linked-list metadata 细分。
+
+本地检查:
+
+- `git diff --check` 通过。
+
+服务器构建和恢复记录:
+
+- `uccl.ep` 构建通过:
+  - `/tmp/uccl_gin_clockprof_build2.log`
+- 第一版 ABI 方案尝试重建 DeepEP `_C` 时遇到过:
+  - `/tmp/deepep_c_clockprof_build.log`: 缺 `ninja`。
+  - `/tmp/deepep_c_clockprof_build2.log`: include path 不完整,缺 `util/gpu_rt.h`。
+  - `/tmp/deepep_c_clockprof_build3.log`: link 时找不到 `libnccl.so.2`。
+  - `/tmp/deepep_c_clockprof_build4.log`: 构建成功。
+- 注意事故:
+  - 曾错误地用跨 host pipe 写同一个 EFS 路径上的 `_C.so`,导致共享 EFS 上的
+    `deep_ep/_C.cpython-312-x86_64-linux-gnu.so` 被截断成 0 byte。
+  - 已用 build artifact 恢复:
+    `thirdparty/DeepEP-v2-d4f41e4/build/lib.linux-x86_64-cpython-312/deep_ep/_C.cpython-312-x86_64-linux-gnu.so`
+    -> `thirdparty/DeepEP-v2-d4f41e4/deep_ep/_C.cpython-312-x86_64-linux-gnu.so`。
+  - 之后两端 import smoke 均通过。
+- 最终 clock profile 设计不再需要重建 DeepEP `_C`。
+
+服务器验证:
+
+- 命令要点:
+  - `UCCL_GIN_DISPATCH_CLOCK_PROFILE=1`
+  - `UCCL_PROXY_PROFILE_COMMANDS=1`
+  - `unset UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY`
+  - 新 JIT cache:
+    `/tmp/deepep_jit_uccl_clockprof4_rank0`,
+    `/tmp/deepep_jit_uccl_clockprof4_rank1`
+- 日志:
+  - `/tmp/uccl_gin_clockprof4_rank0.log`
+  - `/tmp/uccl_gin_clockprof4_rank1.log`
+- 两端 `EXIT:0`。
+
+clock profile 汇总:
+
+```text
+valid_clock_rows 2972
+
+RANGE forward_tokens             8039..8079 avg 8058.7
+RANGE scaleout_remote_tokens     4012..4044 avg 4029.9
+RANGE scaleout_local_tokens      4012..4042 avg 4028.9
+RANGE scaleout_d2h_events        160..160   avg 160.0
+RANGE scaleout_tail_events       0..1488    avg 1477.6
+RANGE forward_tail_wait_events   2728..2855 avg 2785.3
+RANGE forward_meta_wait_events   8039..8079 avg 8058.7
+
+CLOCK_SUM scaleout_preload        cycles   2,249,944,367 events 12,151,037 avg      185
+CLOCK_SUM scaleout_compact_store  cycles     556,810,535 events 11,976,726 avg       46
+CLOCK_SUM scaleout_local_store    cycles   4,132,732,663 events 11,973,830 avg      345
+CLOCK_SUM scaleout_store_wait     cycles  24,233,431,680 events 12,151,037 avg    1,994
+CLOCK_SUM scaleout_d2h            cycles  95,445,160,621 events    475,520 avg  200,717
+CLOCK_SUM scaleout_tail           cycles 125,841,059,500 events  4,391,353 avg   28,657
+CLOCK_SUM forward_tail_wait       cycles 415,739,220,474 events  8,278,026 avg   50,222
+CLOCK_SUM forward_meta_wait       cycles  74,981,641,221 events 23,950,597 avg    3,131
+CLOCK_SUM forward_load            cycles 603,343,600,978 events 23,950,597 avg   25,191
+CLOCK_SUM forward_scaleup_store   cycles  36,921,791,263 events 62,917,507 avg      587
+```
+
+同一轮 README-like timing:
+
+```text
+dispatch          n=48 avg 3868.23 us, min 3465 us, max 4253 us
+expanded dispatch n=16 avg 3866.75 us, min 3465 us, max 4253 us
+cached dispatch   n=16 avg 3861.25 us, min 3473 us, max 4235 us
+combine           n=32 avg 6976.25 us, min 5608 us, max 7457 us
+reduced combine   n=16 avg 6971.00 us, min 5613 us, max 7450 us
+```
+
+同一轮 proxy 汇总:
+
+```text
+post_cmds             722,080
+write_cmds            482,720
+write_bytes    90,286,794,368
+piggyback_atomic_write_cmds 478,720
+atomic_cmds           239,360
+quiet_cmds                  0
+barrier_cmds                0
+completed_wrs     19,671,190
+posted_atomic_wrs    239,360
+poll_us           12,265,479
+progress_atomic_us 2,779,800
+post_gpu_us        9,727,650
+```
+
+解读:
+
+- profile instrumentation 会明显拖慢 dispatch:
+  - no-profile `dispatch_impl ~2.04 ms`。
+  - clock profile run `dispatch ~3.86 ms`。
+  - 因此这组 counter 只能看结构性分布,不能直接当真实性能。
+- `forward_meta_wait` 平均只有约 `3.1k cycles/event`,不像是 payload metadata ready
+  等待主瓶颈。
+- `scaleout_compact_store` 平均只有约 `46 cycles/event`,compact staging 写本身不是
+  当前最大问题。
+- `scaleout_d2h` 单次 command issue 约 `200k cycles/event`,说明 D2H ring/proxy
+  backpressure 仍值得继续拆。
+- aggregate 最大的是 `forward_load` 和 `forward_tail_wait`,但这些是许多 forward
+  warp 并行累加的总和,不等同于 wall time critical path。
+- 下一步 profile 应加 per-rank/per-channel 或 per-warp max counter,把 sum counter
+  变成 critical-path counter;然后再决定 P1/P2 的优先级。
+
+## 2026-06-06: P0.6 dispatch critical-path max counters
+
+背景:
+
+- 用户给了两个“不一定靠谱但值得验证”的判断:
+  - `forward_load avg ~25k cycles` 对 14KB TMA load 偏大,可能不是纯 TMA 慢,
+    而是在等 EFA/NIC DMA 写入 recv buffer 后对 GPU TMA load 可见。
+  - `scaleout_d2h avg ~200k cycles` 需要知道是均匀慢,还是少数 ring/channel
+    outlier;如果是后者,会直接指向 proxy thread/ring imbalance。
+- 这个判断和 P0.5 的结论一致:sum counter 不能代表 wall-time critical path,
+  必须补 max/per-channel 视角后再决定 P1/P2。
+
+本地修改:
+
+- `ep/include/uccl_gin/resources.cuh`
+  - 新增 packed max counters:
+    - `kDispatchClockScaleoutD2HMaxPacked`
+    - `kDispatchClockForwardTailWaitMaxPacked`
+    - `kDispatchClockForwardLoadMaxPacked`
+  - 新增 helper:
+    - `dispatch_clock_detail(channel, aux)`
+    - `dispatch_clock_pack_max(cycles, detail)`
+    - `dispatch_clock_max(...)`
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - 每个 thread 本地维护 `profile_max_local[]`,最后再全局 `atomicMax`,避免 hot loop
+    里每个事件都打全局 atomic。
+  - `scaleout_d2h_max_packed`:
+    - `cycles`: 单次 `rail_put_tail_add` issue 的最长耗时。
+    - `detail.channel`: `channel_idx`。
+    - `detail.aux`: `queue = channel_idx % num_queues`。当前 4 proxy threads x
+      8 rings/thread 时,`proxy_thread = queue / 8`。
+  - `forward_tail_wait_max_packed`:
+    - `cycles`: 单次 forward tail wait 最长耗时。
+    - `detail.channel`: `channel_idx`。
+    - `detail.aux`: `src_scaleout_rank`。
+  - `forward_load_max_packed`:
+    - `cycles`: 单次 forward TMA load 最长耗时。
+    - `detail.channel`: `channel_idx`。
+    - `detail.aux`: `slot_idx`。
+
+packed decode:
+
+```text
+cycles  = packed >> 24
+channel = (packed >> 12) & 0xfff
+aux     = packed & 0xfff
+```
+
+预期分析:
+
+- 如果 `scaleout_d2h_max` 固定集中在某几个 `aux/queue`,优先排查 P2 proxy/ring
+  负载不均。
+- 如果 `forward_load_max` 只是少数 channel/slot outlier,要查对应 tail/payload
+  到达和 receiver scheduling;如果所有 channel 都稳定偏高,更像 EFA NIC->HBM
+  visibility/latency 的结构性成本。
+- 如果 `forward_tail_wait_max` 集中在某个 source rank,要查 receiver-side atomic apply
+  或跨 node lane 分布。
+
+待服务器验证:
+
+- 同步代码后 rebuild `uccl.ep`。
+- 使用新的 JIT cache 跑:
+  - `UCCL_GIN_DISPATCH_CLOCK_PROFILE=1`
+  - `UCCL_PROXY_PROFILE_COMMANDS=1`
+  - `unset UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY`
+- 保存 rank 日志并 grep `UCCL_GIN_DISPATCH_CLOCK`,重点解析三个 `*_max_packed` 字段。
+
+第一轮服务器验证:
+
+- build: `/tmp/uccl_gin_p06_build.log`, `BUILD_RC:0`。
+- 日志:
+  - `/tmp/uccl_gin_p06_rank0.log`
+  - `/tmp/uccl_gin_p06_rank1.log`
+- 两端 `EXIT:0`。
+- 但本轮 profile overhead 过高:
+  - dispatch 从 P0.5 的 `~3.86 ms` 增到 `~5.64 ms`。
+  - 原因很可能是每个 thread 维护了
+    `profile_max_local[kDispatchClockNumCounters]`,额外 20+ 个 `uint64_t` 局部变量带来
+    寄存器压力。
+- 已修复:
+  - 把 max 本地状态收缩成 3 个变量:
+    `profile_scaleout_d2h_max`, `profile_forward_tail_wait_max`,
+    `profile_forward_load_max`。
+  - 已用新 JIT cache 重跑。
+
+第二轮服务器验证:
+
+- 日志:
+  - `/tmp/uccl_gin_p06b_rank0.log`
+  - `/tmp/uccl_gin_p06b_rank1.log`
+- 两端 `EXIT:0`。
+- 注意:
+  - dispatch 仍约 `5.66 ms`,所以 P0.6 max/clock instrumentation 本身会显著扰动
+    kernel;这组结果只用于判断结构和 outlier,不能当真实性能。
+  - 相比 P0.5 `~3.86 ms`,P0.6 多出来的 max/clock 采样本身就是主要 overhead,不是
+    单纯 `profile_max_local[]` 数组造成。
+
+P0.6 聚合:
+
+```text
+clock_rows 2964
+
+AVG_ROW scaleout_d2h_cycles         avg 153,879 cycles/event, min 65,706, max 313,485
+AVG_ROW forward_tail_wait_cycles    avg  51,598 cycles/event, min  2,143, max 10,981,593
+AVG_ROW forward_load_cycles         avg  15,434 cycles/event, min  2,355, max 24,083
+AVG_ROW forward_meta_wait_cycles    avg   2,380 cycles/event, min  1,158, max  3,995
+
+scaleout_d2h_max_packed:
+  max 3,723,190 cycles @ channel 36, queue 4, proxy_thread 0, rank 5
+  per-row max p50 1,080,503 cycles, avg 1,121,408 cycles
+  queue top counts: q14=159, q2=133, q1=129, q4=126, q3=120
+  proxy_thread counts: t0=917, t1=830, t2=609, t3=608
+
+forward_tail_wait_max_packed:
+  max 768,095,364 cycles @ channel 13, src_scaleout_rank 0, rank 9
+  per-row max p50 1,808,368 cycles, avg 3,966,857 cycles
+  src counts: src0=1579, src1=1385
+
+forward_load_max_packed:
+  max 2,567,053 cycles @ channel 19, slot 60, rank 6
+  per-row max p50 813,073 cycles, avg 850,842 cycles
+```
+
+proxy 汇总:
+
+```text
+post_cmds                  1,194,368
+write_cmds                   956,288
+write_bytes          182,578,798,336
+piggyback_atomic_write_cmds  952,320
+atomic_cmds                  238,080
+completed_wrs             56,908,368
+poll_us                  11,352,919
+progress_atomic_us        2,618,879
+post_gpu_us               9,455,853
+
+thread0: post_cmds 361,088, write_bytes 54.786 GB, atomic_cmds 71,424
+thread1: post_cmds 357,120, write_bytes 54.802 GB, atomic_cmds 71,424
+thread2: post_cmds 238,080, write_bytes 36.539 GB, atomic_cmds 47,616
+thread3: post_cmds 238,080, write_bytes 36.452 GB, atomic_cmds 47,616
+```
+
+解读:
+
+- `scaleout_d2h`:
+  - max 不集中在单个 queue,但 queue/proxy thread 分布仍和 proxy command 负载一致:
+    thread0/1 明显重于 thread2/3。
+  - 这继续支持 P2:先修 channel->queue/proxy 映射负载不均,但不是“某一个坏 ring”。
+- `forward_load`:
+  - max 分布在多个 channel/slot,slot top counts 也分散。
+  - 这更像 NIC->HBM visibility / receiver-side data availability 的普遍成本或
+    profile扰动下的 TMA load 等待,不是单个 channel/slot 的 bug。
+- `forward_tail_wait`:
+  - 有少数极大 outlier,主要在 rank1 等 src0,可能包含启动 skew、跨节点第一次到达
+    或非 timed warmup 的等待。
+  - 不能直接把这些极大值当成 steady-state 瓶颈;下一步如果继续 profile,应过滤
+    warmup/first iteration,或只在 timed iterations 开关 counter。
+
+下一步建议:
+
+- 性能工程上先做 P2 queue/proxy balance:
+  - 当前 thread0/1 仍比 thread2/3 多约 `50%` 命令/字节。
+  - `scaleout_d2h` max 的 proxy_thread counts 也偏向 thread0/1。
+- 同时改 profile 方法:
+  - P0.6 当前会把 dispatch 从真实 `~2.0 ms` 扰到 `~5.6 ms`。
+  - 后续只保留 sampled/max 版本,或让 counter 只在少量 timed iteration 打开。
+
+## 2026-06-06 P0.7 D2H ring 背压假设验证
+
+问题:
+
+- P0.6 看到 `scaleout_d2h` 平均约 `154k cycles/event`,max p50 约 `1.08M`
+  cycles,怀疑 GPU scaleout warp 在 D2H ring reserve/commit 等 proxy 腾 slot。
+- 尝试两个便宜实验:
+  1. `NUM_PROXY_THREADS=4 -> 8`
+  2. `kQueueSize=2048 -> 4096`
+
+### 实验 A: 8 proxy threads
+
+构建:
+
+```bash
+make -C ep clean
+make -C ep install NUM_PROXY_THREADS=8 CHANNEL_PER_PROXY=8 CUDA_PATH=/usr/local/cuda-13.0
+```
+
+验证:
+
+```text
+p5en_0: import uccl.ep; get_num_proxy_threads()=8, d2h_queue_capacity()=2048
+p5en_1: import uccl.ep; get_num_proxy_threads()=8, d2h_queue_capacity()=2048
+```
+
+日志:
+
+- no-clock:
+  - `/tmp/uccl_gin_np8_rank0.log`
+  - `/tmp/uccl_gin_np8_rank1.log`
+- clock:
+  - `/tmp/uccl_gin_np8_p06_rank0.log`
+  - `/tmp/uccl_gin_np8_p06_rank1.log`
+
+no-clock 结果:
+
+```text
+dispatch: 30-31 GB/s (SO), 1997-2018 us
+expanded dispatch: 30-31 GB/s (SO), 2001-2033 us
+```
+
+proxy 聚合:
+
+```text
+post_cmds                  1,194,368
+write_cmds                   956,288
+write_bytes          182,578,798,336
+atomic_cmds                  238,080
+
+thread0: 36.587 GB, post_cmds 242,048
+thread1: 36.603 GB, post_cmds 238,080
+thread2: 18.340 GB, post_cmds 119,040
+thread3: 18.245 GB, post_cmds 119,040
+thread4: 18.199 GB, post_cmds 119,040
+thread5: 18.199 GB, post_cmds 119,040
+thread6: 18.199 GB, post_cmds 119,040
+thread7: 18.207 GB, post_cmds 119,040
+```
+
+clock 结果:
+
+```text
+clock_rows 2947
+scaleout_d2h_cycles      avg 178,097 cycles/event, p50 170,664
+forward_tail_wait_cycles avg  74,298 cycles/event
+forward_load_cycles      avg  14,921 cycles/event
+
+scaleout_d2h_max_packed:
+  max 3,951,780 cycles @ channel 21, queue 21, proxy_thread 2
+  per-row max p50 1,154,197 cycles, avg 1,309,087 cycles
+  proxy_thread counts: t0=511, t1=574, t2=353, t3=257, t4=431, t5=240, t6=242, t7=339
+```
+
+解读:
+
+- 8 proxy threads 没改善 wall time;dispatch 仍约 `2.0 ms`。
+- clock profile 下 `scaleout_d2h avg` 反而高于 4-thread baseline。
+- 单纯增加 proxy thread 不是当前主线;thread0/1 仍更重,总 poll/post overhead 也增加。
+
+### 实验 B: queue size 4096
+
+代码:
+
+- `ep/include/common.hpp` 新增 `UCCL_QUEUE_SIZE`,默认 `2048`。
+- `ep/Makefile` 新增 `QUEUE_SIZE ?= 2048`,并传入 `-DUCCL_QUEUE_SIZE=$(QUEUE_SIZE)`。
+
+构建:
+
+```bash
+make -C ep clean
+make -C ep install NUM_PROXY_THREADS=4 CHANNEL_PER_PROXY=8 QUEUE_SIZE=4096 CUDA_PATH=/usr/local/cuda-13.0
+```
+
+验证:
+
+```text
+p5en_0: import uccl.ep; get_num_proxy_threads()=4, d2h_queue_capacity()=4096
+p5en_1: import uccl.ep; get_num_proxy_threads()=4, d2h_queue_capacity()=4096
+```
+
+日志:
+
+- build: `/tmp/uccl_gin_q4096_build.log`
+- no-clock:
+  - `/tmp/uccl_gin_q4096_rank0.log`
+  - `/tmp/uccl_gin_q4096_rank1.log`
+- clock:
+  - `/tmp/uccl_gin_q4096_p06_rank0.log`
+  - `/tmp/uccl_gin_q4096_p06_rank1.log`
+
+no-clock 结果:
+
+```text
+dispatch: 29-30 GB/s (SO), 2069-2079 us
+expanded dispatch: 30 GB/s (SO), 2043-2055 us
+```
+
+clock 结果:
+
+```text
+clock_rows 2964
+scaleout_d2h_cycles      avg 153,038 cycles/event, p50 151,578
+forward_tail_wait_cycles avg  36,070 cycles/event
+forward_load_cycles      avg  14,263 cycles/event
+
+scaleout_d2h_max_packed:
+  max 3,934,454 cycles @ channel 40, queue 8, proxy_thread 1
+  per-row max p50 1,043,145 cycles, avg 1,119,447 cycles
+  proxy_thread counts: t0=968, t1=864, t2=626, t3=506
+```
+
+解读:
+
+- 4096-slot ring 没有改善真实 dispatch,反而略慢。
+- `scaleout_d2h avg` 和 2048 baseline 基本相同,说明 D2H ring capacity 不是当前
+  主要瓶颈。
+- `scaleout_d2h` 的高等待更可能来自 proxy 服务速率、WR/CQE 处理、receiver data
+  visibility 或 emission/control pattern 共同形成的 backpressure。
+
+结论:
+
+- 暂时不继续做 8192 ring sweep。
+- P2 仍应做,但重点从“更大 ring / 更多 thread”转为:
+  - 改 channel -> queue/proxy 映射均衡;
+  - 减少每个 token/batch 的 D2H command 数;
+  - 降低 proxy WR/CQE 处理量;
+  - 继续拆 receiver-side wait 和 proxy-side service rate。
+
+远端状态恢复:
+
+- 恢复构建日志: `/tmp/uccl_gin_restore_q2048_build.log`
+- 已把 `ep.abi3.so` 从 p5en_0 复制到 p5en_1。
+- 验证:
+
+```text
+p5en_0: get_num_proxy_threads()=4, d2h_queue_capacity()=2048
+p5en_1: get_num_proxy_threads()=4, d2h_queue_capacity()=2048
+```
+
+## 2026-06-06: 根据 V1 baseline 重写 UCCL-GIN perf plan
+
+目标:
+
+- 用户指出当前 V2 UCCL-GIN 的 `ring_buffer.cuh::atomic_set_and_commit` 只在
+  `head - tail == Capacity` 时背压,而 V1 `uccl_ibgda.cuh` 在 normal path 里先用
+  `kMaxInflightNormal=8` 做 completion-credit 节流。
+- 结合远端 V1 baseline 数据,重写 `ep/docs/uccl_gin_perf_plan.md`,把优化重点从
+  “更大 ring / 更多 proxy thread / 零散 profile” 转到 “恢复 V1 式 D2H inflight cap
+  和继续减少 command/WR/CQE 数量”。
+
+已确认事实:
+
+```text
+V1 UCCL-EP @ 495b722:
+  FP8 dispatch: ~50-52 GB/s RDMA
+  D2H put/atomic push avg: ~38k cycles/event
+
+当前 V2 UCCL-GIN:
+  dispatch: ~30 GB/s RDMA
+  scaleout_d2h avg: ~153k cycles/event
+```
+
+代码语义核对:
+
+- 当前非 FIFO EFA path 的 D2H `tail` 是 CQ completion/ack 语义:
+  - `poll_cq_* -> acked_wrs_`
+  - `notify_gpu_completion -> mark_acked -> advance_tail_from_mask`
+  - `advance_tail_from_mask` 通过 release store 发布 `tail`
+- 因此在当前 path 中做 V1 式 `head - tail < max_inflight` cap 是有意义的;
+  它限制的是未完成 command/WR,不是单纯限制 proxy 是否读过命令。
+
+文档改动:
+
+- 重写 `ep/docs/uccl_gin_perf_plan.md`。
+- 新优先级:
+  1. P1: 实现 bounded D2H push,对 `4/8/16/32/64/128/2048` 做 cap sweep。
+  2. P2: 保留 V1-style quiet/ack,但禁止 hot path per-tail 同步 drain。
+  3. P3: 继续减少 command/WR/CQE,尤其 finish/control ATOMIC 和 compact32 实际粒度。
+  4. P4: 做 per-ring/profile,修 channel -> queue/proxy 映射偏斜。
+  5. P5: P1/P3 后再复测 receiver wait/data visibility。
+  6. P6: combine 单独立项。
+
+当前判断:
+
+- `QUEUE_SIZE=4096` 和 `NUM_PROXY_THREADS=8` 已证实不是主线。
+- 深 ring 只是 host queue 排队深度,不是 NIC in-flight 深度。
+- 短期最值得做的是把 V2 UCCL-GIN Rail helper 的 push policy 改回 V1 的
+  completion-credit 模型。
+
+## 2026-06-06: 修正 perf plan 优先级,前置 chunk/proxy 诊断
+
+用户 review 指出上一版 plan 仍然过早押注 inflight cap:
+
+- 当前 plan 中已有 `write_bytes` 和 `write_cmds`:
+
+```text
+182,578,798,336 / 956,288 ~= 190,923 bytes ~= 186 KiB per WRITE
+```
+
+按每 token payload `7.5-14 KiB` 粗估,实际平均 chunk 约 `13-25 tokens`,不是
+compact32 的 32 tokens。由于 `piggyback/write ~= 0.996`,大多数 WRITE 都是 compact
+chunk,所以 chunk 粒度不足不是“待确认小项”,而是高优先级根因候选。
+
+- V2 `scaleout_d2h ~153k cycles/event` 可能只是 proxy 跟不上导致 GPU 等 tail;
+  inflight cap 可能只把等待点从 ring full 挪到 cap wait,不一定提高 wall time。
+  因此需要先比较 V1 vs V2 proxy per-command cost。
+
+- V1 baseline 是 4096 tokens,V2 profile 是 8192 tokens;不能直接用 `50 vs 30 GB/s`
+  当 apples-to-apples 差距。
+
+文档更新:
+
+- 再次重写 `ep/docs/uccl_gin_perf_plan.md`。
+- 新优先级:
+  0. 跑 V1 8192-token apples-to-apples baseline。
+  1. P1A: `rail_put_tail_add count_delta` / chunk / flush reason profile。
+  2. P1B: V1 vs V2 proxy `ns/command`, `ns/WR`, `ns/CQE`, `ns/update` profile。
+  3. 根据 P1A/P1B 决定:
+     - chunk 太小 -> 修 compact batching。
+     - proxy per-command 太慢 -> 修 proxy fast path / 减 hot-path bookkeeping。
+     - 两者都不是 -> 再做 inflight cap sweep 或 receiver wait。
+  4. inflight cap 降级为 P2,作为排队形态实验,不再作为先验最高优先级。
+
+当前判断:
+
+- compact32 是否真正达到 32-token chunk 必须马上 profile。
+- V2 proxy per-command 成本是否显著高于 V1 必须马上 profile。
+- cap 仍值得做,但应在上述诊断之后做,并用 wall time/BW 判断,不能只看 per-push
+  cycles 是否接近 V1。
+
+## 2026-06-06: 完成 P0/P1A/P1B 诊断
+
+本轮目标:
+
+0. 跑 V1 `8192` token apples-to-apples baseline。
+1. 给 V2 UCCL-GIN compact dispatch 增加 `count_delta/chunk/flush reason`
+   profile。
+2. 对比 V1 vs V2 proxy `ns/command`。
+
+### 0. V1 8192-token baseline
+
+远端 worktree:
+
+```text
+/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang-v1-baseline-495b722
+commit 495b7221d084cce92553d6a038376358bd218a5a
+```
+
+普通 build 日志:
+
+```text
+/tmp/uccl_v1_495_8192_build.log
+```
+
+运行日志:
+
+```text
+/tmp/uccl_v1_495_ep16_8192_rank0.log
+/tmp/uccl_v1_495_ep16_8192_rank1.log
+```
+
+命令形状:
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 \
+  bench/test_internode.py --num-processes=8 \
+  --num-tokens=8192 --hidden=7168 --num-topk=8 --num-experts=256
+```
+
+结果:
+
+```text
+rank0 FP8 dispatch: 2035 us, 59.30 GB/s RDMA
+rank1 FP8 dispatch: 2054 us, 58.81 GB/s RDMA
+
+rank0 BF16 dispatch: 3419 us, 68.45 GB/s RDMA
+rank1 BF16 dispatch: 3482 us, 67.28 GB/s RDMA
+
+rank0 combine: 11557 us, 20.25 GB/s RDMA
+rank1 combine: 11531 us, 20.32 GB/s RDMA
+```
+
+结论:
+
+- V1 8192-token apples-to-apples dispatch baseline 是 `~59 GB/s FP8` 和
+  `~67-68 GB/s BF16`,不是之前 4096-token 下的 `~50 GB/s`。
+- 当前 V2 UCCL-GIN dispatch `~24-30 GB/s` 仍然明显低于 V1,但目标差距应按
+  `59 GB/s` 量级来理解。
+
+### 1. V2 count_delta / chunk / flush reason profile
+
+代码改动:
+
+- `ep/include/uccl_gin/resources.cuh`
+  - 新增 `DispatchChunkCounter` 和 `DispatchChunkFlushReason`。
+  - 新增 device helper: `dispatch_chunk_add`,
+    `dispatch_chunk_size_bin`, `dispatch_chunk_reason_counter`。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/buffers/elastic.py`
+  - 新增环境变量 `UCCL_GIN_CHUNK_PROFILE=1` 时自动追加
+    `-DDEEPEP_UCCL_GIN_CHUNK_PROFILE`。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - 在 `flush_compact_remote_batch` 里统计实际 `compact_batch_count`。
+  - flush reason 分三类:
+    - `noncontig`: compact slot 不连续导致 flush。
+    - `full`: 达到 `kUCCLGinCompactChunkTokens=32`。
+    - `finish`: channel 结束时 flush partial chunk。
+
+build 日志:
+
+```text
+/tmp/uccl_gin_chunkprof_build.log
+```
+
+运行日志:
+
+```text
+/tmp/uccl_gin_chunk_proxy_rank0.log
+/tmp/uccl_gin_chunk_proxy_rank1.log
+```
+
+运行环境新增:
+
+```bash
+export UCCL_GIN_CHUNK_PROFILE=1
+export UCCL_PROXY_PROFILE_COMMANDS=1
+export EP_JIT_CACHE_DIR=/tmp/deepep_jit_uccl_chunkprof
+```
+
+聚合结果:
+
+```text
+chunk profile lines: 2976
+avg chunk size: mean 25.49 tokens, median 25.49 tokens
+min/max avg per line: 25.46 / 25.53 tokens
+full chunk fraction: 75.0%
+noncontig flush total: 0
+```
+
+典型单行:
+
+```text
+UCCL_GIN_CHUNK_PROFILE rank=7 chunks=320 tokens=8161
+  bin_3_4=3 bin_5_8=77 bin_32=240
+  flush_noncontig=0 flush_full=240 flush_finish=80
+```
+
+解释:
+
+- 每 rank 每次 dispatch 基本是 `320` 个 remote payload chunk。
+- 其中 `240` 个是满 `32-token` chunk,`80` 个是 channel 末尾的 `5-8 token`
+  partial chunk。
+- `flush_noncontig=0`,说明当前 compact staging 没有被 slot 不连续打断。
+- `write_bytes/write_cmds ~= 191 KB/WRITE` 与 chunk profile 一致:
+  `25.5 tokens * ~7.5 KB/token ~= 191 KB`。
+
+结论:
+
+- compact32 已经真正工作。之前“平均 chunk 只有 13-25 token,可能没凑满 32”
+  的担心需要修正:平均 25.5 是 `3 个满 32 + 1 个尾部 partial` 的 channel
+  粒度结果,不是中途 flush。
+- 如果继续做 payload batching,方向不是修复 non-contiguous flush,而是:
+  - 增大 per-channel chunk 上限并保证 receiver tail 语义仍成立;
+  - 或者做跨 channel / 跨 proxy queue 的更高层聚合。但这会明显改变 V2 kernel
+    结构,需要单独设计。
+
+### 2. V1 vs V2 proxy ns/command profile
+
+V2 使用现有 `UCCL_PROXY_PROFILE_COMMANDS=1`。V1 在远端临时加入同格式的
+`UCCL_V1_PROXY_PROFILE` 输出,只记录:
+
+```text
+post_batches, post_cmds, write_cmds, write_bytes, atomic_cmds,
+completed_wrs, poll_us, post_gpu_us
+```
+
+V1 profile 运行日志:
+
+```text
+/tmp/uccl_v1_495_proxyprof_build.log
+/tmp/uccl_v1_495_proxyprof_8192_rank0.log
+/tmp/uccl_v1_495_proxyprof_8192_rank1.log
+```
+
+注意:
+
+- V1 profile build 会明显拖慢 tuning,因此 V1 bandwidth baseline 仍使用上面的普通
+  build 结果。
+- V1 proxy profile 源码改动已经从远端 worktree 恢复;profile `.so` 保存在
+  `/tmp/uccl_ep_v1_495_proxyprof.abi3.so`。
+- 当前两台 venv 里的 `uccl/ep.abi3.so` 已恢复为 V2 build:
+
+```text
+p5en_0: get_num_proxy_threads=4, d2h_queue_capacity=2048
+p5en_1: get_num_proxy_threads=4, d2h_queue_capacity=2048
+```
+
+聚合结果:
+
+```text
+V1 proxy profile lines: 62
+V1 post_gpu_ns_per_cmd:
+  mean 166 ns, median 167 ns, min 144 ns, max 211 ns
+V1 poll_ns_per_completed:
+  mean 127 ns, median 127 ns, min 116 ns, max 146 ns
+V1 write_bytes_per_cmd:
+  mean 144,026 bytes, median 144,000 bytes
+V1 post_cmds per proxy:
+  median 3,581,701 commands
+
+V2 proxy profile lines: 64
+V2 post_gpu_ns_per_cmd:
+  mean 7,949 ns, median 8,351 ns, min 5,467 ns, max 15,054 ns
+V2 poll_ns_per_completed:
+  mean 264 ns, median 191 ns, min 59 ns, max 1,362 ns
+V2 progress_atomic_ns_per_atomic:
+  mean 11,181 ns, median 11,192 ns, min 7,864 ns, max 17,689 ns
+V2 write_bytes_per_cmd:
+  mean 191,045 bytes, median 191,564 bytes
+```
+
+直接结论:
+
+- V2 的 payload WRITE size 甚至比 V1 更大:
+  - V1 `~144 KB/WRITE`
+  - V2 `~191 KB/WRITE`
+- 因此当前主瓶颈不再是 payload chunk 太小。
+- V2 proxy `post_gpu` hot path 单 command 成本约 `8 us`,比 V1 `~0.17 us`
+  慢约 `48x`。
+- V2 `progress_atomic` 仍有约 `11 us/atomic` 的成本。即使 piggyback 已经减少独立
+  tail WR,软件 atomic/apply bookkeeping 仍很重。
+
+下一步方向:
+
+1. 先不要优先做 D2H inflight cap。cap 可能改变 GPU 等待形态,但不会让 proxy
+   每 command 从 `8 us` 变回 V1 的 `~0.17 us`。
+2. 优先查 V2 `post_gpu_commands_mixed` 相比 V1 的 per-command 开销:
+   - `PendingAtomicBatch` / `atomic_dep_by_wr_` / `retire_inflight_write`
+   - piggyback atomic decode/apply 依赖追踪
+   - profile/merge/coalesce 检查是否仍在 hot path 造成分支和容器操作
+   - `std::vector`/`unordered_map`/`set` 是否进入 per-command 关键路径
+3. 保留 chunk profile 代码作为 gated 诊断工具,默认不开。
+
+## 2026-06-06: 批判性核对 dependency-tracking review
+
+外部 review 提出:
+
+- piggyback WRITE 已经把 payload + count 放入同一个 WRITE_WITH_IMM,所以不应继续为
+  每条 piggyback WRITE 支付 standalone ATOMIC dependency-tracking 成本。
+- `atomic_dependency_wrs_` 可能无界增长,导致每个 finish ATOMIC 做 O(N) 扫描。
+- 可以进一步把 finish piggyback 到最后 payload chunk,删除独立 finish ATOMIC。
+
+代码核对结果:
+
+- 第一条部分成立:
+  - `flush_writes()` 当前会把所有 WRITE 加入 `inflight_write_wrs_` 和
+    `atomic_dependency_wrs_`。
+  - 后续 standalone finish ATOMIC 会扫描这些依赖并写入 `atomic_dep_by_wr_`。
+  - 因此 piggyback WRITE 确实仍承担后续 finish ordering 的 per-WR bookkeeping。
+- 第二条不成立:
+  - `enqueue_pending_atomics()` 末尾会调用 `deps.clear()`。
+  - dependency vector 是“自上一个 standalone ATOMIC 以来的 WRITE”,不是全历史无界
+    vector。
+- 第三条方向正确但不能直接删除:
+  - 当前 piggyback count 只表示该 payload chunk 的 token 数。
+  - 发送 chunk 时尚未表达“这是 channel 最后一个 chunk”。
+  - standalone finish 仍负责终止语义;只有设计 last-payload finish piggyback 后才能
+    删除相应 dependency。
+
+计划调整:
+
+- 更新 `ep/docs/uccl_gin_perf_plan.md`。
+- 下一步先细分 dependency hot path:
+  - 每 finish 的 dependency fan-in。
+  - dependency scan/map insert/map erase/retire/coalesce 各自耗时。
+  - finish ATOMIC 与其他 ATOMIC 数量。
+- 根据 profile 决定:
+  - 用 per-ring/per-channel completion watermark 替代 per-WR unordered_map;
+  - 或实现 last-payload finish piggyback;
+  - 或先复用 V1 精简 WRITE post path。

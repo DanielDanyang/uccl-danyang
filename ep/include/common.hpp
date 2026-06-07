@@ -59,8 +59,12 @@ static constexpr int kMaxMRChunks = 128;
 #endif
 
 #define kAtomicBufferSize 81960
-#define kQueueSize 2048
+#ifndef UCCL_QUEUE_SIZE
+#define UCCL_QUEUE_SIZE 2048
+#endif
+#define kQueueSize UCCL_QUEUE_SIZE
 #define kQueueMask (kQueueSize - 1)
+static_assert((kQueueSize & kQueueMask) == 0, "UCCL_QUEUE_SIZE must be a power of two");
 // This is the highest we can get due to the number of bits we allocate in the
 // imm for reordering buffer sequence tracking.
 #define kMaxInflightLowLatency 32
