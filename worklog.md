@@ -5289,7 +5289,8 @@ node1:
 结论:
 
 - scale-up wait 通常不是主成本；
-- per-token reduce 与 D2H emission 都不可忽略；
+- 这批 clock counters 后续被复核为嵌套测量:forward reduce 的 callback 会触发
+  D2H emission，所以 `reduce_cycles` 覆盖其中的 `d2h_cycles`，不能把二者相加；
 - 放宽 D2H cap 已被独立实验否定，不能把 D2H cycles 简单解释成 cap 背压；
 - 下一步执行 P2.1:只做 profile 模拟，在窗口 `4/8/16/32` 内判断按 remote
   `src_token_idx` 有界重排后能否创造足够的 contiguous run，再决定是否值得改 kernel。
@@ -5325,3 +5326,669 @@ reduced combine:
 
 最终保留的代码只有默认关闭的 clock-only 诊断模式；没有保留任何无性能收益的 cap
 实验路径。
+
+## 2026-06-07 18:19 PDT - Combine reduce/D2H 归因修正与 P2.1 重排 profile
+
+### Review 结论吸收
+
+确认一个重要测量问题:combine forward 路径第二个 `combine_reduce` 的
+`Wait buffer release` callback 会调用 `flush_last_tma_and_issue_rdma()`，因此
+`reduce_cycles` 覆盖了其中触发的 `d2h_cycles`。这意味着之前“per-token reduce 与
+D2H emission 都不可忽略”的写法容易被误读成二者可相加。更准确的解释是:
+
+```text
+forward span measured by reduce_cycles
+  includes callback-triggered D2H emission
+
+pure reduce compute ~= reduce_cycles - nested d2h_cycles
+```
+
+所以 clock profile 只能用于阶段排序，不能作为 wall-time budget 求和。`clock64`
+instrumentation 也会破坏原 kernel 设计中的 reduce/RDMA overlap，因此 headline BW 和
+cycle sum 都不能直接作为真实性能。
+
+另一个修正:`same_dst=100%` 是当前 2-node EP8x2/EP16 的拓扑 artifact。非本地目标只有
+一个 remote node，所以它不能证明 emission order 天然按 dst 聚集；未来如果支持超过
+2 个 scaleout node，任何 batching/reindex 都仍然必须先按 `dst_rank` bucket。
+
+### P2.1 有界重排 profile 实现过程
+
+第一版尝试在 GPU kernel 内直接统计窗口 `4/8/16/32` 的排序/contiguity counters。
+实测这个方案太重:
+
+- 全量 README-like 8192 token 会明显拖慢甚至 timeout；
+- 缩到采样 3 个 SM、只看 channel 0 仍然过重；
+- 进一步缩到 1k token 也不适合作为常规 profile。
+
+这些中间尝试的日志保留在:
+
+```text
+/tmp/uccl_gin_combine_reorder_rank0.log
+/tmp/uccl_gin_combine_reorder_rank1.log
+/tmp/uccl_gin_combine_reorder_sample_rank0.log
+/tmp/uccl_gin_combine_reorder_sample_rank1.log
+/tmp/uccl_gin_combine_reorder_ch0_rank0.log
+/tmp/uccl_gin_combine_reorder_ch0_rank1.log
+/tmp/uccl_gin_combine_reorder_1k_rank0.log
+/tmp/uccl_gin_combine_reorder_1k_rank1.log
+```
+
+随后把实现改成轻量 dump:kernel 只在 `UCCL_GIN_COMBINE_REORDER_PROFILE=1` 时打印
+`channel_idx == 0` 的前 256 个 remote put candidates:
+
+```text
+UCCL_GIN_COMBINE_REORDER_CAND rank=... expanded=... multiple_reduction=...
+  channel=0 seq=... dst=... local_off=... remote_off=... bytes=...
+```
+
+再用 CPU offline parser 在窗口 `4/8/16/32` 内按 `(dst, remote_off, local_off)` 排序，
+统计 local/remote/both contiguity。这个方式不再污染 hot path，也避免在 GPU 内做
+profile-only 排序。
+
+成功运行日志与 JIT cache:
+
+```text
+/tmp/uccl_gin_combine_reorder_dump_rank0.log
+/tmp/uccl_gin_combine_reorder_dump_rank1.log
+/tmp/deepep_jit_combine_reorder_dump_rank0
+/tmp/deepep_jit_combine_reorder_dump_rank1
+```
+
+两节点均退出 `0`。
+
+### Offline parse 结果
+
+rank0:
+
+```text
+groups 992, total_candidates 100949
+
+KEY (rank=0, expanded=0, multiple_reduction=1):
+  W4:  remote 0.0%, local 73.67%, both 0.0%
+  W8:  remote 0.0%, local 68.66%, both 0.0%
+  W16: remote 0.0%, local 66.43%, both 0.0%
+  W32: remote 0.0%, local 64.92%, both 0.0%
+
+KEY (rank=0, expanded=1, multiple_reduction=1):
+  W4:  remote 0.0%, local 73.40%, both 0.0%
+  W8:  remote 0.0%, local 68.31%, both 0.0%
+  W16: remote 0.0%, local 66.30%, both 0.0%
+  W32: remote 0.0%, local 64.89%, both 0.0%
+```
+
+rank1:
+
+```text
+groups 987, total_candidates 101367
+
+KEY (rank=1, expanded=0, multiple_reduction=1):
+  W4:  remote 0.0%, local 68.25%, both 0.0%
+  W8:  remote 0.0%, local 67.13%, both 0.0%
+  W16: remote 0.0%, local 66.53%, both 0.0%
+  W32: remote 0.0%, local 65.44%, both 0.0%
+
+KEY (rank=1, expanded=1, multiple_reduction=1):
+  W4:  remote 0.0%, local 67.31%, both 0.0%
+  W8:  remote 0.0%, local 66.92%, both 0.0%
+  W16: remote 0.0%, local 66.68%, both 0.0%
+  W32: remote 0.0%, local 66.06%, both 0.0%
+```
+
+结论:
+
+- 小窗口有界重排不能创造 `remote_contiguous` run；`both_contiguous` 仍然是 `0%`。
+- local 指针有 65-74% 连续性，但 remote V2 destination slot 完全打散，所以仅改变
+  emission order 无法合并成 multi-token RDMA WRITE。
+- P2.1 direct reorder batching 降级，不应实现。
+- 后续若继续追求 combine payload batching，需要评估 receiver-facing staging /
+  layout-aware compact 或 scatter/gather descriptor；这会触及 V2 layout 成本模型，
+  不能再按“窗口内排序”这样的小改来估算收益。
+
+代码清理:
+
+- 删除了 GPU 内排序 profile 遗留的 reorder counter ABI 和尾部空 counter 打印。
+- 保留默认关闭的轻量 `UCCL_GIN_COMBINE_REORDER_PROFILE=1` candidate dump，便于后续
+  做更精细的 offline layout 分析。
+
+### 清理后默认路径验证
+
+同步到服务器:
+
+```text
+/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang
+```
+
+关闭所有 profile flag，使用 fresh JIT cache 跑 README-like EP8x2 full correctness:
+
+```text
+EP_JIT_CACHE_DIR=/tmp/deepep_jit_reorder_cleanup_rank0
+EP_JIT_CACHE_DIR=/tmp/deepep_jit_reorder_cleanup_rank1
+
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_reorder_cleanup_rank0.log
+/tmp/uccl_gin_reorder_cleanup_rank1.log
+```
+
+结果:
+
+```text
+rank0 exit 0
+rank1 exit 0
+error keyword scan: no Traceback / CUDA error / assert / timeout / failed
+
+cached dispatch:
+  rank0: 38 GB/s SO, slowest 1625 us
+  rank1: 38 GB/s SO, slowest 1622 us
+
+normal combine:
+  rank0: 28 GB/s SO, slowest 4197 us
+  rank1: 28-30 GB/s SO, slowest 4130 us
+
+reduced combine:
+  rank0: 31 GB/s SO, slowest 3794 us
+  rank1: 31 GB/s SO, slowest 3817 us
+```
+
+结论:清理 heavy reorder-profile 残留没有改变默认主路径；当前性能与此前 final
+baseline 一致。测试结束后两台没有残留真实 `test_ep.py`/`torchrun`/GPU compute
+进程，`pgrep` 只匹配到检查命令本身。
+
+## 2026-06-07: PT.0 dispatch 分段 profiling 与 V1/V2 RDMA 过程对照
+
+目标:
+
+- 回答当前 V2 UCCL-GIN dispatch 和原 V1 UCCL-EP RDMA 过程的主要差距。
+- 澄清“V1 是不是 32-token 一次”和“为什么当前 V2 4-token 最优”。
+- 更新 `ep/docs/uccl_gin_perf_plan.md`，避免继续引用旧的 chunk=32 / `post_gpu_us`
+  口径。
+
+### 代码改动
+
+增加低开销 proxy 分段 profile（仅 `UCCL_PROXY_PROFILE_COMMANDS=1` 开启）:
+
+- `ep/include/proxy.hpp`
+  - 新增 `profile_record_completion(uint64_t wr_id)`。
+  - 新增 WRITE/ATOMIC post 计数、post ns、post->CQE ns/max 计数。
+  - 新增 `wr_id -> post_time/type` map，只在 profiling 开启时使用。
+- `ep/src/proxy.cpp`
+  - `flush_writes()` 在 `post_rdma_async_batched` 前后计时，记录 WRITE post 热区。
+  - `progress_pending_atomics()` 在 `post_atomic_operations` 前后计时，记录 ATOMIC
+    post 热区。
+  - `notify_gpu_completion()` 对 send CQE 调 `profile_record_completion`，按 wr_id
+    计算 post 返回到 CQE 的时间。
+  - `dump_command_profile()` 输出:
+    `write_post_*`, `write_cqe_*`, `atomic_post_*`, `atomic_cqe_*`。
+
+注意:
+
+- 这组计时是为了拆分 `(b) proxy CPU/cmd` 与 `(c) post->CQE`，不用于 headline BW。
+- p5en_1 缺 `numaif.h`，本轮只在 p5en_0 build，然后把 `.so` 复制到 p5en_1。
+
+构建/同步:
+
+```text
+p5en_0 build log:
+  /tmp/uccl_gin_pt0_build.log
+
+p5en_1 build attempt log:
+  /tmp/uccl_gin_pt0_build_p5en1.log
+  失败原因: src/fifo.cpp include <numaif.h> 时找不到 numaif.h
+
+同步二进制:
+  p5en_0:/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so
+  -> /tmp/uccl_ep_pt0.abi3.so
+  -> p5en_1:/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so
+```
+
+有一轮混合二进制 profile 日志不作为结论使用:
+
+```text
+/tmp/uccl_gin_pt0_proxy_rank0.log
+/tmp/uccl_gin_pt0_proxy_rank1.log
+```
+
+### 1. 当前 V2 dispatch proxy 分段 profile
+
+命令形状:
+
+```bash
+export UCCL_PROXY_PROFILE_COMMANDS=1
+export UCCL_GIN_CHUNK_PROFILE=1
+export EP_JIT_CACHE_DIR=/tmp/deepep_jit_pt0_proxy2_rank{0,1}
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_pt0_proxy2_rank0.log
+/tmp/uccl_gin_pt0_proxy2_rank1.log
+```
+
+README-like 行（profile on，会扰动性能，不作为最终 headline）:
+
+```text
+rank0 node: cached dispatch 约 6 GB/s SO, 9.93-9.95 ms
+rank1 node: cached dispatch 约 6-7 GB/s SO, 9.28-9.31 ms
+```
+
+chunk profile 聚合（每 node 取每个 rank 最后一条）:
+
+```text
+rank0 node:
+  chunks=16616
+  tokens=65291
+  tokens/chunk=3.929
+  bin_1=98, bin_2=359, bin_3_4=16159
+  bin_5_8/bin_9_16/bin_32=0
+  flush_full=15998
+  flush_finish=618
+  flush_noncontig=0
+
+rank1 node:
+  chunks=16623
+  tokens=65241
+  tokens/chunk=3.925
+  bin_1=123, bin_2=379, bin_3_4=16121
+  bin_5_8/bin_9_16/bin_32=0
+  flush_full=15997
+  flush_finish=626
+  flush_noncontig=0
+```
+
+结论:
+
+- 当前主路径确实是 `kUCCLGinCompactChunkTokens=4`。
+- 不是“没有凑满 4”或“中途 non-contig flush”导致小 chunk；绝大多数是 full 4-token。
+- 当前 4-token 最优必须从 receiver 可见性/forward pipeline 解释，不能简单归咎为
+  batching bug。
+
+proxy 分段聚合:
+
+```text
+rank0 node:
+  WRITE post calls:      6,433,717
+  WRITE WRs:            11,199,076
+  WRITE post ns:         4,683,381,481
+  WRITE post ns/WR:      418 ns
+  WRITE CQE ns/WR:       67.1 us
+
+  ATOMIC WRs:            199,040
+  ATOMIC post ns/WR:     531 ns
+  ATOMIC CQE ns/WR:      30.7 us
+
+rank1 node:
+  WRITE post calls:      6,618,793
+  WRITE WRs:            11,206,585
+  WRITE post ns/WR:      422 ns
+  WRITE CQE ns/WR:       63.8 us
+
+  ATOMIC WRs:            199,040
+  ATOMIC post ns/WR:     539 ns
+  ATOMIC CQE ns/WR:      31.3 us
+```
+
+结论:
+
+- 旧结论“V2 proxy `post_gpu_us/post_cmds` 约 8us/cmd 是主因”不成立；那个指标包含
+  空轮询、整轮 mixed loop、profile 扰动和不对称口径。
+- 真正纯 CPU `ibv_post_send` 热区只有约 `0.42us/WRITE`，不是 `38 -> 59 GB/s`
+  dispatch gap 的主因。
+- 当前最重的直接可见段是 `post_send 返回 -> send CQE`，每个 4-token WRITE 约
+  `64-67us`。这可能包含 EFA 小包 delivery、NIC/rail queueing、receiver 端进展和
+  profiling 扰动；下一步要继续拆 receiver apply 与 forward 观察 tail。
+
+### 2. 当前 V2 dispatch GPU clock profile
+
+命令形状:
+
+```bash
+export UCCL_GIN_DISPATCH_CLOCK_PROFILE=1
+export UCCL_GIN_CHUNK_PROFILE=1
+unset UCCL_PROXY_PROFILE_COMMANDS
+export EP_JIT_CACHE_DIR=/tmp/deepep_jit_pt0_clock_rank{0,1}
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_pt0_clock_rank0.log
+/tmp/uccl_gin_pt0_clock_rank1.log
+```
+
+聚合方式:
+
+- 每个 rank 取最后一条 `UCCL_GIN_DISPATCH_CLOCK`。
+- clock profile 侵入性很强，只看阶段相对量级，不看 headline BW。
+
+结果:
+
+```text
+rank0 node:
+  scaleout_preload:        124 cycles/event
+  scaleout_compact_store:   34 cycles/event
+  scaleout_store_wait:    1173 cycles/event
+  scaleout_d2h:         308788 cycles/event
+  scaleout_tail:         15346 cycles/event
+  forward_tail_wait:     82780 cycles/event
+  forward_meta_wait:      3174 cycles/event
+  forward_load:          21602 cycles/event
+  forward_scaleup_store:   287 cycles/event
+
+rank1 node:
+  scaleout_preload:        124 cycles/event
+  scaleout_compact_store:   34 cycles/event
+  scaleout_store_wait:    1073 cycles/event
+  scaleout_d2h:         291005 cycles/event
+  scaleout_tail:          9594 cycles/event
+  forward_tail_wait:     89789 cycles/event
+  forward_meta_wait:      2579 cycles/event
+  forward_load:          17836 cycles/event
+  forward_scaleup_store:   395 cycles/event
+```
+
+结论:
+
+- compact staging 自身很便宜；不是 4-token 最优的原因。
+- `scaleout_d2h` 很高，但结合 proxy profile 看，不是 CPU post 慢，而是 GPU 侧等待
+  command 被 proxy/NIC/receiver 进展吸收的下游症状。
+- `forward_tail_wait` 和 `forward_load` 仍显著，说明 receiver tail/count 可见与
+  payload 到 HBM/TMA load 是 dispatch critical path 的一部分。
+
+### 3. V1 RDMA dispatch 过程与 chunk 事实
+
+源码对照:
+
+```text
+V1 commit:
+  495b7221d084cce92553d6a038376358bd218a5a
+
+V1 benchmark config:
+  ep/bench/test_internode.py
+  Config(num_sms, nvl_chunk_send=8, nvl_chunk_recv=512,
+         rdma_chunk_send=16, rdma_chunk_recv=512)
+
+V1 sweep:
+  rdma_chunk_size in range(4, 33, 4)
+```
+
+所以:
+
+- V1 apples-to-apples baseline 不是固定 32-token 一次。
+- 当前默认 HT/dispatch config 是 `rdma_chunk_send=16`。
+- 32-token 是论文/某些 HT 配置或 tuning sweep 上界里的候选值，不应拿来直接说
+  “V1 原来就是 32, V2 为何 4”。
+
+V1 dispatch sender 关键路径:
+
+```text
+producer:
+  token 按 dst RDMA rank/channel 写入连续 send_buffer[dst][slot]
+  更新 rdma_send_channel_tail[dst]
+
+coordinator:
+  processed = rdma_send_channel_tail[dst] - last_issued_tail
+  if processed >= rdma_chunk_send or all done:
+      num_tokens_to_issue = min(processed, rdma_chunk_send)
+      bytes = num_tokens_to_issue * num_bytes_per_token
+      nvshmemi_ibgda_put_nbi_warp(..., bytes,
+                                  atomic_offset=rdma_channel_tail,
+                                  atomic_val=num_tokens_to_issue)
+
+receiver:
+  tail 表示 channel 进展，但 payload readiness 还由 per-token/source tag 检查。
+```
+
+当前 V2 UCCL-GIN dispatch:
+
+```text
+scaleout warp:
+  token 按 V2 expanded/metadata 语义遍历
+  TMA store 到 per-channel compact send slot
+  每 4 token 发 rail_put_tail_add:
+      payload WRITE_WITH_IMM + count delta
+
+receiver/forward:
+  count/tail apply 后才知道 compact slot 可消费
+  forward 每轮最多消费 kNumSlotsPerForwardChunk=3
+  再 TMA load payload -> scale-up layout
+```
+
+为什么 V2 现在 4-token 最优:
+
+- 4-token WRITE 约 30KB，已经进入 EFA 小消息上沿，但仍能较早发布 count/tail。
+- 16/32-token 会减少 WR 数，但 count/tail 要等整条大 payload WR 到达后才 apply；
+  forward 更晚看到前几个 token ready，流水线被变粗。
+- V1 可以用 16-token chunk 而不付出同样代价，是因为 receiver-facing staging 与
+  per-token ready/tag 允许“大 payload chunk”和“细粒度消费”共存。
+
+### 4. 更新 plan
+
+更新 `ep/docs/uccl_gin_perf_plan.md`:
+
+- 将贯穿性假设改成当前 dispatch 数据驱动版本。
+- 增加 V1 RDMA dispatch 过程图和 chunk 事实。
+- 在 5.1 记录本轮 proxy/chunk/clock profile 数字。
+- 撤销旧的 V2 `post_gpu_us/post_cmds ~= 8us/cmd` 主因判断。
+- 将 PT.1 CPU proxy hot-path 对 dispatch 降级。
+- 将下一步改成:
+  1. low-overhead receiver apply timing；
+  2. source/channel HOL profile；
+  3. 设计 V2-native ready/tag 或 receiver-facing landing，使更大 payload WRITE 不推迟
+     细粒度 token ready。
+
+## 2026-06-08 PT.0 补充: receiver apply 与 forward HOL profile
+
+### 1. 目的
+
+继续拆 dispatch 的剩余 gap，重点回答两个问题:
+
+```text
+1. receiver 端 WRITE_WITH_IMM / ordered atomic apply 本身是不是慢？
+2. forward_tail_wait 是所有 source 都没 ready，还是 selected source 造成 HOL？
+```
+
+### 2. 代码改动
+
+- `ep/include/proxy_ctx.hpp`
+  - 新增 receiver atomic process / commit 的 profile counters。
+- `ep/src/rdma.cpp`
+  - 在 normal-mode receiver atomics path 中计时:
+    - CQE decode + reorder + apply 的总处理时间；
+    - 真正 `fetch_add` commit 的时间。
+- `ep/src/proxy.cpp`
+  - 在 `UCCL_PROXY_PROFILE` 输出 receiver apply counters。
+- `ep/include/uccl_gin/resources.cuh`
+  - 新增 dispatch clock fresh 分桶 counters:
+    - selected source fresh read 后 ready；
+    - other source ready；
+    - no source ready。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`
+  - 在 forward stall 后的一次 fresh tail read 中记录上述三类分桶。
+
+### 3. 服务器操作
+
+构建:
+
+```text
+p5en_0:
+  make -C ep clean install CUDA_PATH=/usr/local/cuda-13.0 PYTHON=python
+  build log: /tmp/uccl_gin_hol_build.log
+
+p5en_1:
+  复用 p5en_0 构建出的 ep.abi3.so:
+  /home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so
+```
+
+profile run:
+
+```text
+proxy / receiver timing:
+  /tmp/uccl_gin_hol_proxy_rank0.log
+  /tmp/uccl_gin_hol_proxy_rank1.log
+  env:
+    UCCL_PROXY_PROFILE_COMMANDS=1
+    UCCL_GIN_CHUNK_PROFILE=1
+
+dispatch clock + HOL:
+  第一版日志:
+    /tmp/uccl_gin_hol_clock_rank0.log
+    /tmp/uccl_gin_hol_clock_rank1.log
+  修复 CUDA device printf 参数上限后重跑:
+    /tmp/uccl_gin_hol_clock2_rank0.log
+    /tmp/uccl_gin_hol_clock2_rank1.log
+  env:
+    UCCL_GIN_DISPATCH_CLOCK_PROFILE=1
+    UCCL_GIN_CHUNK_PROFILE=1
+```
+
+两组测试均为 README-like EP8x2:
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+### 4. 遇到的 bug
+
+`UCCL_GIN_DISPATCH_CLOCK` 原本一条 device `printf` 中有 `rank + 32` 个参数。
+CUDA device printf 有参数数量限制，最后一个 `forward_tail_fresh_no_ready_events`
+被错读成 `0x4e49475f4c434355`，即 ASCII `"UCCL_GIN"`。
+
+修复:
+
+```text
+把 fresh 分桶拆到第二条短 printf:
+  UCCL_GIN_DISPATCH_CLOCK_FRESH
+```
+
+这个 bug 只影响 profiling 输出，不影响默认 dispatch/combine 路径。
+
+### 5. 结果
+
+proxy / receiver timing 聚合:
+
+```text
+rank0 node:
+  WRITE post:                  427 ns/WR
+  WRITE post->CQE:            63.4 us/WR
+  ATOMIC post:                 539 ns/WR
+  ATOMIC post->CQE:           30.7 us/WR
+  receiver atomic process:     134 ns/CQE
+  receiver atomic commit:       65 ns/fetch_add
+
+rank1 node:
+  WRITE post:                  422 ns/WR
+  WRITE post->CQE:            67.0 us/WR
+  ATOMIC post:                 535 ns/WR
+  ATOMIC post->CQE:           30.8 us/WR
+  receiver atomic process:     133 ns/CQE
+  receiver atomic commit:       64 ns/fetch_add
+```
+
+dispatch clock + HOL 聚合:
+
+```text
+rank0 node:
+  scaleout_d2h:       525.1k cycles / 4-token WRITE
+  forward_tail_wait:  168.6k cycles / event
+  fresh selected ready: 32.0%
+  fresh other ready:    53.0%
+  fresh no ready:       15.0%
+
+rank1 node:
+  scaleout_d2h:       517.6k cycles / 4-token WRITE
+  forward_tail_wait:  180.5k cycles / event
+  fresh selected ready: 27.9%
+  fresh other ready:    55.3%
+  fresh no ready:       16.9%
+```
+
+### 6. 结论
+
+- receiver CQE decode / ordered apply / `fetch_add` 是百纳秒量级，不是 dispatch gap 主因。
+- 超过一半 forward stall 在 fresh read 后发现“其他 source 已 ready”，说明
+  source-selection HOL 是真实优化机会。
+- 只有约 15-17% stall 是 fresh read 后所有 source 都没 ready，不能把 forward wait
+  简单归因于 receiver apply 或 EFA delivery。
+- plan 已更新:
+  - `(b) proxy CPU/cmd` 与 `(d) receiver apply` 对 dispatch 降级；
+  - 当前 dispatch 主嫌疑改成 `(c) 4-token WRITE post->CQE` 与
+    `forward source-selection HOL`；
+  - 下一步先验证 ready-source-first 是否能转化成 wall-time 收益；若低于保留门槛则回退。
+
+## 2026-06-08 ready-source-first forward selection 尝试与回退
+
+### 1. 假设
+
+HOL profile 显示 fresh read 后超过一半 stall 是:
+
+```text
+selected source not ready, but another source ready
+```
+
+因此尝试最小行为改动:
+
+```text
+在 forward timeout loop fresh-read 之后:
+  如果 selected source 已 ready -> 保持原 selected；
+  如果 selected source 未 ready、但其他 source ready -> 切换到 ready source 并退出等待；
+  否则继续等待。
+```
+
+该改动不碰 wire/layout/metadata，只改变 forward source selection。
+
+### 2. 验证
+
+profiling-off README-like EP8x2，fresh JIT cache:
+
+```text
+logs:
+  /tmp/uccl_gin_ready_source_rank0.log
+  /tmp/uccl_gin_ready_source_rank1.log
+```
+
+结果:
+
+```text
+rank0 node:
+  dispatch:          38 GB/s, avg 1619 us
+  expanded dispatch: 38 GB/s, avg 1622 us
+  cached dispatch:   38 GB/s, avg 1604 us
+  combine:           avg 27.9 GB/s, max 4949 us
+  reduced combine:   avg 30.0 GB/s, max 4509 us
+
+rank1 node:
+  dispatch:          38 GB/s, avg 1617 us
+  expanded dispatch: 38.1 GB/s, avg 1600 us
+  cached dispatch:   38 GB/s, avg 1608 us
+  combine:           avg 23.9 GB/s, max 5076 us
+  reduced combine:   avg 24.9 GB/s, max 4817 us
+```
+
+### 3. 结论
+
+- dispatch headline 没有超过保留门槛；仍是约 `38 GB/s`。
+- combine path 理论上未改，但这次 rank1 combine 出现明显低值；无论是否噪声，
+  该 patch 都没有收益。
+- 按规则回退行为改动，只保留 HOL profiling counters。
+- 新判断:HOL 现象真实存在，但简单切换 source 可能只是把等待转移到 metadata/payload
+  load 或其他 pipeline 阶段；下一步不应继续堆 source switch 小改，而应先做
+  post->CQE/NIC-rail profile 和更深 HOL phase profile。
