@@ -244,6 +244,11 @@ struct ProxyCtx {
   uint64_t profile_receiver_atomic_buffered = 0;
   uint64_t profile_receiver_atomic_drained = 0;
   uint64_t profile_receiver_atomic_max_buffered = 0;
+  uint64_t profile_receiver_atomic_process_ns = 0;
+  uint64_t profile_receiver_atomic_process_max_ns = 0;
+  uint64_t profile_receiver_atomic_commits = 0;
+  uint64_t profile_receiver_atomic_commit_ns = 0;
+  uint64_t profile_receiver_atomic_commit_max_ns = 0;
   inline uint8_t take_next_atomic_seq(size_t index) {
     assert(index < next_seq_per_index.size());
     uint8_t const seq = next_seq_per_index[index];

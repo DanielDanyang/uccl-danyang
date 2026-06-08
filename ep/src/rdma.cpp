@@ -2272,6 +2272,9 @@ void remote_process_completions_normal_mode(
     }
     if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM &&
         ImmType::IsAtomics(ntohl(cqe.imm_data))) {
+      auto const profile_receiver_process_start =
+          S.profile_receiver_atomics ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
       AtomicsImm aimm(ntohl(cqe.imm_data));
       int value = aimm.GetValue();
       uint32_t offset = aimm.GetOff();
@@ -2281,8 +2284,27 @@ void remote_process_completions_normal_mode(
 
       if (value == kMaxSendAtomicValue) value = kLargeAtomicValue;
 
+      auto commit = [&](int delta) {
+        if (S.profile_receiver_atomics) {
+          auto const commit_start = std::chrono::steady_clock::now();
+          addr64->fetch_add(delta, std::memory_order_release);
+          auto const commit_ns =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - commit_start)
+                  .count();
+          ++S.profile_receiver_atomic_commits;
+          S.profile_receiver_atomic_commit_ns +=
+              static_cast<uint64_t>(commit_ns);
+          S.profile_receiver_atomic_commit_max_ns = std::max<uint64_t>(
+              S.profile_receiver_atomic_commit_max_ns,
+              static_cast<uint64_t>(commit_ns));
+        } else {
+          addr64->fetch_add(delta, std::memory_order_release);
+        }
+      };
+
       if (!aimm.IsReorderable()) {
-        addr64->fetch_add(value, std::memory_order_release);
+        commit(value);
       } else {
 #ifndef EFA
         assert(false &&
@@ -2295,9 +2317,6 @@ void remote_process_completions_normal_mode(
         auto& sb = S.ordered_atomic_seqbufs[index];
         if (S.profile_receiver_atomics) ++S.profile_receiver_atomic_cqes;
 
-        auto commit = [&](int delta) {
-          addr64->fetch_add(delta, std::memory_order_release);
-        };
         uint8_t seq = aimm.GetSeq();
         if (seq >= kReorderingBufferSize) {
           fprintf(stderr, "Error: seq %u out of range\n", seq);
@@ -2346,6 +2365,18 @@ void remote_process_completions_normal_mode(
             }
           }
         }
+      }
+      if (S.profile_receiver_atomics) {
+        auto const process_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() -
+                profile_receiver_process_start)
+                .count();
+        S.profile_receiver_atomic_process_ns +=
+            static_cast<uint64_t>(process_ns);
+        S.profile_receiver_atomic_process_max_ns = std::max<uint64_t>(
+            S.profile_receiver_atomic_process_max_ns,
+            static_cast<uint64_t>(process_ns));
       }
     } else if (cqe.opcode == IBV_WC_RECV_RDMA_WITH_IMM &&
                ImmType::IsBarrier(ntohl(cqe.imm_data))) {

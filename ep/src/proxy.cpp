@@ -685,6 +685,7 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
   expand_atomic_completion_aliases();
   if (profile_commands_) {
     profile_completed_wrs_ += acked_wrs_.size();
+    for (auto wr_id : acked_wrs_) profile_record_completion(wr_id);
   }
   if (acked_wrs_.empty()) return;
 
@@ -751,6 +752,32 @@ void Proxy::notify_gpu_completion(uint64_t& my_tail) {
   adaptive_sleeper_.update_timer();
 }
 
+void Proxy::profile_record_completion(uint64_t wr_id) {
+  if (!profile_commands_) return;
+  auto time_it = profile_wr_post_time_.find(wr_id);
+  if (time_it == profile_wr_post_time_.end()) return;
+  const auto now = std::chrono::steady_clock::now();
+  const auto ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now - time_it->second)
+          .count());
+  auto type_it = profile_wr_post_type_.find(wr_id);
+  const auto type = type_it == profile_wr_post_type_.end()
+                        ? CmdType::WRITE
+                        : type_it->second;
+  if (type == CmdType::ATOMIC) {
+    ++profile_atomic_cqe_wrs_;
+    profile_atomic_cqe_ns_ += ns;
+    profile_atomic_cqe_max_ns_ = std::max(profile_atomic_cqe_max_ns_, ns);
+  } else {
+    ++profile_write_cqe_wrs_;
+    profile_write_cqe_ns_ += ns;
+    profile_write_cqe_max_ns_ = std::max(profile_write_cqe_max_ns_, ns);
+  }
+  profile_wr_post_time_.erase(time_it);
+  if (type_it != profile_wr_post_type_.end()) profile_wr_post_type_.erase(type_it);
+}
+
 void Proxy::retire_inflight_write(uint64_t wr_id) {
   if (inflight_write_wrs_.erase(wr_id) == 0) return;
   auto it = atomic_dep_by_wr_.find(wr_id);
@@ -758,6 +785,9 @@ void Proxy::retire_inflight_write(uint64_t wr_id) {
   PendingAtomicBatch* batch = it->second;
   if (batch != nullptr && batch->pending_writes > 0) {
     --batch->pending_writes;
+    if (profile_commands_ && batch->pending_writes == 0) {
+      batch->profile_ready_time = std::chrono::steady_clock::now();
+    }
   }
   atomic_dep_by_wr_.erase(it);
 }
@@ -793,6 +823,10 @@ void Proxy::enqueue_pending_atomics(std::vector<uint64_t>& wrs,
   batch.wrs.swap(wrs);
   batch.cmds.swap(cmds);
   batch.pending_writes = 0;
+  if (profile_commands_) {
+    batch.profile_dependency_batch = !deps.empty();
+    batch.profile_enqueue_time = profile_start;
+  }
   for (uint64_t wr_id : deps) {
     if (inflight_write_wrs_.find(wr_id) == inflight_write_wrs_.end()) continue;
     ++batch.pending_writes;
@@ -802,6 +836,9 @@ void Proxy::enqueue_pending_atomics(std::vector<uint64_t>& wrs,
   }
   deps.clear();
   if (profile_commands_) {
+    if (batch.profile_dependency_batch && batch.pending_writes == 0) {
+      batch.profile_ready_time = std::chrono::steady_clock::now();
+    }
     profile_dependency_scan_ns_ += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - profile_start)
@@ -905,10 +942,49 @@ void Proxy::progress_pending_atomics(bool force) {
     coalesce_atomic_batch(batch);
     if (profile_commands_) {
       profile_posted_atomic_wrs_ += batch.wrs.size();
+      if (batch.profile_dependency_batch) {
+        const auto now = std::chrono::steady_clock::now();
+        if (batch.profile_ready_time ==
+            std::chrono::steady_clock::time_point{}) {
+          batch.profile_ready_time = now;
+        }
+        const auto enqueue_to_post_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now - batch.profile_enqueue_time)
+                .count());
+        const auto ready_to_post_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now - batch.profile_ready_time)
+                .count());
+        ++profile_dependency_batches_;
+        profile_dependency_enqueue_to_post_ns_ += enqueue_to_post_ns;
+        profile_dependency_enqueue_to_post_max_ns_ =
+            std::max(profile_dependency_enqueue_to_post_max_ns_,
+                     enqueue_to_post_ns);
+        profile_dependency_ready_to_post_ns_ += ready_to_post_ns;
+        profile_dependency_ready_to_post_max_ns_ =
+            std::max(profile_dependency_ready_to_post_max_ns_,
+                     ready_to_post_ns);
+      }
     }
+    std::chrono::steady_clock::time_point atomic_post_start;
+    if (profile_commands_) atomic_post_start = std::chrono::steady_clock::now();
     post_atomic_operations(ctx_, batch.wrs, batch.cmds, ctxs_for_all_ranks_,
                            cfg_.rank, cfg_.thread_idx, acked_wrs_,
                            cfg_.use_normal_mode);
+    if (profile_commands_) {
+      const auto post_done = std::chrono::steady_clock::now();
+      ++profile_atomic_post_calls_;
+      profile_atomic_post_wrs_ += batch.wrs.size();
+      profile_atomic_post_ns_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              post_done - atomic_post_start)
+              .count());
+      for (auto wr_id : batch.wrs) {
+        profile_wr_post_time_[wr_id] = post_done;
+        profile_wr_post_type_[wr_id] = CmdType::ATOMIC;
+      }
+    }
     clear_atomic_batch_deps(batch);
     pending_atomic_batches_.pop_front();
   }
@@ -1265,9 +1341,24 @@ void Proxy::post_gpu_commands_mixed(
   // the device-issued QUIET.
   auto flush_writes = [&]() {
     if (rdma_wrs.empty()) return;
+    std::chrono::steady_clock::time_point write_post_start;
+    if (profile_commands_) write_post_start = std::chrono::steady_clock::now();
     post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
                             cfg_.thread_idx, cfg_.use_normal_mode);
+    if (profile_commands_) {
+      const auto post_done = std::chrono::steady_clock::now();
+      ++profile_write_post_calls_;
+      profile_write_post_wrs_ += rdma_wrs.size();
+      profile_write_post_ns_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              post_done - write_post_start)
+              .count());
+      for (auto wr_id : rdma_wrs) {
+        profile_wr_post_time_[wr_id] = post_done;
+        profile_wr_post_type_[wr_id] = CmdType::WRITE;
+      }
+    }
     inflight_write_wrs_.insert(rdma_wrs.begin(), rdma_wrs.end());
     // A WRITE_WITH_IMM piggyback count and a later ordered finish ATOMIC use
     // the same per-(dst, tail word) sequence. The receiver applies the finish
@@ -1638,7 +1729,7 @@ void Proxy::dump_command_profile() const {
       seconds > 0.0
           ? static_cast<double>(profile_write_bytes_) / seconds / 1.0e9
           : 0.0;
-  char line[4096];
+  char line[6144];
   int const n = std::snprintf(
       line, sizeof(line),
       "UCCL_PROXY_PROFILE rank=%d thread=%d normal=%d rings=%zu "
@@ -1647,11 +1738,23 @@ void Proxy::dump_command_profile() const {
       "atomic_cmds=%llu quiet_cmds=%llu "
       "barrier_cmds=%llu completed_wrs=%llu posted_atomic_wrs=%llu "
       "coalesced_atomic_wrs=%llu poll_us=%llu progress_atomic_us=%llu "
-      "post_gpu_us=%llu mixed_ns=%llu dependency_scan_ns=%llu "
+      "post_gpu_us=%llu mixed_ns=%llu "
+      "write_post_calls=%llu write_post_wrs=%llu write_post_ns=%llu "
+      "atomic_post_calls=%llu atomic_post_wrs=%llu atomic_post_ns=%llu "
+      "write_cqe_wrs=%llu write_cqe_ns=%llu write_cqe_max_ns=%llu "
+      "atomic_cqe_wrs=%llu atomic_cqe_ns=%llu atomic_cqe_max_ns=%llu "
+      "dependency_scan_ns=%llu "
       "dependency_candidates=%llu dependency_active=%llu dependency_max=%llu "
+      "dependency_batches=%llu dependency_enqueue_to_post_ns=%llu "
+      "dependency_enqueue_to_post_max_ns=%llu dependency_ready_to_post_ns=%llu "
+      "dependency_ready_to_post_max_ns=%llu "
       "receiver_atomic_cqes=%llu receiver_atomic_in_order=%llu "
       "receiver_atomic_buffered=%llu receiver_atomic_drained=%llu "
       "receiver_atomic_max_buffered=%llu "
+      "receiver_atomic_process_ns=%llu "
+      "receiver_atomic_process_max_ns=%llu "
+      "receiver_atomic_commits=%llu receiver_atomic_commit_ns=%llu "
+      "receiver_atomic_commit_max_ns=%llu "
       "merge_profile_enabled=%d stream_remote_runs=%llu stream_remote_tokens=%llu "
       "stream_remote_max=%llu stream_local_runs=%llu stream_local_tokens=%llu "
       "stream_local_max=%llu semantic_remote_runs=%llu "
@@ -1682,15 +1785,37 @@ void Proxy::dump_command_profile() const {
       static_cast<unsigned long long>(profile_progress_atomic_us_),
       static_cast<unsigned long long>(profile_post_gpu_us_),
       static_cast<unsigned long long>(profile_mixed_ns_),
+      static_cast<unsigned long long>(profile_write_post_calls_),
+      static_cast<unsigned long long>(profile_write_post_wrs_),
+      static_cast<unsigned long long>(profile_write_post_ns_),
+      static_cast<unsigned long long>(profile_atomic_post_calls_),
+      static_cast<unsigned long long>(profile_atomic_post_wrs_),
+      static_cast<unsigned long long>(profile_atomic_post_ns_),
+      static_cast<unsigned long long>(profile_write_cqe_wrs_),
+      static_cast<unsigned long long>(profile_write_cqe_ns_),
+      static_cast<unsigned long long>(profile_write_cqe_max_ns_),
+      static_cast<unsigned long long>(profile_atomic_cqe_wrs_),
+      static_cast<unsigned long long>(profile_atomic_cqe_ns_),
+      static_cast<unsigned long long>(profile_atomic_cqe_max_ns_),
       static_cast<unsigned long long>(profile_dependency_scan_ns_),
       static_cast<unsigned long long>(profile_dependency_candidates_),
       static_cast<unsigned long long>(profile_dependency_active_),
       static_cast<unsigned long long>(profile_dependency_max_),
+      static_cast<unsigned long long>(profile_dependency_batches_),
+      static_cast<unsigned long long>(profile_dependency_enqueue_to_post_ns_),
+      static_cast<unsigned long long>(profile_dependency_enqueue_to_post_max_ns_),
+      static_cast<unsigned long long>(profile_dependency_ready_to_post_ns_),
+      static_cast<unsigned long long>(profile_dependency_ready_to_post_max_ns_),
       static_cast<unsigned long long>(ctx_.profile_receiver_atomic_cqes),
       static_cast<unsigned long long>(ctx_.profile_receiver_atomic_in_order),
       static_cast<unsigned long long>(ctx_.profile_receiver_atomic_buffered),
       static_cast<unsigned long long>(ctx_.profile_receiver_atomic_drained),
       static_cast<unsigned long long>(ctx_.profile_receiver_atomic_max_buffered),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_process_ns),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_process_max_ns),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_commits),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_commit_ns),
+      static_cast<unsigned long long>(ctx_.profile_receiver_atomic_commit_max_ns),
       profile_merge_opportunity_ ? 1 : 0,
       static_cast<unsigned long long>(profile_stream_remote_runs_),
       static_cast<unsigned long long>(profile_stream_remote_run_tokens_),

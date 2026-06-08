@@ -47,6 +47,16 @@ enum DispatchClockCounter : uint32_t {
   kDispatchClockForwardTailReadyEvents,
   kDispatchClockForwardTailStallEvents,
   kDispatchClockForwardTailStallCycles,
+  // On a stalled first check, after one fresh tail read:
+  // - selected ready: local cached state was stale, but the chosen source had
+  //   already progressed by the time we refreshed.
+  // - other ready: chosen source was not ready but another source was; this is
+  //   source-selection head-of-line blocking.
+  // - no ready: no source had data/finish visible yet; this points at delivery
+  //   or receiver-apply lag.
+  kDispatchClockForwardTailFreshSelectedReadyEvents,
+  kDispatchClockForwardTailFreshOtherReadyEvents,
+  kDispatchClockForwardTailFreshNoReadyEvents,
   kDispatchClockNumCounters
 };
 
@@ -72,6 +82,39 @@ enum DispatchChunkFlushReason : uint32_t {
   kDispatchChunkFlushReasonNonContig = 0,
   kDispatchChunkFlushReasonFull,
   kDispatchChunkFlushReasonFinish
+};
+
+enum CombineProfileCounter : uint32_t {
+  kCombineProfileScaleupWaitCycles = 0,
+  kCombineProfileScaleupWaitEvents,
+  kCombineProfileReduceCycles,
+  kCombineProfileReduceEvents,
+  kCombineProfileD2HCycles,
+  kCombineProfileD2HEvents,
+  kCombineProfileFinishD2HCycles,
+  kCombineProfileFinishD2HEvents,
+  kCombineProfileFinishWaitCycles,
+  kCombineProfileFinishWaitEvents,
+  kCombineProfileRemotePuts,
+  kCombineProfileTransitions,
+  kCombineProfileSameDstTransitions,
+  kCombineProfileLocalContiguousTransitions,
+  kCombineProfileRemoteContiguousTransitions,
+  kCombineProfileBothContiguousTransitions,
+  kCombineProfileRuns,
+  kCombineProfileRunBin1,
+  kCombineProfileRunBin2,
+  kCombineProfileRunBin3To4,
+  kCombineProfileRunBin5To8,
+  kCombineProfileRunBin9To16,
+  kCombineProfileRunBin17To32,
+  kCombineProfileRunBinGt32,
+  kCombineProfileBreakDst,
+  kCombineProfileBreakLocalGap,
+  kCombineProfileBreakRemoteGap,
+  kCombineProfileD2HMaxPacked,
+  kCombineProfileFinishWaitMaxPacked,
+  kCombineProfileNumCounters
 };
 
 struct UCCLGinResources {
@@ -171,6 +214,52 @@ __device__ __forceinline__ uint32_t dispatch_chunk_reason_counter(uint32_t reaso
   if (reason == kDispatchChunkFlushReasonFull) return kDispatchChunkFlushFull;
   if (reason == kDispatchChunkFlushReasonFinish) return kDispatchChunkFlushFinish;
   return kDispatchChunkFlushNonContig;
+}
+
+__device__ __forceinline__ void combine_profile_add(
+    uint64_t* counters, uint32_t counter, uint64_t value) {
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+#if defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+  if ((blockIdx.x & 7u) != 0) return;
+#endif
+  if (counters != nullptr && counter < kCombineProfileNumCounters && value != 0) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(counters + counter),
+              static_cast<unsigned long long>(value));
+  }
+#else
+  (void)counters;
+  (void)counter;
+  (void)value;
+#endif
+}
+
+__device__ __forceinline__ void combine_profile_max(
+    uint64_t* counters, uint32_t counter, uint64_t cycles, uint64_t detail) {
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+#if defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+  if ((blockIdx.x & 7u) != 0) return;
+#endif
+  if (counters != nullptr && counter < kCombineProfileNumCounters && cycles != 0) {
+    const auto packed = dispatch_clock_pack_max(cycles, detail);
+    atomicMax(reinterpret_cast<unsigned long long*>(counters + counter),
+              static_cast<unsigned long long>(packed));
+  }
+#else
+  (void)counters;
+  (void)counter;
+  (void)cycles;
+  (void)detail;
+#endif
+}
+
+__device__ __forceinline__ uint32_t combine_profile_run_bin(uint32_t count) {
+  if (count <= 1) return kCombineProfileRunBin1;
+  if (count == 2) return kCombineProfileRunBin2;
+  if (count <= 4) return kCombineProfileRunBin3To4;
+  if (count <= 8) return kCombineProfileRunBin5To8;
+  if (count <= 16) return kCombineProfileRunBin9To16;
+  if (count <= 32) return kCombineProfileRunBin17To32;
+  return kCombineProfileRunBinGt32;
 }
 #endif
 

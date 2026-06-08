@@ -746,6 +746,7 @@ hybrid_dispatch_impl(
             // Wait for this rank to have data (or finish)
 #if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
             const auto profile_tail_wait_start = lane_idx == 0 ? clock64() : 0;
+            bool profile_tail_fresh_recorded = false;
             // Discriminator: replicate the timeout_while first check WITHOUT
             // re-reading the tail. If the chosen src rank already has data/finish
             // visible from the previous round, the forward warp is NOT starved
@@ -786,6 +787,27 @@ hybrid_dispatch_impl(
 #endif
                 }
                 __syncwarp();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+                if (not profile_tail_ready and not profile_tail_fresh_recorded) {
+                    const uint32_t fresh_arrived_or_finished =
+                        stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
+                    const uint32_t fresh_ready_mask = ptx::gather(fresh_arrived_or_finished);
+                    if (lane_idx == 0) {
+                        constexpr uint32_t valid_scaleout_mask =
+                            kNumScaleoutRanks == 32 ? 0xffffffffu : ((1u << kNumScaleoutRanks) - 1u);
+                        const uint32_t valid_fresh_ready_mask = fresh_ready_mask & valid_scaleout_mask;
+                        const uint32_t selected_mask = 1u << recv_scaleout_rank_idx;
+                        if (valid_fresh_ready_mask & selected_mask) {
+                            profile_inc(uccl_gin::kDispatchClockForwardTailFreshSelectedReadyEvents);
+                        } else if (valid_fresh_ready_mask & ~selected_mask) {
+                            profile_inc(uccl_gin::kDispatchClockForwardTailFreshOtherReadyEvents);
+                        } else {
+                            profile_inc(uccl_gin::kDispatchClockForwardTailFreshNoReadyEvents);
+                        }
+                    }
+                    profile_tail_fresh_recorded = true;
+                }
+#endif
                 return false;
             });
 #if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
@@ -1091,6 +1113,14 @@ hybrid_dispatch_impl(
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailReadyEvents]),
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailStallEvents]),
                static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailStallCycles]));
+        printf("UCCL_GIN_DISPATCH_CLOCK_FRESH rank=%d "
+               "forward_tail_fresh_selected_ready_events=%llu "
+               "forward_tail_fresh_other_ready_events=%llu "
+               "forward_tail_fresh_no_ready_events=%llu\n",
+               rank_idx,
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailFreshSelectedReadyEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailFreshOtherReadyEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kDispatchClockForwardTailFreshNoReadyEvents]));
     }
 #endif
 

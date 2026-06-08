@@ -100,6 +100,9 @@ class Proxy {
     std::vector<TransferCmd> cmds;
     std::vector<uint64_t> dep_wrs;
     size_t pending_writes = 0;
+    bool profile_dependency_batch = false;
+    std::chrono::steady_clock::time_point profile_enqueue_time;
+    std::chrono::steady_clock::time_point profile_ready_time;
   };
 
   ProxyCtx ctx_;
@@ -123,6 +126,7 @@ class Proxy {
              std::vector<uint64_t> release_wrs);
   void quiet_cq(std::vector<uint64_t> release_wrs);
   void wait_for_cq(std::vector<uint64_t> release_wrs, bool include_all_writes);
+  void profile_record_completion(uint64_t wr_id);
   void retire_inflight_write(uint64_t wr_id);
   void clear_atomic_batch_deps(PendingAtomicBatch& batch);
   void enqueue_pending_atomics(std::vector<uint64_t>& wrs,
@@ -167,10 +171,27 @@ class Proxy {
   uint64_t profile_progress_atomic_us_ = 0;
   uint64_t profile_post_gpu_us_ = 0;
   uint64_t profile_mixed_ns_ = 0;
+  uint64_t profile_write_post_calls_ = 0;
+  uint64_t profile_write_post_wrs_ = 0;
+  uint64_t profile_write_post_ns_ = 0;
+  uint64_t profile_atomic_post_calls_ = 0;
+  uint64_t profile_atomic_post_wrs_ = 0;
+  uint64_t profile_atomic_post_ns_ = 0;
+  uint64_t profile_write_cqe_wrs_ = 0;
+  uint64_t profile_write_cqe_ns_ = 0;
+  uint64_t profile_write_cqe_max_ns_ = 0;
+  uint64_t profile_atomic_cqe_wrs_ = 0;
+  uint64_t profile_atomic_cqe_ns_ = 0;
+  uint64_t profile_atomic_cqe_max_ns_ = 0;
   uint64_t profile_dependency_scan_ns_ = 0;
   uint64_t profile_dependency_candidates_ = 0;
   uint64_t profile_dependency_active_ = 0;
   uint64_t profile_dependency_max_ = 0;
+  uint64_t profile_dependency_batches_ = 0;
+  uint64_t profile_dependency_enqueue_to_post_ns_ = 0;
+  uint64_t profile_dependency_enqueue_to_post_max_ns_ = 0;
+  uint64_t profile_dependency_ready_to_post_ns_ = 0;
+  uint64_t profile_dependency_ready_to_post_max_ns_ = 0;
   uint64_t profile_stream_remote_runs_ = 0;
   uint64_t profile_stream_remote_run_tokens_ = 0;
   uint64_t profile_stream_remote_run_max_ = 0;
@@ -220,6 +241,9 @@ class Proxy {
   std::vector<uint64_t> atomic_dependency_wrs_;
   std::vector<uint64_t> coalesced_atomic_wrs_;
   std::vector<TransferCmd> coalesced_atomic_cmds_;
+  std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
+      profile_wr_post_time_;
+  std::unordered_map<uint64_t, CmdType> profile_wr_post_type_;
 
 #ifdef USE_MSCCLPP_FIFO_BACKEND
   std::vector<uint64_t> fifo_seq_;
