@@ -1,5 +1,55 @@
 # Worklog
 
+## 2026-06-07: CX7 (GDAKI) vs EFA (proxy GIN) — GIN put microbenchmark
+
+### 背景
+
+拿到两台 GH200 + CX7 400G NDR InfiniBand 机器 (`gh200_0`/`gh200_1`，
+hostname `mi-sky-gh200-1`/`mi-sky-gh200-2`)，想和现有 P5en EFA 做一个
+apple-to-apple GIN put benchmark 对比。
+
+### 环境搭建
+
+- **GH200**: Grace-Hopper aarch64，CUDA 12.0 太旧不能直接 build NCCL 2.30.4。
+  最终用 Docker `nvidia/cuda:13.2.0-devel-ubuntu24.04` 编译，提取 CUDA 13.2
+  runtime libs 到 host 运行。NCCL 2.30.4 来自 pip `nvidia-nccl-cu13` (同样 aarch64)。
+- **P5en**: x86_64，已有 CUDA 13.0 / NCCL 2.30.4 / aws-ofi-nccl master / MPI，
+  直接 build。
+
+关键发现：aarch64 glibc 的 `<bits/math-vector.h>` (SVE types) 在 nvcc 12.0
+下无法编译，只能靠 Docker + CUDA 13.2 nvcc 绕过。
+
+### 结果摘要
+
+CX7 GDAKI (native IB) 对 EFA proxy GIN (2 rails, 400 Gbps 总带宽) 的对比：
+
+| 指标 | CX7 GDAKI | EFA proxy | CX7/EFA |
+|------|-----------|-----------|---------|
+| 大包峰值 (1 GiB, remote) | 48.43 GB/s | 41.67 GB/s | 1.16× |
+| 小消息 1 KiB | 25.53 GB/s | 0.94 GB/s | **27.2×** |
+| 小消息 4 KiB | 48.95 GB/s | 3.81 GB/s | **12.8×** |
+| 小消息 8 KiB | 49.56 GB/s | 7.61 GB/s | **6.5×** |
+| 小消息 16 KiB | 49.22 GB/s | 14.92 GB/s | **3.3×** |
+| 小消息 32 KiB | 49.55 GB/s | 26.20 GB/s | 1.89× |
+| 饱和消息大小 | 2 KiB | 128 KiB | 64× |
+
+详细报告: `ep/docs/uccl_gin_perf_cx7_vs_efa.md`
+
+### 关键结论
+
+1. **DeepEP 典型 7-8 KiB 消息粒度下 CX7 是 EFA 的 6-8×**，根因是 EFA proxy 路径
+   每消息有 ~3-5 µs CPU 开销 (CQ poll/proxy progress/SRD reorder)。
+2. CX7 GDAKI 可以不经 coalescing 在 2 KiB 直接到达线速；EFA proxy 需要
+   aggressive coalescing 才能接近可用性能。
+3. EFA proxy 大包性能可接受 (83% of 400G)，但小消息差距无法靠增加 rails 弥补。
+4. 这验证了之前 EFA dispatch profiling 的瓶颈诊断 (3-6 GB/s SO)：proxy 的
+   per-message 开销是根因，不是网卡带宽不够。
+
+### 原始数据位置
+
+- CX7: `/tmp/gin_bench_*` 在 `gh200_0`，EFA: `/tmp/gin_bench_efa_*` 在 `p5en_0`
+- 报告: `ep/docs/uccl_gin_perf_cx7_vs_efa.md`
+
 ## 2026-06-05: UCCL-GIN dispatch ordering cleanup and V2 receiver readiness guard
 
 ### 背景
@@ -4822,3 +4872,456 @@ combine 调用，因此也覆盖了当前同步执行模型下的跨 iteration t
 /tmp/deepep_jit_combine_followup_rank0
 /tmp/deepep_jit_combine_followup_rank1
 ```
+
+## 2026-06-07: 重写 UCCL-GIN 性能计划
+
+根据当前代码与最新验证结果，重写 `ep/docs/uccl_gin_perf_plan.md`:
+
+- 从仅讨论 dispatch 改为同时覆盖 dispatch 与已经跑通的 combine。
+- 固定当前 README-like EP8x2 基线:
+  - dispatch/cached dispatch `37-38 GB/s SO`；
+  - combine `28-30 GB/s SO`；
+  - reduced combine `~31 GB/s SO`。
+- 将已经完成或证伪的方向移出首要路径:
+  - dispatch compact chunk sweep 已确认 4-token 最优；
+  - compact32 平均不足 32 不是 non-contiguous flush bug；
+  - sender dependency 已收窄；
+  - proxy thread、ring size、inflight cap、receiver reorder lookup 均不是当前主瓶颈；
+  - `rail_is_combine` 在 normal-mode inert；
+  - 当前同步协议不需要 per-iteration host quiet。
+- 将下一阶段最高优先级改为 combine critical-path profile:
+  - kernel 阶段分解；
+  - local/remote pointer 连续 run 和 merge opportunity；
+  - plain WRITE / finish dependency latency。
+- combine batching 只有在 profile 证明连续性机会足够后才实施，优先 direct contiguous
+  multi-token WRITE，不预先引入新 staging buffer，也不改变 V2 receiver layout。
+- dispatch 下一阶段转向 forward critical path:
+  - 轻量 tail/payload latency discriminator；
+  - `kNumSlotsPerForwardChunk=3` 对 compact publication=4 的消费粒度 sweep；
+  - source/channel head-of-line blocking profile。
+- 明确 CPU steady clock 与 GPU `clock64()` 不可直接相减；跨域端到端归因必须先做
+  tagged sequence 和时钟校准，否则只分别分析 CPU/GPU 区间。
+- 增加统一实验记录格式和量化验收线，避免低于噪声的微优化被当作性能进展。
+
+## 2026-06-07: 开始执行新性能计划 P1 combine profiling
+
+### 假设
+
+当前 combine `28-30 GB/s SO / ~4 ms` 明显慢于 dispatch `37-38 GB/s SO`，但尚未
+分清主要时间来自 reduce/TMA、每 token D2H put、finish dependency 还是 receiver
+finish wait。Combine 两个真实 put call site 是否存在足够的 local/remote 连续 run
+也未知，不能在没有数据时直接实现 compact staging。
+
+### 本地改动
+
+新增默认零开销、仅由 `UCCL_GIN_COMBINE_PROFILE=1` 开启的 JIT profiling:
+
+- `ep/include/uccl_gin/resources.cuh`
+  - 新增 combine clock / merge-opportunity counters 与 profile helper。
+- `thirdparty/DeepEP-v2-d4f41e4/deep_ep/buffers/elastic.py`
+  - 环境变量自动追加 `-DDEEPEP_UCCL_GIN_COMBINE_PROFILE`。
+- `hybrid_combine.cuh`
+  - 统计 scale-up wait、reduce、D2H put、finish D2H、finish wait；
+  - 统计真实 remote put 序列的 same-dst、local contiguous、remote contiguous、
+    both-contiguous transition；
+  - 统计 both-contiguous run-length histogram 与 break reason；
+  - 输出中带 `expanded` / `multiple_reduction`，区分普通与 reduced combine JIT 实例。
+
+Counters 复用 `atomic_tail_base` 中 compact tail 区域之后的 scratch，不新增 buffer、
+command、wire 字段或 host API。Profiling 开启时 kernel 末尾增加 grid sync 以获得完整
+计数，因此其 headline BW 只用于观察侵入性，不能作为优化前后性能结论。
+
+### 当前状态
+
+```text
+git diff --check: pass
+服务器 build/JIT/runtime: 尚未验证
+```
+
+## 2026-06-07: P1.2 combine merge opportunity 结果与 P1.3 开始
+
+### 服务器验证
+
+顺序构建和两节点 README-like EP8x2 profiling 均退出 `0`。
+
+```text
+build:
+  /tmp/uccl_gin_combine_p1_build.log
+  /tmp/uccl_gin_combine_p1_install.log
+
+runtime:
+  /tmp/uccl_gin_combine_p1_rank0.log
+  /tmp/uccl_gin_combine_p1_rank1.log
+
+extracted profile:
+  /tmp/uccl_gin_combine_p1_profile_rank0.txt
+  /tmp/uccl_gin_combine_p1_profile_rank1.txt
+
+fresh JIT cache:
+  /tmp/deepep_jit_combine_p1_rank0
+  /tmp/deepep_jit_combine_p1_rank1
+```
+
+Profiling 开启时 combine headline 膨胀到约 `132-168 ms / ~1 GB/s`，原因是首版
+profile 对每个 token/transition 都执行 host-mapped atomic。因此 clock 周期只能观察
+相对长尾，不能作为正常路径的耗时占比。
+
+### P1.2 决定性结果
+
+rank0 聚合的两个实际 JIT 实例:
+
+```text
+mode expanded=0, multiple_reduction=1:
+  samples=496, remote_puts/kernel=8155.1
+  same_dst=100.00%, local_contig=66.54%, remote_contig=0.00%
+  both_contig=0.00%, run_1=100.00%
+
+mode expanded=1, multiple_reduction=1:
+  samples=496, remote_puts/kernel=8155.1
+  same_dst=100.00%, local_contig=66.54%, remote_contig=0.00%
+  both_contig=0.00%, run_1=100.00%
+```
+
+根因来自当前 V2 combine replay layout:
+
+```text
+local ptr 约 2/3 随 replay slot i 连续；
+remote ptr 使用 src_token_idx，当前 emission order 中每次都跳跃。
+```
+
+所以普通 RDMA WRITE 无法直接合并多个 token。Proxy coalescing 和
+`ncclGinOptFlagsAggregateRequests` 都不能把连续 local bytes scatter 到不连续 remote
+slot。原计划中的 direct contiguous batch 被数据否定，不能继续直接实现。
+
+### P1.3 改动
+
+为 pending finish atomic batch 增加仅在 `UCCL_PROXY_PROFILE_COMMANDS=1` 时记录的
+低开销延迟:
+
+```text
+dependency_batches
+dependency_enqueue_to_post_ns / max
+dependency_ready_to_post_ns / max
+```
+
+当前协议中，带 plain WRITE dependencies 的 atomic batch 对应 combine finish:
+
+- `enqueue -> post`: finish 等 payload CQE 的总时间；
+- `ready -> post`: 最后一条 dependency 完成后，proxy progress 到真正 post 的调度延迟。
+
+默认路径不读取时钟，也不改变 command、wire、ordering 或 layout。下一步在服务器仅开
+proxy profile 跑 README-like EP8x2，以正常 combine kernel 测量 finish dependency。
+
+### P1.3 服务器结果
+
+同步后顺序 build/install 通过:
+
+```text
+/tmp/uccl_gin_combine_p13_build.log
+/tmp/uccl_gin_combine_p13_install.log
+```
+
+首次运行未进入 benchmark。两台当前实例的私网地址已经变化:
+
+```text
+旧记录:
+  p5en_0 = 172.31.78.36
+  p5en_1 = 172.31.72.96
+
+当前:
+  p5en_0 = 172.31.70.225
+  p5en_1 = 172.31.71.140
+```
+
+使用旧 `MASTER_ADDR=172.31.78.36` 时，torch TCPStore 报 `No route to host`。停止本轮
+自己的测试进程后，改用 `172.31.70.225:29678` 重跑成功。
+
+成功日志与 fresh JIT cache:
+
+```text
+/tmp/uccl_gin_combine_p13b_rank0.log
+/tmp/uccl_gin_combine_p13b_rank1.log
+/tmp/deepep_jit_combine_p13b_rank0
+/tmp/deepep_jit_combine_p13b_rank1
+```
+
+两端退出 `0`。只开启 `UCCL_PROXY_PROFILE_COMMANDS=1`，未开启侵入式 GPU combine
+profile。普通 combine 保持约 `27-29 GB/s SO / 4.1-4.3 ms`；reduced combine 在
+proxy profile 开启时下降到 `16-19 GB/s / 6.3-7.3 ms`，说明该累计 profile 对 reduced
+路径仍有明显扰动，不能用其 headline 作为正常性能。
+
+聚合 finish dependency:
+
+```text
+node0:
+  batches=72,204
+  enqueue -> post avg/max = 126.485 / 518.638 us
+  ready -> post avg/max   =  14.639 / 461.211 us
+
+node1:
+  batches=74,087
+  enqueue -> post avg/max = 123.502 / 462.266 us
+  ready -> post avg/max   =  13.863 / 268.134 us
+```
+
+结论:
+
+- finish 等 payload CQE 的平均总延迟约 `0.12 ms`，只占普通 combine `4.1-4.3 ms`
+  的约 `3%`；
+- dependencies 已 ready 后 proxy 再 post finish 的平均调度延迟约 `14 us`；
+- finish dependency / pending atomic container 不是当前 combine 主瓶颈；
+- combine 后续应集中于每 token reduce/TMA、D2H emission 和约 `8155` 条不连续
+  payload WRITE；
+- P1.3 completed，下一步执行低侵入阶段分解和 dispatch P3.2 sweep。
+
+## 2026-06-07: P3.2 dispatch forward consume 粒度 sweep
+
+### 改动
+
+为 `hybrid_dispatch.cuh` 增加编译期开关:
+
+```text
+DEEPEP_UCCL_GIN_FORWARD_CHUNK_SLOTS
+```
+
+它只改变 forward warp 在 tail 已发布后每轮最多消费的 slot 数，不改变 sender
+publication、wire command、tail/count、receiver layout 或 buffer size。NCCL-GIN
+保持上游默认 `3`。
+
+首次 sweep JIT 编译失败，因为模板默认参数中的宏表达式未加括号，展开后的 `>` 被模板
+解析器解释成结束符。修正为括号表达式后，JIT 与运行通过。
+
+### 结果
+
+README-like EP8x2，fresh JIT cache，`--skip-check` performance discriminator:
+
+```text
+slots=4:
+  node0 cached dispatch: 36 GB/s, 1.688-1.697 ms
+  node1 cached dispatch: 36-37 GB/s, 1.668-1.682 ms
+
+slots=6:
+  node0 cached dispatch: 38 GB/s, 1.590-1.609 ms
+  node1 cached dispatch: 38-39 GB/s, 1.574-1.590 ms
+
+slots=8:
+  node0 cached dispatch: 37-38 GB/s, 1.619-1.644 ms
+  node1 cached dispatch: 38-39 GB/s, 1.582-1.621 ms
+```
+
+日志与 cache:
+
+```text
+/tmp/uccl_gin_fwd4_rank{0,1}.log
+/tmp/uccl_gin_fwd6_rank{0,1}.log
+/tmp/uccl_gin_fwd8_rank{0,1}.log
+/tmp/deepep_jit_fwd{4,6,8}_rank{0,1}
+```
+
+### Apples-to-apples 补测与最终结论
+
+首次 `slots=3` 因模板表达式解析失败，没有形成有效 baseline。补跑修正后的显式
+`slots=3`:
+
+```text
+slots=3:
+  node0 avg 1.632 ms
+  node1 avg 1.624 ms
+
+slots=6:
+  node0 avg 1.602 ms, improvement 1.9%
+  node1 avg 1.583 ms, improvement 2.5%
+```
+
+补测日志:
+
+```text
+/tmp/uccl_gin_fwd3b_rank0.log
+/tmp/uccl_gin_fwd3b_rank1.log
+/tmp/deepep_jit_fwd3b_rank0
+/tmp/deepep_jit_fwd3b_rank1
+```
+
+`slots=6` 的真实收益低于计划规定的 `3%` 保留门槛。删除实验宏并恢复上游默认
+`kNumSlotsPerForwardChunk=kScaleoutUpdateInterval=3`，不给主路径留下低收益调参代码。
+P3.2 completed and downgraded；forward consume 粒度不是当前主要 gap。
+
+在得出最终结论前，曾用默认 `slots=6` 跑完整 correctness，两端退出 `0`:
+
+```text
+/tmp/uccl_gin_fwd6_correct_rank0.log
+/tmp/uccl_gin_fwd6_correct_rank1.log
+/tmp/deepep_jit_fwd6_correct_rank0
+/tmp/deepep_jit_fwd6_correct_rank1
+```
+
+该 run 中 cached dispatch 为 `37-38 GB/s / 1.59-1.64 ms`，normal combine
+`28-30 GB/s`，reduced combine `31-32 GB/s`，无 timeout、CUDA fault 或 assertion。
+它证明更大 consume 粒度 correctness 可行，但性能不足以保留。
+
+## 2026-06-08: Combine AggregateRequests cap 与 clock-only profile
+
+### 假设与边界
+
+Combine merge-opportunity profile 已证明当前 emission order 中:
+
+```text
+same_dst=100%
+remote_contiguous=0%
+both_contiguous=0%
+run length=1
+```
+
+因此 `ncclGinOptFlagsAggregateRequests` 不能直接把多个普通 RDMA WRITE 合成一个连续
+WRITE。仍值得验证的较小假设是:带 aggregate hint 的 payload put 是否被
+`kUCCLGinMaxInflightNormal=8` 过度节流。
+
+没有实现“把 finish piggyback 到最后 payload”。原因是 EFA SRD 不保证多个离散 WR
+按到达顺序落地；最后发出的 payload 到达不能证明此前 payload 已全部到达。当前
+standalone finish 的 sender-side completion dependency 提供了这项保证，而且此前
+profile 显示其平均只占 combine wall time 约 `3%`。
+
+### AggregateRequests 专用 cap sweep
+
+临时改动:
+
+- `rail_put` 接受可选 `max_inflight`；
+- UCCL-GIN handle 对带 `ncclGinOptFlagsAggregateRequests` 的 put 使用独立 JIT cap；
+- 普通 put 与 dispatch compact/piggyback 路径保持不变。
+
+首次 cap=8 JIT 失败:
+
+```text
+uccl_gin_handle.cuh:113: expected an identifier
+uccl_gin::8
+```
+
+根因是 `kUCCLGinMaxInflightNormal` 本身是宏，限定名被预处理成非法
+`uccl_gin::8`。修正实验配置表达后，四组均成功运行。
+
+README-like EP8x2，fresh JIT cache，`--skip-check`:
+
+```text
+aggregate cap   跨节点最慢普通 combine
+8               4.166 ms
+16              4.182 ms
+32              4.171 ms
+64              4.166 ms
+```
+
+日志:
+
+```text
+/tmp/uccl_gin_aggcap{8,16,32,64}_rank0.log
+/tmp/uccl_gin_aggcap{8,16,32,64}_rank1.log
+/tmp/deepep_jit_aggcap{8,16,32,64}_rank{0,1}
+```
+
+结论:没有提升或稳定趋势。按“无收益即回退”原则，完整删除 aggregate 专用 cap
+实验代码。
+
+### Normal put unlimited cap discriminator
+
+不改代码，仅用 JIT flag:
+
+```text
+EP_JIT_EXTRA_FLAGS=-DUCCL_GIN_MAX_INFLIGHT_NORMAL=0
+```
+
+这使所有 normal put 只受 2048-slot D2H ring 容量限制。两节点均退出 `0`:
+
+```text
+cached dispatch: 约 38 GB/s, 最慢约 1.626 ms
+normal combine:  约 28-29 GB/s, 最慢约 4.171 ms
+reduced combine: 约 31 GB/s, 最慢约 3.783 ms
+```
+
+日志与 cache:
+
+```text
+/tmp/uccl_gin_normalcap0_rank0.log
+/tmp/uccl_gin_normalcap0_rank1.log
+/tmp/deepep_jit_normalcap0_rank0
+/tmp/deepep_jit_normalcap0_rank1
+```
+
+结论:cap=8 不是 combine 或 dispatch 当前 wall-time 根因；不保留 cap=0，也不再优先
+调 ring depth / inflight cap。
+
+### P1.1 clock-only 采样 profile
+
+原 `UCCL_GIN_COMBINE_PROFILE=1` 同时做逐 token merge 统计和阶段 clock atomic，使
+普通 combine 膨胀到 `132-168 ms`。新增默认关闭的
+`UCCL_GIN_COMBINE_CLOCK_PROFILE=1`:
+
+- 复用现有阶段 counters；
+- 禁用 merge-opportunity 逐 token 统计；
+- 仅采样 `blockIdx.x % 8 == 0` 的 SM；
+- profiling-off 路径不变。
+
+运行成功，但普通 combine 仍被放大到约 `14.6-15.1 ms`，reduced combine 约
+`18.4-19.1 ms`。因此不能用该 run 的 headline BW；事件均值只作为方向判别。
+
+代表性稳定样本:
+
+```text
+node0:
+  scaleup wait 约 2.6k cycles/event
+  reduce       约 78k cycles/event
+  D2H put      约 62k cycles/event
+  finish D2H   约 52k cycles/event
+
+node1:
+  reduce       约 60-93k cycles/event
+  D2H put      约 42-60k cycles/event
+  finish wait 受慢节点/采样扰动影响，长尾明显
+```
+
+日志与 cache:
+
+```text
+/tmp/uccl_gin_combine_clock_rank0.log
+/tmp/uccl_gin_combine_clock_rank1.log
+/tmp/deepep_jit_combine_clock_rank0
+/tmp/deepep_jit_combine_clock_rank1
+```
+
+结论:
+
+- scale-up wait 通常不是主成本；
+- per-token reduce 与 D2H emission 都不可忽略；
+- 放宽 D2H cap 已被独立实验否定，不能把 D2H cycles 简单解释成 cap 背压；
+- 下一步执行 P2.1:只做 profile 模拟，在窗口 `4/8/16/32` 内判断按 remote
+  `src_token_idx` 有界重排后能否创造足够的 contiguous run，再决定是否值得改 kernel。
+
+### 回退后最终完整 correctness
+
+将 aggregate 专用 cap 实验代码完整回退并同步服务器后，关闭全部 profiling，使用
+fresh JIT cache 跑 README-like EP8x2 完整 correctness。两节点均退出 `0`，未出现
+timeout、CUDA fault 或 assertion:
+
+```text
+cached dispatch:
+  rank0 最慢 1.635 ms, 37-38 GB/s SO
+  rank1 最慢 1.621 ms, 38 GB/s SO
+
+normal combine:
+  rank0 最慢 4.165 ms, 28-29 GB/s SO
+  rank1 最慢 4.182 ms, 28-29 GB/s SO
+
+reduced combine:
+  rank0 最慢 3.800 ms, 31 GB/s SO
+  rank1 最慢 3.784 ms, 31 GB/s SO
+```
+
+日志与 cache:
+
+```text
+/tmp/uccl_gin_combine_final_rank0.log
+/tmp/uccl_gin_combine_final_rank1.log
+/tmp/deepep_jit_combine_final_rank0
+/tmp/deepep_jit_combine_final_rank1
+```
+
+最终保留的代码只有默认关闭的 clock-only 诊断模式；没有保留任何无性能收益的 cap
+实验路径。
