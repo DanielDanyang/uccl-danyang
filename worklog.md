@@ -5992,3 +5992,124 @@ rank1 node:
 - 新判断:HOL 现象真实存在，但简单切换 source 可能只是把等待转移到 metadata/payload
   load 或其他 pipeline 阶段；下一步不应继续堆 source switch 小改，而应先做
   post->CQE/NIC-rail profile 和更深 HOL phase profile。
+
+## 2026-06-09 大 chunk + producer/coordinator 实验、ready 协议定位与回退
+
+### 目标与 Step 0
+
+验证“V2 不能使用 V1 的大 WRITE，只是因为 scaleout warp 被 D2H push 回压并阻塞”：
+
+```text
+cap=0 + chunk=16 + forward slots=16 -> 33-34 GB/s
+cap=0 + chunk=32 + forward slots=16 -> 31-32 GB/s
+```
+
+日志：
+
+```text
+/tmp/uccl_step0_c16_s16_rank{0,1}.log
+/tmp/uccl_step0_c32_s16_rank{0,1}.log
+```
+
+直接组合现有旋钮仍低于 `chunk=4 / slots=3` 的 `37-38 GB/s` 基线。
+
+### Producer/coordinator 实现与 correctness 定位
+
+实验把 scaleout warp 拆为只做 compact TMA store 的 producer，以及独立观察 ready
+tail、发送 `rail_put_tail_add` 的 coordinator；forward burst 扩到 16 slots。
+
+期间定位并修正了 shared-memory allocation、`BufferLayout` padding、多个 ring
+`QUIET` 覆盖单一 proxy-wide `quiet_wr` 等问题。相关失败日志：
+
+```text
+/tmp/uccl_coordinator_quiet_c16_s16_rank0.log
+/tmp/uccl_coordinator_quiet2_c16_s16_rank0.log
+/tmp/uccl_coordinator_lane0_rank0.log
+/tmp/uccl_coordinator_seqquiet_rank0.log
+```
+
+真正的 correctness 根因不是 quiet，而是 shared-memory `prepared_tail` 不能单独作为
+TMA payload 已可被 CPU proxy/NIC 安全读取的正式 ready 协议：
+
+```text
+chunk=4 / slots=3 仍在第一次 dispatch_copy_epilogue 出现 metadata assertion。
+coordinator 等 producer_done 后再发送 -> 完整小配置两端 RC=0。
+```
+
+日志：
+
+```text
+/tmp/uccl_coord_doneboundary_small_rank{0,1}.log
+```
+
+随后把 ready/done 状态放入 `atomic_tail_base` scratch，用单调
+`atomicAdd_system` 发布/读取；流式 coordinator 完整小配置 correctness 通过：
+
+```text
+/tmp/uccl_coord_systemready_small_rank{0,1}.log
+```
+
+### README-like 性能与结论
+
+```text
+coordinator, chunk=16, forward slots=16, cap=0:
+  node0 dispatch: 23-24 GB/s, ~2.52-2.60 ms
+  node1 dispatch: 22 GB/s,    ~2.72-2.80 ms
+
+coordinator, chunk=4, forward slots=3, cap=0:
+  both nodes dispatch: ~20 GB/s, ~3.02-3.07 ms
+```
+
+日志：
+
+```text
+/tmp/uccl_coord_systemready_c16_s16_rank{0,1}.log
+/tmp/uccl_coord_systemready_c4_s3_rank{0,1}.log
+```
+
+结论：
+
+- 大 WRITE 相比 coordinator 的小 WRITE 有收益，但额外 coordinator warp、
+  system-scope ready 发布和生命周期 drain 的成本远大于收益；
+- 当前 V2 内核中直接照搬 V1 producer/coordinator 角色不能接近 V1 `~59 GB/s`；
+- 按“低于基线就回退”规则，已删除 coordinator、forward slots 开关和配套 proxy
+  quiet 改动，恢复原 `chunk=4 / slots=3` 主路径；
+- 本轮无收益代码不 commit，只保留实验记录和设计约束。
+
+### 操作与清理
+
+- 一次测试误用了不可达的 `MASTER_ADDR=172.31.78.36`；实际管理网地址为
+  `172.31.70.225`，之后已恢复。
+- 每次失败后同时清理 `test_ep.py`、`spawn_main` 进程组并确认两台 GPU 无残留。
+- 服务器下一步同步回退主路径，重建默认 `GIN_MAX_INFLIGHT_NORMAL=8`，确认
+  `37-38 GB/s` 基线恢复。
+
+### 回退后最终验证
+
+回退源码后必须同时重建两类二进制：
+
+```text
+1. ep/ host proxy extension，恢复 GIN_MAX_INFLIGHT_NORMAL=8；
+2. DeepEP deep_ep/_C 扩展，恢复 hybrid_dispatch_impl 的 16 参数模板 ABI。
+```
+
+第一次回退验证因 `_C` 仍保留 coordinator 版本的 17 参数生成逻辑而 NVCC 失败：
+
+```text
+/tmp/uccl_post_revert_baseline_rank{0,1}.log
+```
+
+重建并同步 `_C` 后，README-like EP8x2 两端 `RC=0`，基线完全恢复：
+
+```text
+dispatch:          37-38 GB/s, 1.60-1.64 ms
+expanded dispatch: 38 GB/s,    1.61-1.63 ms
+cached dispatch:   38 GB/s,    1.60-1.63 ms
+
+logs:
+  /tmp/uccl_post_revert_baseline2_rank0.log
+  /tmp/uccl_post_revert_baseline2_rank1.log
+```
+
+最终检查两台机器均无 `test_ep.py` / `spawn_main` 残留，`nvidia-smi` compute process
+为空。
