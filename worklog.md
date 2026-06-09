@@ -6231,6 +6231,89 @@ node1 reduced combine    3785.5 us          3587.6 us
   分解 tail 可见后到 metadata-ready、payload load、scaleup store 的等待与 overlap。
 - 测试结束后两台机器均无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。
 
+## 2026-06-09: V1/V2 dispatch channel 与 warp 组织对照
+
+低扰动 FIFO profile 排除 device->proxy push 差距后，继续逐行对照 V1
+`ep/src/internode.cu` 与 V2 `hybrid_dispatch.cuh`，定位到此前计划低估的核心差异。
+
+### V1
+
+V1 host/kernel 事实：
+
+```text
+num_channels = config.num_sms / 2
+dispatch launch blocks = num_channels * 2
+kNumDispatchRDMASenderWarps = 7
+NUM_MAX_NVL_PEERS = 8
+```
+
+README-like `num_sms=20` 对应：
+
+```text
+10 network channels
+
+每个 sender channel block:
+  7 x kRDMASender
+  1 x kRDMASenderCoordinator
+  8 x kNVLReceivers
+
+每个 forward channel block:
+  8 x kRDMAAndNVLForwarder
+  1 x kForwarderCoordinator
+```
+
+sender coordinator 观察 7 个 producer 的 ready tail，默认每次发最多 16 token；
+receiver 侧 8 个 forward warp 可以并行吸收到达的 chunk。
+
+### 当前 V2
+
+V2 host/kernel 事实：
+
+```text
+num_scaleout_warps = num_channels_per_sm
+num_forward_warps = num_channels_per_sm
+num_channels = num_sms * num_channels_per_sm
+```
+
+README-like 配置实测 `num_channels_per_sm=4`，对应：
+
+```text
+80 network channels
+
+每个 channel:
+  1 x scaleout warp
+  1 x forward warp
+```
+
+V1/V2 的总 producer/forward warp 数接近：
+
+```text
+V1 producer:  10 channels * 7 = 70 warps
+V1 forward:   10 channels * 8 = 80 warps
+V2 producer:  80 channels * 1 = 80 warps
+V2 forward:   80 channels * 1 = 80 warps
+```
+
+但并行度组织完全不同。V1 把 warp 聚合到少量 channel，能快速形成 16-token chunk，
+也能用多个 forward warp 吸收 burst；V2 把相同 warp 数摊成大量单-warp stream，
+因此 chunk=16 会让单 forward warp 出现持续气泡，chunk=4 才是当前平衡点。
+
+### 修正后的根因与开发方向
+
+- V1 的 per-token epoch tag 主要保证 payload freshness；receiver 仍以 tail/chunk
+  获得可消费范围。它不是 V1 能用大 WRITE 的唯一原因。
+- “给当前 V2 单 forward warp 增加 ready/tag，然后直接把 chunk 改 16”不足以解决
+  burst 消费能力。
+- “额外增加一个 coordinator warp”此前已实测更慢，因为它没有同时恢复 V1 的
+  multi-producer / multi-forward channel 组织，还引入了 system-scope ready 成本。
+- 下一阶段应设计 **V2-native multi-warp channel grouping**：
+  - 保留 V2 compact send scratch、expanded receiver layout、handle 和 combine replay；
+  - 将每 SM 的多个 scaleout/forward warp 聚合到更少的 network channel；
+  - 每 channel 使用多个 producer、轻量 coordinator、多个 forward consumer；
+  - producer/coordinator ordering 优先精确复用 V1 release/acquire + FIFO
+    system-release 机制，不新增每 chunk system atomic；
+  - 多 forward warp 必须重新设计 metadata index、linked-list tail 和 slot ownership。
+
 ### 恢复 V1 映射后的 dispatch phase profile
 
 使用：

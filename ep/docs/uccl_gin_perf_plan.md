@@ -55,11 +55,32 @@ remote_scaleout_rank_idx = scaleout_rank_idx ^ 1;
   - forward stall 后 fresh tail read 显示 53-55% 是“selected source 没 ready，
     但其他 source 已 ready”，存在明显 source-selection HOL。
 
-所以当前 dispatch gap 更像是【V2 为了流式可见性产生大量 4-token WRITE，导致
-EFA delivery + forward source-selection / tail 等待成为主路径】；不是 V2 proxy CPU
-每 command 慢几十倍，也不是 receiver atomic apply 慢。V1 更快的关键是
-packed/chunked receiver 协议可以用 16-token RDMA chunk，同时 receiver 通过
-per-token ready/tag 消费，不需要把“count 可见”绑定在每个很小的 payload chunk 上。
+所以当前 dispatch gap 更像是【V2 将 producer/forward 并行度摊到大量单-warp
+channel，导致每条 stream 只能用 4-token WRITE 保持流水；EFA delivery 与单 forward
+warp 的 burst 消费成为主路径】；不是 V2 proxy CPU 每 command 慢几十倍，也不是
+receiver atomic apply 慢。
+
+进一步对照 V1 代码后，V1 更快的首要结构原因已经明确：
+
+```text
+V1, num_sms=20:
+  num_channels = num_sms / 2 = 10
+  each channel:
+    sender block:    7 producer warps + 1 sender coordinator
+    forwarder block: 8 forward warps + 1 forward coordinator
+
+V2, num_sms=20, channels_per_sm=4:
+  num_channels = 80
+  each channel:
+    1 scaleout warp + 1 forward warp
+```
+
+两者总 producer/forward warp 数接近，但 V1 把并行度聚合到少量 channel：producer
+能快速攒够 16-token chunk，receiver 又能用 8 个 forward warp 吸收大 WRITE burst。
+V2 将并行度拆成 80 条单-warp stream；单 forward warp 的 per-token
+metadata/TMA/top-k/slot 工作无法快速吸收 16-token burst，所以实测必须用 4-token
+chunk 保持平滑流水。per-token ready/tag 仍是 correctness/landing 机制，但不能单独
+解释或修复当前性能差距。
 ```
 
 ## 2. 已验证基线
@@ -136,11 +157,12 @@ EFA normal path:
 这和当前 V2 的差异不是“V1 固定 32、V2 固定 4”这么简单，而是:
 
 ```text
-V1: receiver-facing staging 已按 dst/channel 连续，16-token chunk 不会推迟 receiver
-    对已到 token 的判断；ready/tag 负责细粒度消费。
+V1: receiver-facing staging 已按 dst/channel 连续；同一 channel 有 7 个 producer
+    warp + coordinator 发 16-token chunk，并有 8 个 forward warp 吸收 burst；
+    ready/tag 负责 payload freshness。
 V2: receiver 直接消费 expanded layout。当前 UCCL-GIN 用 compact send scratch 生成
-    连续 payload chunk，但 count/tail 与整条 payload WRITE 绑定；chunk 越大，forward
-    越晚知道前几个 token 可消费。
+    连续 payload chunk，但每个 channel 只有一个 producer/forward warp；chunk 越大，
+    sender 越晚发出，单 forward warp 也越难吸收 burst。
 ```
 
 ### 2.3 独立 GIN / EFA 事实
@@ -514,10 +536,12 @@ V1:       同一套 UCCL/EFA substrate，8192-token dispatch ~59 GB/s。
                      需要继续拆 receiver CQE apply 与 GPU tail wait 的关系
 ```
 
-V1 之所以更快，首要结构差异是 receiver-facing staging 和 ready/tag 语义允许更大的
-RDMA chunk（baseline 16 token）而不牺牲流式消费；其次才是 V1 proxy hot path 更薄。
-当前 V2 若只把 chunk 设大，已经实测会降低 BW；必须同时改变“payload chunk 完成后
-才 count 可见”的 receiver 语义，或者设计不破坏 V2 layout 的 ready/tag/landing 机制。
+V1 之所以更快，首要结构差异是 **multi-warp channel grouping**：少量 channel 上有
+多个 producer、独立 coordinator 和多个 forward warp，因此 baseline 16-token
+chunk 的形成与消费都足够快。receiver-facing staging/ready-tag 保证 freshness，但
+不是单独的吞吐来源。当前 V2 若只把 chunk 设大，已经实测会降低 BW；必须在不破坏
+V2 layout 的前提下重新聚合 channel 内 producer/forward 并行度，再重新评估
+ready/tag/landing。
 
 ## 6. 新执行顺序
 
@@ -1223,15 +1247,19 @@ dispatch:
   1. 低扰动 sender-emission / forward-tail 联合 profile 已完成第一轮:
      当前路径是 MSCCL++ FIFO；FIFO at-cap 仅约 0.05%，push 约 38-39k cycles，
      与 V1 接近。下一轮只需补齐少量 forward 处理吞吐/profile，不再继续调 FIFO cap。
-  2. V2-native ready/tag / landing 设计草案，但不再直接增加 coordinator warp:
-     目标是在保留当前单 scaleout warp 快路径的前提下，让 receiver 能对大 WRITE
-     内的 token 细粒度判 ready；任何方案必须避免每 chunk 的 system-scope
-     ready atomic 和 kernel-end proxy-wide quiet。
-  3. 优先评估 receiver forward pipeline:
-     V2 forward 对每 token 执行 metadata-ready、TMA load、top-k routing、slot 分配和
-     scale-up TMA store；大 chunk 会形成 receiver burst，而当前单 forward warp
-     串行消费。应先量化/优化该 per-token pipeline（例如双缓冲 TMA load 与 routing
-     overlap），再重试 16-token WRITE。
+  2. 设计 V2-native multi-warp channel grouping:
+     保留 V2 BufferLayout、expanded dispatch、token_metadata_at_forward 和 combine
+     replay 语义；把当前每 SM 的 4 个 scaleout/4 个 forward warp 从 4 条独立 channel
+     聚合成更少的 network channel。每条 network channel 需要多个 producer、一个
+     轻量 coordinator、多个 forward consumer。
+  3. grouping 的关键 correctness 设计:
+     producer->coordinator 必须复用 V1 的 release/acquire + FIFO system-release
+     ordering，避免每 token/chunk system atomic；多个 forward warp 必须安全分配
+     V2 metadata 顺序、expanded slot 和 linked-list tail。ready/tag 只用于 payload
+     freshness，不能替代这些 ownership 规则。
+  4. grouping 完成后重新 sweep:
+     network channel 数、producer/forward warp 比、chunk=4/8/16/32。只有此时再次
+     测大 WRITE 才有意义。
 
 combine:
   继续用同口径 PT.0 拆 proxy post、post->CQE、receiver apply，但避免全量 clock
