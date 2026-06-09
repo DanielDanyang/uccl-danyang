@@ -1144,6 +1144,39 @@ chunk；V2 4-token 最优来自当前 receiver 可见性与 pipeline 平衡。
   - 大 WRITE 本身有收益，但 producer/coordinator ready 发布与生命周期成本更大。
 ```
 
+最新 per-rail profile 与 V1 queue 映射实验确认：
+
+```text
+原 V2 queue 映射:
+  proxy thread bytes = 62.5 / 62.5 / 41.7 / 41.6 GB
+
+恢复 V1 interleaved proxy mapping:
+  proxy thread bytes = 52.1 / 52.1 / 52.1 / 52.1 GB
+
+全部 QP 的 post->CQE average:
+  约 83-111 us，未发现少数 rail/QP 独占长延迟。
+```
+
+恢复 V1 映射后，profiling-off README-like EP8x2 correctness 全过；dispatch 改善
+约 `0.4-1.8%`，combine 改善约 `3-4%`，reduced combine 改善约 `4-5%`。该映射
+修复保留。它同时排除了“当前 dispatch 主要被少数错误映射的 NIC/QP 拖慢”；剩余
+约 `90-100 us` WRITE completion latency 是所有 rail 上普遍的小包 delivery/queueing
+成本。
+
+恢复映射后的 dispatch phase profile 进一步给出：
+
+```text
+scaleout D2H push           ~76k cycles/event
+stalled forward tail wait  ~166k cycles/event
+forward payload TMA load    ~14k cycles/event
+forward metadata wait       ~2k cycles/event
+forward scaleup store      < 1k cycles/event
+```
+
+全量 clock atomic 会显著扰动 wall time，因此这些数字只用于阶段排序；它们足以排除
+“per-token metadata-ready wait 是主因”。同时，恢复映射后重新做的 8-proxy sweep
+仍令 dispatch 回退，说明 4-token completion latency 也不是 proxy/QP 数不足导致。
+
 P1.2 已否定原始顺序下的 direct batch，P1.3 已否定 finish dependency 是主瓶颈。
 P1.1 clock-only 采样的 reduce/D2H counters 是嵌套测量，不可相加；校正后的方向是
 优先减少 D2H emission/离散 payload WR，而不是优化 pure reduce。aggregate/normal
@@ -1153,12 +1186,11 @@ inflight cap sweep 又否定了“放宽 D2H cap 即可改善 combine”。
 
 ```text
 dispatch:
-  1. 低开销 NIC/rail 与 post->CQE profile:
-     区分 4-token WRITE completion 长尾来自小包、rail 映射还是 receiver 侧进展。
-  2. 更深的 forward HOL profile:
-     naive ready-source-first 已回退；下一步要确认等待是否只是转移到
-     metadata/payload load 或 scale-up store。
-  3. V2-native ready/tag / landing 设计草案，但不再直接增加 coordinator warp:
+  1. 低扰动 sender-emission / forward-tail 联合 profile:
+     当前全量 clock atomic 已完成阶段排序，但扰动过大；下一步只采样少数 channel，
+     对齐 D2H reserve/commit、proxy post、CQE、receiver apply、forward tail 首次可见
+     的时间线，确认约 90-100 us completion latency 如何转化为 kernel wall time。
+  2. V2-native ready/tag / landing 设计草案，但不再直接增加 coordinator warp:
      目标是在保留当前单 scaleout warp 快路径的前提下，让 receiver 能对大 WRITE
      内的 token 细粒度判 ready；任何方案必须避免每 chunk 的 system-scope
      ready atomic 和 kernel-end proxy-wide quiet。
@@ -1168,7 +1200,8 @@ combine:
   atomic 扰动。
 ```
 
-在完成 post->CQE/rail 和更深 HOL profile 前，不再凭直觉调 cap/ring，也不再把
+post->CQE/rail profile 已完成并恢复 V1 queue mapping。在完成更深 HOL/landing
+profile 前，不再凭直觉调 cap/ring，也不再把
 `kUCCLGinCompactChunkTokens` 直接改大作为主路径优化。naive ready-source-first
 和独立 producer/coordinator 都已尝试且低于保留门槛，代码已回退。
 
@@ -1177,3 +1210,10 @@ receiver-facing staging / layout-aware compact 仍是 combine 把小包做大的
 hop，再投入；如果这个方向需要重写过多 V2 buffer/layout，必须先和保留当前 28-31 GB/s
 combine 性能作工程收益对比。与此同时，dispatch 的 P3.2 sweep 已完成并降级；
 `slots=6` 的收益低于保留门槛，主路径继续使用上游默认 `3`。
+
+已完成并否定的额外旋钮：
+
+```text
+恢复 V1 mapping 后的 8 proxy threads:
+  dispatch 无提升，rank1 约回退 3%，已恢复 4 proxy。
+```

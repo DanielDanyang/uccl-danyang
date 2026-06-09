@@ -153,6 +153,7 @@ class Proxy {
   uint64_t wr_time_total_us_ = 0;
 
   bool profile_commands_ = false;
+  bool profile_rails_ = false;
   bool profile_merge_opportunity_ = false;
   std::chrono::steady_clock::time_point profile_start_;
   std::chrono::steady_clock::time_point profile_end_;
@@ -183,6 +184,11 @@ class Proxy {
   uint64_t profile_atomic_cqe_wrs_ = 0;
   uint64_t profile_atomic_cqe_ns_ = 0;
   uint64_t profile_atomic_cqe_max_ns_ = 0;
+  std::vector<uint64_t> profile_rail_write_wrs_;
+  std::vector<uint64_t> profile_rail_write_bytes_;
+  std::vector<uint64_t> profile_rail_write_cqe_wrs_;
+  std::vector<uint64_t> profile_rail_write_cqe_ns_;
+  std::vector<uint64_t> profile_rail_write_cqe_max_ns_;
   uint64_t profile_dependency_scan_ns_ = 0;
   uint64_t profile_dependency_candidates_ = 0;
   uint64_t profile_dependency_active_ = 0;

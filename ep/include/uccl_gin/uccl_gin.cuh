@@ -37,7 +37,7 @@ struct UCCLGin {
     if (res.d2h_queues == nullptr || res.num_queues == 0) {
       __trap();
     }
-    return res.d2h_queues[static_cast<uint32_t>(hint) % res.num_queues];
+    return res.d2h_queues[uccl_gin::queue_index_from_hint(res, hint)];
   }
 
   // ---- put -------------------------------------------------------------

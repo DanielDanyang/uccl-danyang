@@ -6113,3 +6113,195 @@ logs:
 
 最终检查两台机器均无 `test_ep.py` / `spawn_main` 残留，`nvidia-smi` compute process
 为空。
+
+## 2026-06-09 per-rail post->CQE profile 与 V1 queue 映射恢复
+
+### 假设与 profile 实现
+
+为了区分 4-token WRITE 的长 completion 延迟来自少数慢 NIC/QP，还是 EFA 小包路径的
+普遍成本，在 proxy 已有 command profile 上增加独立开关：
+
+```text
+UCCL_PROXY_PROFILE_RAILS=1
+```
+
+它只在已有 WRITE post 与 CQE completion 点按 `(proxy thread, ring/QP)` 记录：
+
+```text
+posted WRITE WRs / bytes
+completed WRITE WRs
+post -> CQE average / max latency
+```
+
+没有改变 wire、ordering、CQ progress 或 D2H queue 行为。日志：
+
+```text
+/tmp/uccl_rail_profile_rank0.log
+/tmp/uccl_rail_profile_rank1.log
+```
+
+### 原映射的 profile 结果
+
+同一 proxy 内 8 个 QP 的负载与 CQE latency 基本均衡，但 4 个 proxy thread 出现稳定
+的 `3:2` 偏载：
+
+```text
+node0 bytes:
+  thread 0/1: 62.51 / 62.53 GB
+  thread 2/3: 41.69 / 41.58 GB
+
+node1 bytes:
+  thread 0/1: 62.51 / 62.53 GB
+  thread 2/3: 41.69 / 41.60 GB
+
+all QP post->CQE average:
+  node0: 87.3-111.1 us, overall 96.2 us
+  node1: 83.1-102.6 us, overall 92.1 us
+```
+
+根因来自 queue 数组是 proxy-major，而当前 `UCCLGin::lane()` 直接执行
+`channel_idx % num_queues`。README 配置有 80 个 channel、32 个 queue，因此前 16 个
+queue 各承载 3 个 channel、后 16 个各承载 2 个；前两个 proxy 恰好拿到全部重载
+queue。
+
+原 V1 `uccl_ibgda.cuh` 已有正确映射：
+
+```text
+logical channel
+  -> thread_idx = logical % num_proxy_threads
+  -> queue_in_proxy = logical / num_proxy_threads
+  -> physical queue = thread_idx * queues_per_proxy + queue_in_proxy
+```
+
+因此恢复同一映射，没有新增策略。修改后 profile 日志：
+
+```text
+/tmp/uccl_v1_queue_map_profile_rank0.log
+/tmp/uccl_v1_queue_map_profile_rank1.log
+```
+
+4 个 proxy thread 的累计 bytes 变为：
+
+```text
+node0: 52.095 / 52.087 / 52.056 / 52.072 GB
+node1: 52.100 / 52.092 / 52.062 / 52.075 GB
+```
+
+即 thread 层偏载被完全消除。单个 QP 仍不可避免地承载 2 或 3 个 channel，但它们属于
+同一均衡 proxy/NIC 工作集，不再形成 proxy thread 的 `3:2` 偏载。
+
+### profiling-off README-like EP8x2 验证
+
+命令使用：
+
+```text
+--num-processes 8 --test-first-only --num-sms 20
+--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256
+--ignore-local-traffic
+```
+
+日志：
+
+```text
+/tmp/uccl_v1_queue_map_clean_rank0.log
+/tmp/uccl_v1_queue_map_clean_rank1.log
+```
+
+两节点 correctness 全过，平均 kernel 时间：
+
+```text
+                         old baseline       V1 queue map
+node0 dispatch           1629.4 us          1622.5 us
+node1 dispatch           1606.5 us          1599.8 us
+node0 expanded           1622.4 us          1607.8 us
+node1 expanded           1618.5 us          1589.3 us
+node0 combine            4047.4 us          3892.9 us
+node1 combine            4125.0 us          3998.1 us
+node0 reduced combine    3771.8 us          3617.9 us
+node1 reduced combine    3785.5 us          3587.6 us
+```
+
+结论：
+
+- 保留 V1 queue 映射恢复：它修复确定的 proxy 偏载，dispatch 小幅改善，combine /
+  reduced combine 达到约 `3-5%` 改善。
+- 排除“少数慢 rail/QP 导致 dispatch 4-token completion 长尾”：约 `90-100 us`
+  post->CQE latency 在全部 proxy/NIC/QP 上普遍存在。
+- 下一步 dispatch 不再调 channel->rail mapping；转向 receiver forward pipeline，
+  分解 tail 可见后到 metadata-ready、payload load、scaleup store 的等待与 overlap。
+- 测试结束后两台机器均无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。
+
+### 恢复 V1 映射后的 dispatch phase profile
+
+使用：
+
+```text
+UCCL_GIN_DISPATCH_CLOCK_PROFILE=1
+```
+
+日志：
+
+```text
+/tmp/uccl_v1_map_dispatch_clock_rank0.log
+/tmp/uccl_v1_map_dispatch_clock_rank1.log
+```
+
+该 profile 每个事件执行 global atomic，令 dispatch headline 降至约 `10 GB/s`，因此
+cycle 不能相加成 wall-time budget，只用于比较阶段量级。两节点累计结果：
+
+```text
+scaleout D2H push             76.1k cycles/event
+scaleout tail push            13.1k cycles/event
+forward tail wait             41.2k cycles/event
+  stalled event fraction      24.6%
+  stalled event average       165.7k cycles/event
+forward metadata-ready wait    2.2k cycles/event
+forward payload TMA load      14.1k cycles/event
+forward scaleup store          0.5k cycles/event
+
+fresh-read after a tail stall:
+  selected source ready       44.0%
+  another source ready        46.4%
+  no source ready              9.6%
+```
+
+结论：
+
+- receiver 的 per-token metadata-ready 检查不是当前主要成本；它比 stalled tail wait
+  小约两个数量级。
+- sender D2H emission 与 receiver tail visibility/source-selection 仍是主要候选。
+- “另一个 source ready”仍很常见，但 naive ready-source-first 已经实测无 wall-time
+  收益，所以后续不能只改 source selection。
+
+### 8 proxy threads 重测与回退
+
+旧的 8-proxy 负结果受到错误 queue 映射污染，因此在恢复 V1 mapping 后重新构建：
+
+```text
+NUM_PROXY_THREADS=8
+CHANNEL_PER_PROXY=8
+GIN_MAX_INFLIGHT_NORMAL=8
+```
+
+profiling-off README-like EP8x2 日志：
+
+```text
+/tmp/uccl_v1_map_8proxy_clean_rank0.log
+/tmp/uccl_v1_map_8proxy_clean_rank1.log
+```
+
+对比保留的 4-proxy V1 mapping：
+
+```text
+                         4 proxy             8 proxy
+node0 dispatch           1622.5 us           1620.0 us
+node1 dispatch           1599.8 us           1647.3 us
+node0 expanded           1607.8 us           1624.1 us
+node1 expanded           1589.3 us           1654.4 us
+node0 cached             1610.4 us           1636.3 us
+node1 cached             1602.6 us           1657.1 us
+```
+
+8 proxy 未改善 dispatch，rank1 反而稳定回退；combine/reduced 的额外收益也低于
+`3%` 保留门槛。结论是当前普遍的 post->CQE 延迟不是 proxy/QP 数不足造成，更多
+proxy 会增加 CPU/CQ 竞争。实验配置已回退，服务器恢复 4 proxy 默认构建。

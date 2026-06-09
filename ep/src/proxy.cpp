@@ -88,12 +88,22 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Initialize state tracking for each ring buffer
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
-  profile_commands_ = std::getenv("UCCL_PROXY_PROFILE_COMMANDS") != nullptr;
+  profile_rails_ = std::getenv("UCCL_PROXY_PROFILE_RAILS") != nullptr;
+  profile_commands_ =
+      std::getenv("UCCL_PROXY_PROFILE_COMMANDS") != nullptr || profile_rails_;
   ctx_.profile_receiver_atomics = profile_commands_;
   profile_merge_opportunity_ =
       std::getenv("UCCL_PROXY_PROFILE_MERGE_OPPORTUNITY") != nullptr;
   profile_start_ = std::chrono::steady_clock::now();
   profile_end_ = profile_start_;
+  if (profile_rails_) {
+    const auto num_rings = cfg_.d2h_queues.size();
+    profile_rail_write_wrs_.resize(num_rings, 0);
+    profile_rail_write_bytes_.resize(num_rings, 0);
+    profile_rail_write_cqe_wrs_.resize(num_rings, 0);
+    profile_rail_write_cqe_ns_.resize(num_rings, 0);
+    profile_rail_write_cqe_max_ns_.resize(num_rings, 0);
+  }
 #ifndef USE_MSCCLPP_FIFO_BACKEND
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
   ring_seen_.resize(cfg_.d2h_queues.size(), 0);
@@ -773,6 +783,15 @@ void Proxy::profile_record_completion(uint64_t wr_id) {
     ++profile_write_cqe_wrs_;
     profile_write_cqe_ns_ += ns;
     profile_write_cqe_max_ns_ = std::max(profile_write_cqe_max_ns_, ns);
+    if (profile_rails_) {
+      const auto ring_idx = static_cast<size_t>(wr_id >> 32);
+      if (ring_idx < profile_rail_write_cqe_wrs_.size()) {
+        ++profile_rail_write_cqe_wrs_[ring_idx];
+        profile_rail_write_cqe_ns_[ring_idx] += ns;
+        profile_rail_write_cqe_max_ns_[ring_idx] =
+            std::max(profile_rail_write_cqe_max_ns_[ring_idx], ns);
+      }
+    }
   }
   profile_wr_post_time_.erase(time_it);
   if (type_it != profile_wr_post_type_.end()) profile_wr_post_type_.erase(type_it);
@@ -1341,6 +1360,7 @@ void Proxy::post_gpu_commands_mixed(
   // the device-issued QUIET.
   auto flush_writes = [&]() {
     if (rdma_wrs.empty()) return;
+    assert(rdma_wrs.size() == rdma_cmds.size());
     std::chrono::steady_clock::time_point write_post_start;
     if (profile_commands_) write_post_start = std::chrono::steady_clock::now();
     post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
@@ -1354,9 +1374,17 @@ void Proxy::post_gpu_commands_mixed(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               post_done - write_post_start)
               .count());
-      for (auto wr_id : rdma_wrs) {
+      for (size_t i = 0; i < rdma_wrs.size(); ++i) {
+        const auto wr_id = rdma_wrs[i];
         profile_wr_post_time_[wr_id] = post_done;
         profile_wr_post_type_[wr_id] = CmdType::WRITE;
+        if (profile_rails_) {
+          const auto ring_idx = static_cast<size_t>(wr_id >> 32);
+          if (ring_idx < profile_rail_write_wrs_.size()) {
+            ++profile_rail_write_wrs_[ring_idx];
+            profile_rail_write_bytes_[ring_idx] += rdma_cmds[i].bytes;
+          }
+        }
       }
     }
     inflight_write_wrs_.insert(rdma_wrs.begin(), rdma_wrs.end());
@@ -1365,7 +1393,6 @@ void Proxy::post_gpu_commands_mixed(
     // only after those payload counts, and each count arrives with its payload
     // WRITE completion. Only plain WRITEs lack that ordering and must remain
     // sender-side completion dependencies.
-    assert(rdma_wrs.size() == rdma_cmds.size());
     for (size_t i = 0; i < rdma_wrs.size(); ++i) {
       if (rdma_cmds[i].atomic_val == 0) {
         atomic_dependency_wrs_.push_back(rdma_wrs[i]);
@@ -1848,6 +1875,34 @@ void Proxy::dump_command_profile() const {
     size_t const len =
         static_cast<size_t>(std::min(n, static_cast<int>(sizeof(line) - 1)));
     (void)::write(STDERR_FILENO, line, len);
+  }
+  if (profile_rails_) {
+    for (size_t ring_idx = 0; ring_idx < profile_rail_write_wrs_.size();
+         ++ring_idx) {
+      const auto cqe_wrs = profile_rail_write_cqe_wrs_[ring_idx];
+      const double avg_cqe_ns =
+          cqe_wrs == 0
+              ? 0.0
+              : static_cast<double>(profile_rail_write_cqe_ns_[ring_idx]) /
+                    static_cast<double>(cqe_wrs);
+      char rail_line[512];
+      const int rail_n = std::snprintf(
+          rail_line, sizeof(rail_line),
+          "UCCL_PROXY_RAIL_PROFILE rank=%d thread=%d ring=%zu "
+          "write_wrs=%llu write_bytes=%llu write_cqe_wrs=%llu "
+          "write_cqe_avg_ns=%.1f write_cqe_max_ns=%llu\n",
+          cfg_.rank, cfg_.thread_idx, ring_idx,
+          static_cast<unsigned long long>(profile_rail_write_wrs_[ring_idx]),
+          static_cast<unsigned long long>(profile_rail_write_bytes_[ring_idx]),
+          static_cast<unsigned long long>(cqe_wrs), avg_cqe_ns,
+          static_cast<unsigned long long>(
+              profile_rail_write_cqe_max_ns_[ring_idx]));
+      if (rail_n > 0) {
+        const size_t rail_len = static_cast<size_t>(
+            std::min(rail_n, static_cast<int>(sizeof(rail_line) - 1)));
+        (void)::write(STDERR_FILENO, rail_line, rail_len);
+      }
+    }
   }
 }
 

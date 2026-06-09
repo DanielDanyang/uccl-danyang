@@ -478,7 +478,7 @@ hybrid_dispatch_impl(
                     uccl_gin::dispatch_clock_detail(
                         static_cast<uint32_t>(channel_idx),
                         uccl_gin_resources.num_queues == 0 ? 0 :
-                            static_cast<uint32_t>(channel_idx) % uccl_gin_resources.num_queues));
+                            gin.lane_index(channel_idx)));
 #endif
             }
             if (finish_flag and lane_idx == remote_scaleout_rank_idx) {

@@ -58,7 +58,10 @@ struct UCCLGin {
     if (res.d2h_queues == nullptr || res.num_queues == 0) {
       __trap();
     }
-    return res.d2h_queues[static_cast<uint32_t>(hint) % res.num_queues];
+    return res.d2h_queues[lane_index(hint)];
+  }
+  __device__ __forceinline__ uint32_t lane_index(int hint) const {
+    return uccl_gin::queue_index_from_hint(res, hint);
   }
 
   // ---- pointer translation / membership: identical to NCCLGin -----------

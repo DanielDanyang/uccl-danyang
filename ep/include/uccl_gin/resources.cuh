@@ -135,6 +135,25 @@ struct UCCLGinResources {
 };
 
 #if defined(__CUDA_ARCH__)
+__device__ __forceinline__ uint32_t queue_index_from_hint(
+    const UCCLGinResources& resources, int hint) {
+  if (resources.num_queues == 0 || resources.num_lanes == 0 ||
+      resources.num_queues % resources.num_lanes != 0) {
+    __trap();
+  }
+
+  // Preserve the original UCCL/EP mapping: logical channels first round-robin
+  // across proxy threads, then select a queue local to that proxy. The host
+  // resource array is proxy-major, so a direct hint % num_queues would overload
+  // the first proxies whenever num_channels is not divisible by num_queues.
+  const auto logical_idx =
+      static_cast<uint32_t>(hint) % resources.num_queues;
+  const auto queues_per_proxy = resources.num_queues / resources.num_lanes;
+  const auto proxy_idx = logical_idx % resources.num_lanes;
+  const auto queue_in_proxy = logical_idx / resources.num_lanes;
+  return proxy_idx * queues_per_proxy + queue_in_proxy;
+}
+
 __device__ __forceinline__ void dispatch_clock_add(
     uint64_t* counters, uint32_t counter, uint64_t cycles) {
 #if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
