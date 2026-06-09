@@ -6305,3 +6305,146 @@ node1 cached             1602.6 us           1657.1 us
 8 proxy 未改善 dispatch，rank1 反而稳定回退；combine/reduced 的额外收益也低于
 `3%` 保留门槛。结论是当前普遍的 post->CQE 延迟不是 proxy/QP 数不足造成，更多
 proxy 会增加 CPU/CQ 竞争。实验配置已回退，服务器恢复 4 proxy 默认构建。
+
+## 2026-06-08: dispatch 首包 4 / steady 16 自适应 chunk 实验
+
+### 动机与改动
+
+为了区分“大 chunk 慢”究竟来自首包启动气泡，还是持续的 receiver 可见性气泡，
+临时把 dispatch compact chunk 改为：
+
+```text
+每个 channel 的第一个 remote batch: 4 token
+之后的 steady remote batch:          16 token
+```
+
+该实验不新增 buffer，不改变 receiver、proxy、tail 或 V2 layout，只调整
+`hybrid_dispatch.cuh` 中 compact batch flush 阈值。
+
+### README-like EP8x2 结果
+
+命令使用标准第一组配置：
+
+```text
+--num-processes 8 --test-first-only --num-sms 20
+--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256
+--ignore-local-traffic
+```
+
+日志：
+
+```text
+/tmp/uccl_adaptive_chunk_4_16_rank0.log
+/tmp/uccl_adaptive_chunk_4_16_rank1.log
+```
+
+两节点 correctness 全过，但性能明显回退：
+
+```text
+                         fixed chunk=4       first=4, steady=16
+node0 dispatch           1622.5 us           2064-2079 us
+node1 dispatch           1599.8 us           1995-2011 us
+node0 expanded           1607.8 us           2043-2058 us
+node1 expanded           1589.3 us           2012-2028 us
+node0 cached             1610.4 us           1999-2010 us
+node1 cached             1602.6 us           2000-2014 us
+```
+
+结论：
+
+- 小首包不足以让后续 16-token chunk 获得大包收益；steady 阶段仍持续制造
+  receiver count/tail 可见性气泡。
+- 当前 chunk=4 最优不是单纯的 startup latency 偶然结果，而是现有
+  scaleout/forward pipeline 对持续细粒度可见性的要求。
+- 若要使用 V1 式 16/32-token 大 WRITE，必须先解耦 producer 与网络 coordinator，
+  并给 receiver 引入 per-token ready/tag 或等价机制；只调 flush threshold 不成立。
+- 实验代码已本地和服务器回退到固定 chunk=4。测试结束后两台机器无残留
+  `test_ep.py` / `spawn_main` 或 GPU compute process。
+
+## 2026-06-09: 低扰动 dispatch FIFO / forward 联合采样
+
+### 目标
+
+全量 dispatch clock profile 会明显扰动 kernel。本轮新增
+`DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE`，只采样每 16 个 channel 中的一个，
+并在 warp 结束时一次性打印：
+
+```text
+sender:
+  push events / cycles
+  push 前 FIFO inflight sum / max
+  push 前是否已达到 FIFO capacity
+
+receiver:
+  forward tail-wait events / cycles
+```
+
+profiling 关闭时不进入主路径。采样开启后 headline 仍保持约 `37-38 GB/s`，说明
+扰动远小于旧全量 clock profile。
+
+### 编译时发现：当前 hot path 是 MSCCL++ FIFO，不是旧 ring
+
+第一次采样直接读取 `D2HHandle::head()/tail()`，NVCC 编译失败：
+
+```text
+/tmp/uccl_dispatch_sample_rank0.log
+/tmp/uccl_dispatch_sample_rank1.log
+
+d2hq::D2HHandle has no member head/tail
+```
+
+原因是 `ep/include/common.hpp` 默认定义 `USE_MSCCLPP_FIFO_BACKEND`。当前
+`D2HHandle::atomic_set_and_commit` 实际调用：
+
+```text
+mscclpp::FifoDeviceHandle::push(trigger, maxSpinCount=-1)
+```
+
+因此旧 ring 的 `kUCCLGinMaxInflightNormal=8` 不作用于当前 device hot path。
+采样随后改为读取 FIFO 自己使用的 `head`、`tailCache` 和 `size`。
+
+### README-like EP8x2 结果
+
+日志：
+
+```text
+/tmp/uccl_dispatch_sample2_rank0.log
+/tmp/uccl_dispatch_sample2_rank1.log
+```
+
+两节点 correctness 全过，性能约 `37-38 GB/s`。采样聚合：
+
+```text
+node0:
+  push events:              194007
+  push avg:                 39425 cycles
+  initial FIFO inflight:    1023.8 average
+  at FIFO capacity:         102 events / 0.053%
+  observed max:             2049
+  forward tail-wait avg:    33828 cycles/event
+
+node1:
+  push events:              193727
+  push avg:                 38552 cycles
+  initial FIFO inflight:    1027.5 average
+  at FIFO capacity:         108 events / 0.056%
+  observed max:             2049
+  forward tail-wait avg:    50364 cycles/event
+```
+
+`initial inflight` 使用和 `FifoDeviceHandle::push` 相同的 cached-tail 口径，因此它
+可能比 host 当前真实 tail 更旧；但这正是判断 push 是否会进入 FIFO `sync()` 的正确
+口径。
+
+### 结论
+
+- FIFO 平均约半满，但几乎从不达到 capacity；当前 V2 不是“灌到 2048 后撞墙硬等”。
+- push 平均 `38-39k cycles`，与 V1 apples-to-apples profile 的约
+  `38k cycles/event` 接近；device->proxy FIFO push 不是 V1/V2 gap 的主因。
+- 当前差距主要仍来自 V2 的命令数量：V2 每 4 token 一次 push，而 V1 默认每
+  16 token 一次；以及 V2 receiver forward 每 token 执行的 metadata/TMA/top-k/slot
+  语义处理。
+- 直接增大 chunk 和独立 coordinator 已被负实验否定。下一步应优先 profile/优化
+  receiver forward per-token pipeline，再重试大 WRITE；不再继续调 FIFO cap/ring
+  depth。
+- 测试结束后两台机器均无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。

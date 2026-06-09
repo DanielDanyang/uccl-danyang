@@ -240,6 +240,20 @@ tokens/chunk   cached dispatch SO BW   dispatch_impl
 - “继续把 dispatch chunk 加到 32/64”已证实会损失 overlap。
 - 未来只有在 forward 调度或 transport 行为变化后，才需要重跑 sweep。
 
+补充实验：尝试“首个 chunk=4，后续 steady chunk=16”，希望先用小首包唤醒
+receiver，再用大包提高 EFA 效率。README-like EP8x2 correctness 通过，但
+dispatch 从约 `1.60-1.62 ms` 回退到 `2.00-2.08 ms`，约慢 `24%`：
+
+```text
+/tmp/uccl_adaptive_chunk_4_16_rank0.log
+/tmp/uccl_adaptive_chunk_4_16_rank1.log
+```
+
+因此问题不只是首包启动延迟。当前 forward pipeline 需要持续的细粒度 count
+可见性；在不改变 receiver 消费协议时，后续 16-token burst 仍会产生明显气泡。
+该实验已回退。后续若要恢复 16/32-token WRITE，必须先实现 producer/coordinator
+解耦与 receiver 侧 ready/tag 或等价的流式可见机制，不能只调发送阈值。
+
 ### 4.2 Compact32 未打满不是 bug
 
 旧 profile 中平均 `25.49 tokens/WRITE` 来自每 channel 多个 full chunk 加最后 partial
@@ -273,6 +287,26 @@ V1-style inflight=8:   correctness pass, 性能仍约 37-38 GB/s
 
 所以“GPU 灌满 2048 ring”不是当前 dispatch gap 的直接主因。cap=8 保留用于 sequence
 安全和可控背压，不应被描述成性能解法。
+
+补充澄清：当前构建启用了 `USE_MSCCLPP_FIFO_BACKEND`，device hot path 实际进入
+`mscclpp::FifoDeviceHandle::push`，不是旧 `RingBuffer::atomic_set_and_commit`。
+FIFO 容量仍为 2048，但旧 ring 的 `kUCCLGinMaxInflightNormal=8` 不限制这个路径。
+低扰动采样结果：
+
+```text
+node0: push avg 39.4k cycles, initial FIFO inflight avg 1023.8,
+       at-cap 0.053%, max 2049
+node1: push avg 38.6k cycles, initial FIFO inflight avg 1027.5,
+       at-cap 0.056%, max 2049
+
+logs:
+  /tmp/uccl_dispatch_sample2_rank0.log
+  /tmp/uccl_dispatch_sample2_rank1.log
+```
+
+FIFO 平均约半满，但几乎从不因容量耗尽进入 `sync()`。push 的 `38-39k cycles` 又与
+V1 profile 的约 `38k cycles/event` 接近，因此 device->proxy FIFO push 不是 V1/V2
+性能差距的主因。后续不再用“撞 2048 ring”解释 V2 dispatch gap。
 
 ### 4.5 Receiver reorder 不是主瓶颈
 
@@ -1186,14 +1220,18 @@ inflight cap sweep 又否定了“放宽 D2H cap 即可改善 combine”。
 
 ```text
 dispatch:
-  1. 低扰动 sender-emission / forward-tail 联合 profile:
-     当前全量 clock atomic 已完成阶段排序，但扰动过大；下一步只采样少数 channel，
-     对齐 D2H reserve/commit、proxy post、CQE、receiver apply、forward tail 首次可见
-     的时间线，确认约 90-100 us completion latency 如何转化为 kernel wall time。
+  1. 低扰动 sender-emission / forward-tail 联合 profile 已完成第一轮:
+     当前路径是 MSCCL++ FIFO；FIFO at-cap 仅约 0.05%，push 约 38-39k cycles，
+     与 V1 接近。下一轮只需补齐少量 forward 处理吞吐/profile，不再继续调 FIFO cap。
   2. V2-native ready/tag / landing 设计草案，但不再直接增加 coordinator warp:
      目标是在保留当前单 scaleout warp 快路径的前提下，让 receiver 能对大 WRITE
      内的 token 细粒度判 ready；任何方案必须避免每 chunk 的 system-scope
      ready atomic 和 kernel-end proxy-wide quiet。
+  3. 优先评估 receiver forward pipeline:
+     V2 forward 对每 token 执行 metadata-ready、TMA load、top-k routing、slot 分配和
+     scale-up TMA store；大 chunk 会形成 receiver burst，而当前单 forward warp
+     串行消费。应先量化/优化该 per-token pipeline（例如双缓冲 TMA load 与 routing
+     overlap），再重试 16-token WRITE。
 
 combine:
   继续用同口径 PT.0 拆 proxy post、post->CQE、receiver apply，但避免全量 clock

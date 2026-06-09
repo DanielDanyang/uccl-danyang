@@ -162,6 +162,15 @@ hybrid_dispatch_impl(
             profile_forward_load_max = packed > profile_forward_load_max ? packed : profile_forward_load_max;
     };
 #endif
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE)
+    uint64_t sample_push_cycles = 0;
+    uint64_t sample_push_events = 0;
+    uint64_t sample_initial_inflight_sum = 0;
+    uint64_t sample_initial_inflight_max = 0;
+    uint64_t sample_initial_at_cap = 0;
+    uint64_t sample_forward_tail_wait_cycles = 0;
+    uint64_t sample_forward_tail_wait_events = 0;
+#endif
 
     // All the buffers
     auto scaleup_buffer = layout::BufferLayout<false>(
@@ -459,6 +468,26 @@ hybrid_dispatch_impl(
 #if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
                 const auto profile_start = clock64();
 #endif
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE)
+                uint64_t sample_start = 0;
+                if (channel_idx % 16 == 0) {
+                    auto* sample_queue = gin.lane(channel_idx);
+#ifdef USE_MSCCLPP_FIFO_BACKEND
+                    const uint64_t initial_head = mscclpp::atomicLoad<uint64_t, mscclpp::scopeDevice>(
+                        sample_queue->fifo.head, mscclpp::memoryOrderRelaxed);
+                    const uint64_t initial_inflight = initial_head - *sample_queue->fifo.tailCache;
+                    const uint64_t inflight_limit = static_cast<uint64_t>(sample_queue->fifo.size);
+#else
+                    const uint64_t initial_inflight = sample_queue->head() - sample_queue->tail();
+                    const uint64_t inflight_limit = static_cast<uint64_t>(kUCCLGinMaxInflightNormal);
+#endif
+                    sample_initial_inflight_sum += initial_inflight;
+                    sample_initial_inflight_max = initial_inflight > sample_initial_inflight_max ?
+                        initial_inflight : sample_initial_inflight_max;
+                    sample_initial_at_cap += initial_inflight >= inflight_limit;
+                    sample_start = clock64();
+                }
+#endif
                 gin.rail_put_tail_add(
                     scaleout_recv_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
                     scaleout_send_channel_buffer.get_token_buffer(compact_batch_first_slot).get_base_ptr(),
@@ -468,6 +497,12 @@ hybrid_dispatch_impl(
                     scaleout_rank_idx,
                     compact_batch_count,
                     channel_idx);
+#if defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE)
+                if (channel_idx % 16 == 0) {
+                    sample_push_cycles += clock64() - sample_start;
+                    sample_push_events += 1;
+                }
+#endif
 #if defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
                 const auto profile_cycles = clock64() - profile_start;
                 profile_add(uccl_gin::kDispatchClockScaleoutD2HCycles, profile_cycles);
@@ -744,8 +779,12 @@ hybrid_dispatch_impl(
             recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
 
             // Wait for this rank to have data (or finish)
-#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
+#if defined(DEEPEP_USE_UCCL_GIN) && \
+    (defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE) || \
+     defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE))
             const auto profile_tail_wait_start = lane_idx == 0 ? clock64() : 0;
+#endif
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
             bool profile_tail_fresh_recorded = false;
             // Discriminator: replicate the timeout_while first check WITHOUT
             // re-reading the tail. If the chosen src rank already has data/finish
@@ -810,6 +849,12 @@ hybrid_dispatch_impl(
 #endif
                 return false;
             });
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE)
+            if (lane_idx == 0 and channel_idx % 16 == 0) {
+                sample_forward_tail_wait_cycles += clock64() - profile_tail_wait_start;
+                sample_forward_tail_wait_events += 1;
+            }
+#endif
 #if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
             if (lane_idx == 0) {
                 const auto profile_cycles = clock64() - profile_tail_wait_start;
@@ -1038,6 +1083,36 @@ hybrid_dispatch_impl(
 #endif
         __syncwarp();
     }
+
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_SAMPLE_PROFILE)
+    if (warp_idx >= kNumNotifyWarps and
+        warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
+        const int sample_channel =
+            sm_idx * kNumChannelsPerSM + (warp_idx - kNumNotifyWarps);
+        if (sample_channel % 16 == 0 and lane_idx == (scaleout_rank_idx ^ 1)) {
+            printf("UCCL_GIN_DISPATCH_SAMPLE_PUSH rank=%d channel=%d queue=%u "
+                   "events=%llu cycles=%llu initial_inflight_sum=%llu "
+                   "initial_inflight_max=%llu initial_at_cap=%llu\n",
+                   rank_idx, sample_channel, gin.lane_index(sample_channel),
+                   static_cast<unsigned long long>(sample_push_events),
+                   static_cast<unsigned long long>(sample_push_cycles),
+                   static_cast<unsigned long long>(sample_initial_inflight_sum),
+                   static_cast<unsigned long long>(sample_initial_inflight_max),
+                   static_cast<unsigned long long>(sample_initial_at_cap));
+        }
+    } else if (warp_idx >= kNumNotifyWarps + kNumScaleoutWarps) {
+        const int sample_channel =
+            sm_idx * kNumChannelsPerSM +
+            (warp_idx - kNumNotifyWarps - kNumScaleoutWarps);
+        if (sample_channel % 16 == 0 and lane_idx == 0) {
+            printf("UCCL_GIN_DISPATCH_SAMPLE_FORWARD rank=%d channel=%d "
+                   "events=%llu tail_wait_cycles=%llu\n",
+                   rank_idx, sample_channel,
+                   static_cast<unsigned long long>(sample_forward_tail_wait_events),
+                   static_cast<unsigned long long>(sample_forward_tail_wait_cycles));
+        }
+    }
+#endif
 
 #if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_DISPATCH_CLOCK_PROFILE)
     for (int i = 0; i < uccl_gin::kDispatchClockNumCounters; ++i) {
