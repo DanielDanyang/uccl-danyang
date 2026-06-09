@@ -134,6 +134,7 @@ public:
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
+        int num_channels_per_sm;
         int num_scaleout_ranks, num_scaleup_ranks;
         int num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
@@ -179,7 +180,7 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.launch_args.grid_dim.first,
@@ -188,7 +189,8 @@ public:
                 args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
-                args.num_qps, args.num_timeout_cycles);
+                args.num_qps, args.num_timeout_cycles,
+                args.num_channels_per_sm);
         }
 
         return fmt::format(R"(
@@ -286,7 +288,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                             const bool& is_scaleup_nvlink,
-                            const int& num_sms, const int& num_channels_per_sm,
+                            const int& num_sms, const int& num_warps_per_role_per_sm,
+                            const int& num_channels_per_sm,
                             const int& num_smem_bytes,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
@@ -326,8 +329,8 @@ static void launch_dispatch(void* x, void* sf,
         // Some unimplemented assertions
         EP_HOST_ASSERT(not deterministic);
 
-        num_scaleout_warps = num_channels_per_sm;
-        num_forward_warps = num_channels_per_sm;
+        num_scaleout_warps = num_warps_per_role_per_sm;
+        num_forward_warps = num_warps_per_role_per_sm;
         num_threads = (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
     }
 
@@ -339,6 +342,7 @@ static void launch_dispatch(void* x, void* sf,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
+        .num_channels_per_sm = num_channels_per_sm,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = hidden * elem_size, .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,

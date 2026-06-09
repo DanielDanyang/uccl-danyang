@@ -1261,6 +1261,38 @@ dispatch:
      network channel 数、producer/forward warp 比、chunk=4/8/16/32。只有此时再次
      测大 WRITE 才有意义。
 
+### 6.1 Multi-warp channel grouping 的实现顺序
+
+不能直接把多个 warp 的 `channel_idx` 做整数除法。V2 的 channel 同时是 buffer、
+metadata、linked-list 和 combine replay 的 ownership 单元，必须按以下顺序改：
+
+1. **解耦 warp 数与 network channel 数**（已完成且默认映射验证通过）
+   - kernel thread 数仍由 `num_warps_per_role_per_sm` 决定；
+   - buffer/handle/JIT 的 `kNumChannelsPerSM` 独立表示 network channel 数；
+   - 默认两者相等，README-like dispatch 仍为 `37-38 GB/s`。
+2. **Sender grouping**
+   - 每个 network channel 使用多个 producer warp 和一个 coordinator；
+   - producer 从共享 reservation tail 领取 compact-send slot，完成 TMA store 后按
+     V1 的 CTA release/window 机制发布连续 ready tail；
+   - coordinator 只观察连续 ready tail，按 16/32-token chunk 发
+     WRITE+piggyback tail，不参与 token pack；
+   - finish 只在所有 producer 退出且连续 ready tail 全部发送后发布。
+3. **Receiver grouping**
+   - 多个 forward warp 从每个 source 的 arrived tail 中原子领取不重叠 slot range；
+   - 为每个 claimed range 原子分配连续 `token_metadata_at_forward` 序号；
+   - per-scaleup linked-list index/tail 改为 channel-shared allocation，不能继续使用
+     warp-local `stored_scaleup_send_counters`；
+   - 最后一个 forward coordinator 写 metadata sentinel、linked-list tail，并清理
+     rail tail。
+4. **重新 sweep**
+   - 从 `4 warps / 2 channels` 开始，再测 `4/1`；
+   - 每种 grouping sweep chunk `4/8/16/32`；
+   - 保留标准是 correctness 全过且 dispatch wall time/BW 有实际提升。
+
+sender 和 receiver grouping 必须分别做 isolated correctness，但不能把临时 fallback
+接入主路径。任何共享发布机制优先复制 V1 的 `rdma_send_channel_tail/window/lock`
+语义，而不是新增 system-scope per-token atomic。
+
 combine:
   继续用同口径 PT.0 拆 proxy post、post->CQE、receiver apply，但避免全量 clock
   atomic 扰动。

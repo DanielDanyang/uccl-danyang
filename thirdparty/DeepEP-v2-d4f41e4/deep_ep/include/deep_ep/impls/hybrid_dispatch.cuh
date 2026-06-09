@@ -22,9 +22,9 @@ template <bool kDoCPUSync,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
-          int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
-          int kNumChannels = kNumScaleoutWarps * kNumSMs,
+          int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
+          int kNumChannels = kNumChannelsPerSM * kNumSMs,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
           int kScaleoutUpdateInterval = 3,
           int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
@@ -57,6 +57,10 @@ hybrid_dispatch_impl(
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
+    EP_STATIC_ASSERT(kNumScaleoutWarps % kNumChannelsPerSM == 0,
+                     "Scale-out warps must divide evenly across network channels");
+    EP_STATIC_ASSERT(kNumForwardWarps % kNumChannelsPerSM == 0,
+                     "Forward warps must divide evenly across network channels");
 #ifdef DEEPEP_USE_UCCL_GIN
     EP_STATIC_ASSERT(kNumMaxTokensPerChannel < handle::kUCCLGinTailFinishDelta,
                      "UCCL-GIN packed tail finish bit requires a larger finish delta");

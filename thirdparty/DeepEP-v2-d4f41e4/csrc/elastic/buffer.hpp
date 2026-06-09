@@ -891,25 +891,30 @@ public:
 
         // Decide number of channels by shared memory consumption
         // Only for hybrid version
-        int num_channels_per_sm = 1, num_channels = 1;
+        int num_warps_per_role_per_sm = 1, num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
         if (nccl_context->num_scaleout_ranks > 1) {
             const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
             EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
-            num_channels_per_sm = std::min<int>(
+            num_warps_per_role_per_sm = std::min<int>(
                 (num_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
                 32 - kNumNotifyWarps);
-            num_channels_per_sm = std::min<int>(
+            num_warps_per_role_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
-                num_channels_per_sm);
-            num_channels_per_sm = std::min<int>(
-                /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+                num_warps_per_role_per_sm);
+            num_warps_per_role_per_sm = std::min<int>(
+                /* 2 kinds of warps */ num_warps_per_role_per_sm / 2, kNumMaxChannelsPerSM);
             if (not prefer_overlap_with_compute)
-                num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+                num_warps_per_role_per_sm = std::min<int>(num_warps_per_role_per_sm, 4);
+            // Keep the upstream one-warp-per-channel mapping by default. UCCL-GIN
+            // may later group several producer/forward warps onto one network
+            // channel without changing the V2 handle's channel ownership.
+            num_channels_per_sm = num_warps_per_role_per_sm;
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
-                printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
+                printf("Elastic buffer uses %d warps per role and %d channels per SM\n",
+                       num_warps_per_role_per_sm, num_channels_per_sm);
         }
 
         // Non-hybrid mode handles
@@ -1064,7 +1069,7 @@ public:
                         nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
                         nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                         nccl_context->is_scaleup_nvlink,
-                        num_sms, num_channels_per_sm,
+                        num_sms, num_warps_per_role_per_sm, num_channels_per_sm,
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, deterministic, do_cpu_sync,

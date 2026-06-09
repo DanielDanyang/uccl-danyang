@@ -6531,3 +6531,82 @@ node1:
   receiver forward per-token pipeline，再重试大 WRITE；不再继续调 FIFO cap/ring
   depth。
 - 测试结束后两台机器均无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。
+
+## 2026-06-09: 解耦 V2 dispatch warp 数与 network channel 数
+
+开始落实 V2-native multi-warp channel grouping。第一步只拆 host/JIT 的结构耦合，
+不改变默认映射和运行语义。
+
+修改：
+
+- `csrc/elastic/buffer.hpp`
+  - 将原先同时表示 warp 数和 channel 数的 `num_channels_per_sm` 拆为
+    `num_warps_per_role_per_sm` 与 `num_channels_per_sm`。
+  - 默认仍令两者相等，因此当前仍是一个 scaleout/forward warp 对应一个 channel。
+  - handle tensor、`token_metadata_at_forward`、`dst_buffer_slot_idx` 和
+    `channel_linked_list` 仍按 network channel 数分配。
+- `csrc/kernels/elastic/dispatch.hpp`
+  - 将两个值分别传入 launch/JIT。
+  - kernel thread 数由 warp 数决定，JIT 的 `kNumChannelsPerSM` 由 network channel
+    数决定。
+- `hybrid_dispatch.cuh`
+  - 将 `kNumChannelsPerSM` 提升为显式模板参数。
+  - 添加 scaleout/forward warp 数必须能整除 network channel 数的静态约束。
+
+这一步的意义是为后续 `4 producer/forward warps -> 1/2 network channels` 建立
+干净边界；默认值不变时应与当前主路径完全等价。后续还不能直接减小 channel 数，
+因为多个 warp 共享 channel 前必须先实现：
+
+```text
+producer slot allocation + publish ordering
+forward chunk claiming + metadata sequence allocation
+linked-list / expanded-slot ownership
+```
+
+服务器执行前检查：
+
+```text
+p5en_0 / p5en_1:
+  nvidia-smi compute apps: empty
+  no test_ep.py / spawn_main
+```
+
+### 服务器默认映射验证
+
+同步到共享 EFS 后，先重建 vendored DeepEP `_C`：
+
+```text
+/tmp/uccl_grouping_scaffold_build.log
+```
+
+第一次链接失败于 `cannot find -l:libnccl.so`。这是已知 setup.py
+`library_dirs` 缺失问题，不是本轮代码错误；补上 venv NCCL 路径到
+`LIBRARY_PATH` 后增量构建通过。
+
+两节点 EP8x2 smoke：
+
+```text
+/tmp/uccl_grouping_scaffold_smoke_rank0.log
+/tmp/uccl_grouping_scaffold_smoke_rank1.log
+```
+
+两端退出 `0`。
+
+README-like EP8x2：
+
+```text
+/tmp/uccl_grouping_scaffold_readme_rank0.log
+/tmp/uccl_grouping_scaffold_readme_rank1.log
+```
+
+结果：
+
+```text
+dispatch / expanded / cached dispatch: 37-38 GB/s, about 1.60-1.63 ms
+combine:                             29-31 GB/s
+reduced combine:                     32-33 GB/s
+```
+
+与拆分前基线相同，说明默认 `warps_per_role_per_sm == channels_per_sm` 时，host
+allocation、JIT template、dispatch handle 和 combine replay 均保持等价。测试后两台
+机器无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。
