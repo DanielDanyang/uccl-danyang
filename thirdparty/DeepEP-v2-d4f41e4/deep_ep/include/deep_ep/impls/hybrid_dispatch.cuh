@@ -61,6 +61,8 @@ hybrid_dispatch_impl(
                      "Scale-out warps must divide evenly across network channels");
     EP_STATIC_ASSERT(kNumForwardWarps % kNumChannelsPerSM == 0,
                      "Forward warps must divide evenly across network channels");
+    constexpr int kNumScaleoutWarpsPerChannel = kNumScaleoutWarps / kNumChannelsPerSM;
+    constexpr int kNumForwardWarpsPerChannel = kNumForwardWarps / kNumChannelsPerSM;
 #ifdef DEEPEP_USE_UCCL_GIN
     EP_STATIC_ASSERT(kNumMaxTokensPerChannel < handle::kUCCLGinTailFinishDelta,
                      "UCCL-GIN packed tail finish bit requires a larger finish delta");
@@ -442,7 +444,11 @@ hybrid_dispatch_impl(
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
-        const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
+        const int channel_in_sm_idx = scaleout_warp_idx % kNumChannelsPerSM;
+        const int producer_warp_idx_in_channel = scaleout_warp_idx / kNumChannelsPerSM;
+        const int global_scaleout_warp_idx = sm_idx * kNumScaleoutWarps + scaleout_warp_idx;
+        const int channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+        (void)producer_warp_idx_in_channel;
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
 #ifdef DEEPEP_USE_UCCL_GIN
@@ -613,8 +619,9 @@ hybrid_dispatch_impl(
         };
 
         // Iterate all tokens
-        preload_next_token(channel_idx);
-        for (int token_idx = channel_idx; token_idx < num_tokens; token_idx += kNumChannels) {
+        preload_next_token(global_scaleout_warp_idx);
+        for (int token_idx = global_scaleout_warp_idx; token_idx < num_tokens;
+             token_idx += kNumSMs * kNumScaleoutWarps) {
             // Load top-k indices and weights
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for loading top-k indices");
             int stored_dst_scaleout_rank_idx = -1;
@@ -710,7 +717,7 @@ hybrid_dispatch_impl(
             __syncwarp();
 
             // Preload the next token (overlapping with the IBGDA issues)
-            preload_next_token(token_idx + kNumChannels);
+            preload_next_token(token_idx + kNumSMs * kNumScaleoutWarps);
 
             // Issue IBGDA requests
 #ifdef DEEPEP_USE_UCCL_GIN
@@ -748,7 +755,10 @@ hybrid_dispatch_impl(
         update_scaleout_tail(true);
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
-        const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
+        const int channel_in_sm_idx = forward_warp_idx % kNumChannelsPerSM;
+        const int forward_warp_idx_in_channel = forward_warp_idx / kNumChannelsPerSM;
+        const int channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+        (void)forward_warp_idx_in_channel;
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
         scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
 
@@ -1092,7 +1102,8 @@ hybrid_dispatch_impl(
     if (warp_idx >= kNumNotifyWarps and
         warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int sample_channel =
-            sm_idx * kNumChannelsPerSM + (warp_idx - kNumNotifyWarps);
+            sm_idx * kNumChannelsPerSM +
+            (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM;
         if (sample_channel % 16 == 0 and lane_idx == (scaleout_rank_idx ^ 1)) {
             printf("UCCL_GIN_DISPATCH_SAMPLE_PUSH rank=%d channel=%d queue=%u "
                    "events=%llu cycles=%llu initial_inflight_sum=%llu "
@@ -1107,7 +1118,7 @@ hybrid_dispatch_impl(
     } else if (warp_idx >= kNumNotifyWarps + kNumScaleoutWarps) {
         const int sample_channel =
             sm_idx * kNumChannelsPerSM +
-            (warp_idx - kNumNotifyWarps - kNumScaleoutWarps);
+            (warp_idx - kNumNotifyWarps - kNumScaleoutWarps) % kNumChannelsPerSM;
         if (sample_channel % 16 == 0 and lane_idx == 0) {
             printf("UCCL_GIN_DISPATCH_SAMPLE_FORWARD rank=%d channel=%d "
                    "events=%llu tail_wait_cycles=%llu\n",

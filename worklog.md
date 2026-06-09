@@ -6610,3 +6610,47 @@ reduced combine:                     32-33 GB/s
 与拆分前基线相同，说明默认 `warps_per_role_per_sm == channels_per_sm` 时，host
 allocation、JIT template、dispatch handle 和 combine replay 均保持等价。测试后两台
 机器无 `test_ep.py` / `spawn_main` 或 GPU compute process 残留。
+
+### Sender/forward 索引解耦
+
+继续拆分 kernel 内索引：
+
+```text
+global_scaleout_warp_idx:
+  唯一决定 producer 处理的 token 起点和 stride
+
+channel_idx:
+  由 local warp index % channels_per_sm 得到
+  唯一决定 network buffer / tail / QP ownership
+
+producer_warp_idx_in_channel / forward_warp_idx_in_channel:
+  表示同一 network channel 内的 warp 身份
+```
+
+默认一个 warp 对应一个 channel 时：
+
+```text
+global_scaleout_warp_idx == channel_idx
+kNumSMs * kNumScaleoutWarps == kNumChannels
+```
+
+因此该改动仍与原路径等价。它是 sender grouping 的必要前置：以后减少 network
+channel 数时，全部 producer warp 仍按原总 warp 数均匀遍历 token，而不是错误地按
+减少后的 channel 数重复/漏处理 token。当前尚未启用 group size > 1；下一步仍需实现
+共享 compact slot reservation 与连续 ready-tail publication。
+
+服务器验证：
+
+```text
+smoke:
+  /tmp/uccl_grouping_index_smoke_rank0.log
+  /tmp/uccl_grouping_index_smoke_rank1.log
+
+README-like:
+  /tmp/uccl_grouping_index_readme_rank0.log
+  /tmp/uccl_grouping_index_readme_rank1.log
+```
+
+两端 correctness 均退出 `0`。README-like dispatch / expanded / cached dispatch
+仍为 `38 GB/s`，约 `1.59-1.63 ms`，说明 token producer 索引与 network channel
+索引解耦在默认映射下没有性能回退。测试后两台机器无残留 GPU compute process。
