@@ -7189,3 +7189,32 @@ V1 安全两个待确认点（已在 plan §D / commit message 记录）：
 - (a) ordered-atomic 定长数组化：靠"每 ProxyCtx 单 dst_rank"成立，已查 `proxy_ctx.hpp:35`
   单 `dst_rank`/`remote_addr`/`dst_qpn` 佐证；
 - (b) 依赖机落在共享路径——靠 V1 回归测试兜底。
+
+### 服务器验证（2026-06-11，p5en，已上 GitHub `DanielDanyang/uccl-danyang`
+`uccl-gin-rail-primitives`）
+
+已 push 分支并在 p5en 全新 clone（`.../uccl-danyang/uccl-danyang`）checkout 该分支跑：
+- **build gate 过**：`make install ... CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j` 全部
+  .o（proxy/rdma/uccl_proxy/uccl_ep/internode…）编译 + 链接通过，`ep.abi3.so` 装好，
+  `import uccl.ep` OK，`UCCLGinResourceHandle` / `build_uccl_gin_resources` 都在。日志
+  `/tmp/gin_clean_build.log`。
+- **microbench gate 过**：两机 8 卡（world=16），`/opt/amazon/openmpi/bin/mpirun`
+  （binary 链 openmpi v4，必须用 v4 launcher），`FORCE_NUM_RAILS=2`，sizes 1KB–8MB。
+  **两条路径所有 size correctness + ordering 全 PASS**（gate 住 BW）。BW 与 dev 分支
+  数值一致（噪声内），UCCL-GIN 全胜：
+
+  ```text
+  size    NCCL-GIN  UCCL-GIN
+  1KB     0.02      0.25
+  8KB     0.16      2.01
+  64KB    1.28      16.20
+  256KB   5.14      34.78
+  1MB     17.06     42.53
+  8MB     38.63     46.04
+  ```
+
+  即干净库移植**忠实**：build/import + GIN 端到端正确性 + 性能都和 dev 对齐，profiling
+  去掉、V1 piggyback 触发条件不放宽（1-based tail 槽）也不影响 GIN 正确性。
+- **仍待办**：V1 回归（`test_internode.py`/`test_low_latency.py`）—— microbench 已经把
+  共享 RDMA proxy 路径（含依赖机/有序 atomic）跑通且正确，但 V1 特有命令序（metadata
+  write + piggyback tail + combine）还没单独验证；这是"不影响 V1"硬要求的最后一道闸。
