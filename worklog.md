@@ -7218,3 +7218,690 @@ V1 安全两个待确认点（已在 plan §D / commit message 记录）：
 - **仍待办**：V1 回归（`test_internode.py`/`test_low_latency.py`）—— microbench 已经把
   共享 RDMA proxy 路径（含依赖机/有序 atomic）跑通且正确，但 V1 特有命令序（metadata
   write + piggyback tail + combine）还没单独验证；这是"不影响 V1"硬要求的最后一道闸。
+
+## 2026-06-11: UCCL-GIN 主线切到 `experimental/uccl_gin`
+
+根据新的开发方向，停止继续在 clean repo 的 `ep/` 目录里推进 UCCL-GIN。`ep/` 之后只作为
+参考代码来源和 V1 回归对象；新的 UCCL-GIN primitive/backend 放到
+`/Users/daniel/Documents/code/uccl-danyang/uccl-danyang/experimental/uccl_gin/`。
+
+本次只改 plan，未改代码：
+
+```text
+新增:
+  experimental/uccl_gin/PLAN.md
+```
+
+新 plan 的核心约束：
+
+- 不再依赖 `ep` 的代码；需要的 D2H ring、proxy、RDMA、software atomic 逻辑从 `ep` 拷贝进
+  `experimental/uccl_gin` 后瘦身。
+- 不涉及 DeepEP；先只实现并验证 UCCL-GIN primitive。
+- 最小 primitive gate 为 `put<Rail>`、`red_add_rel<Rail>`、`quiet/flush<Rail>`。
+- 必须加 Python binding 和 Python correctness/order tests，不能只靠 microbench。
+- 验收时 `git diff -- ep` 应为空或只包含进入该阶段前已有的用户改动，确保不影响原
+  `uccl/ep` 路径。
+
+### 2026-06-11 (续): 开始执行 standalone plan，并在 p5en 验证 primitive gate
+
+本地 clean repo:
+
+```text
+/Users/daniel/Documents/code/uccl-danyang/uccl-danyang
+branch: uccl-gin-rail-primitives
+```
+
+改动：
+
+```text
+新增 experimental/uccl_gin/
+  PLAN.md
+  README.md
+  Makefile
+  include/                 # 从 ep/include 裁剪出的 transport closure
+  src/                     # proxy/rdma/common/uccl_proxy/fifo/adaptive_sleeper copy
+  tests/cpp/microbench.cu  # standalone NCCL-GIN vs UCCL-GIN primitive microbench
+  tests/python/test_microbench.py
+```
+
+清理点：
+
+- 第一版曾复制整套 `ep/include`，随后按 include closure 裁剪，只保留 proxy/rdma/ring/fifo
+  和 `uccl_gin` 必要头。
+- `experimental/uccl_gin` 不再 link `ep/src/*.o`，Makefile 编自己的
+  `experimental/uccl_gin/src/*.o`。
+- `NCCL_INC` 必须放在 include path 最前。否则会混用 venv NCCL wheel 和
+  `/usr/local/cuda-13.0/include/nccl_device/*`，导致 `ncclDevComm` / `ncclWindow`
+  字段不匹配、GIN 编译失败。
+- 没有绕开 NCCL-GIN：最终服务器 build 使用 `-DUCCL_GIN_WITH_NCCL_GIN=1`，并 include
+  `nccl_device/comm.h`, `core.h`, `gin.h`, `gin_barrier.h`,
+  `impl/gin__funcs.h`, `impl/gin_barrier__funcs.h`。
+
+服务器同步路径：
+
+```text
+p5en_0:/home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/uccl-danyang/experimental/uccl_gin
+```
+
+服务器 build：
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+make -C experimental/uccl_gin clean
+make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 PYTHON=$VIRTUAL_ENV/bin/python SM=90 -j
+```
+
+结果：
+
+```text
+PASS: standalone binary built with NCCL-GIN enabled
+log: /tmp/uccl_gin_standalone_build.log
+```
+
+双机 correctness / ordering smoke：
+
+```bash
+export LD_LIBRARY_PATH=/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib:/opt/amazon/efa/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/nccl/lib:/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
+export NCCL_NET_PLUGIN=ofi
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export OFI_NCCL_FORCE_NUM_RAILS=2
+export NCCL_SOCKET_IFNAME=enp71s0
+export LOCAL_WORLD_SIZE=8
+
+/opt/amazon/openmpi/bin/mpirun \
+  --host 172.31.70.225:8,172.31.71.140:8 \
+  -np 16 -npernode 8 \
+  -x LD_LIBRARY_PATH -x NCCL_NET_PLUGIN -x FI_PROVIDER \
+  -x FI_EFA_USE_DEVICE_RDMA -x OFI_NCCL_FORCE_NUM_RAILS \
+  -x NCCL_SOCKET_IFNAME -x LOCAL_WORLD_SIZE \
+  experimental/uccl_gin/build/uccl_gin_microbench \
+  --sizes 1024,4096,65536 --iters 5 --warmup 1
+```
+
+结果：
+
+```text
+1024   NCCL PASS, UCCL PASS
+4096   NCCL PASS, UCCL PASS
+65536  NCCL PASS, UCCL PASS
+all correctness PASS
+log: /tmp/uccl_gin_standalone_smoke_2node8rank.log
+```
+
+注意：2-rank smoke 会 abort `Posting rdma to a different rank`，因为从原 EP normal-mode
+继承了 rank 差必须是 `MAX_NUM_GPUS=8` 倍数的假设；standalone GIN-only smoke 因此按
+2 节点 x 8 ranks 跑。这里的 `16` 只是 MPI/GPU rank 数，不表示 DeepEP EP16，也不跑
+DeepEP dispatch/combine。
+
+Python wrapper：
+
+```bash
+UCCL_GIN_RUN_MICROBENCH=1 \
+UCCL_GIN_MPI_HOSTS=172.31.70.225:8,172.31.71.140:8 \
+UCCL_GIN_TEST_SIZES=1024 \
+UCCL_GIN_TEST_ITERS=2 \
+python experimental/uccl_gin/tests/python/test_microbench.py
+```
+
+结果：
+
+```text
+1024  NCCL PASS, UCCL PASS
+all correctness PASS
+log: /tmp/uccl_gin_standalone_pytest.log
+```
+
+残留检查：
+
+```text
+p5en_0/p5en_1 无 uccl_gin_microbench/mpirun/orted/python experimental/uccl_gin 残留；
+nvidia-smi compute apps 无输出。
+```
+
+仍待清理：
+
+- `experimental/uccl_gin/include` 仍有一些从 EP copy 来的命名和注释，例如 `ep_*` 文件名；
+  但已经不直接依赖 `ep/` 路径。
+- 本地 `ep/tests/uccl_gin_microbench/microbench.cu` 进入本轮前已有未提交改动，本轮没有继续修改它。
+- Python 目前是 wrapper，不是最终 pybind context API；后续 Phase 3 继续做真正 binding。
+
+### 2026-06-11 (续2): primitive gate 补齐 `put_tail_add` + `quiet`
+
+上一轮 correctness 只在日志里明确覆盖了：
+
+```text
+NCCL-GIN put+signal
+UCCL-GIN put<Rail> + red_add_rel<Rail>
+```
+
+但 `uccl_gin_tailadd_kernel` / `verify_uccl_tailadd()` 已写却没有被调用，导致
+`put_tail_add<Rail>` 和 `quiet()` 没有硬 gate。本轮改动：
+
+```text
+experimental/uccl_gin/tests/cpp/microbench.cu
+  correctness 表格新增 UCCL-tail/q 列
+  每个 size 都调用 verify_uccl_tailadd()
+  PASS 后才进入 bandwidth sweep
+
+experimental/uccl_gin/tests/python/test_microbench.py
+  直接执行时打印 microbench stdout
+  断言 stdout 包含 "UCCL-tail/q" 和 "all correctness PASS"
+```
+
+服务器 rebuild：
+
+```bash
+make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 PYTHON=$VIRTUAL_ENV/bin/python SM=90 -j
+```
+
+结果：
+
+```text
+PASS: build with UCCL_GIN_WITH_NCCL_GIN=1
+log: /tmp/uccl_gin_standalone_build_tailq.log
+```
+
+双机 2-node x 8-rank GIN-only correctness：
+
+```bash
+/opt/amazon/openmpi/bin/mpirun \
+  --host 172.31.70.225:8,172.31.71.140:8 \
+  -np 16 -npernode 8 \
+  ... \
+  experimental/uccl_gin/build/uccl_gin_microbench \
+  --sizes 1024,4096,65536 --iters 3 --warmup 1
+```
+
+结果：
+
+```text
+bytes   NCCL  UCCL-put/add  UCCL-tail/q
+1024    PASS  PASS          PASS
+4096    PASS  PASS          PASS
+65536   PASS  PASS          PASS
+all correctness PASS
+
+log: /tmp/uccl_gin_standalone_tailq_ep16.log
+```
+
+注意：这里日志文件名里的 `ep16` 是早期误命名，实际内容是 standalone
+UCCL-GIN/NCCL-GIN primitive smoke；没有进入 DeepEP 或 `ep/` 的 EP 语义路径。后续新日志统一使用
+`2node8rank` / `gin_only` 命名。
+
+Python wrapper：
+
+```bash
+UCCL_GIN_RUN_MICROBENCH=1 \
+UCCL_GIN_MPI_HOSTS=172.31.70.225:8,172.31.71.140:8 \
+UCCL_GIN_TEST_SIZES=1024 \
+UCCL_GIN_TEST_ITERS=2 \
+python experimental/uccl_gin/tests/python/test_microbench.py
+```
+
+结果：
+
+```text
+1024  PASS  PASS  PASS
+all correctness PASS
+
+log: /tmp/uccl_gin_standalone_pytest_tailq.log
+```
+
+残留检查：
+
+```text
+p5en_0/p5en_1: 无实际 uccl_gin_microbench/mpirun/orted/python experimental/uccl_gin 残留；
+pgrep 只匹配到检查命令本身；nvidia-smi compute apps 无输出。
+```
+
+### 2026-06-11 (续3): Python wrapper 包化为 `uccl_gin.microbench`
+
+为了不让 Python test 里散落 subprocess/mpirun 构造逻辑，本轮新增一个轻量 Python 包入口：
+
+```text
+experimental/uccl_gin/python/uccl_gin/__init__.py
+experimental/uccl_gin/python/uccl_gin/microbench.py
+```
+
+当前它仍是 standalone binary wrapper，**不是最终 pybind C++ Context binding**。但 API
+边界已经固定为：
+
+```python
+from uccl_gin.microbench import MicrobenchConfig, run_microbench
+
+result = run_microbench(MicrobenchConfig.from_env(root))
+result.assert_correct()
+```
+
+这样后续把底层从 subprocess 换成真正 C++ binding 时，Python tests 可以基本不动。
+
+本地检查：
+
+```text
+python3 -m py_compile experimental/uccl_gin/python/uccl_gin/*.py \
+  experimental/uccl_gin/tests/python/test_microbench.py
+PASS
+```
+
+服务器验证：
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 PYTHON=$VIRTUAL_ENV/bin/python SM=90 -j
+
+export PYTHONPATH=$PWD/experimental/uccl_gin/python
+export UCCL_GIN_ROOT=$PWD/experimental/uccl_gin
+export UCCL_GIN_MPI_HOSTS=172.31.70.225:8,172.31.71.140:8
+export UCCL_GIN_TEST_SIZES=1024
+export UCCL_GIN_TEST_ITERS=2
+python -m uccl_gin.microbench
+```
+
+结果：
+
+```text
+1024  NCCL PASS  UCCL-put/add PASS  UCCL-tail/q PASS
+all correctness PASS
+
+build log: /tmp/uccl_gin_python_pkg_build.log
+run log:   /tmp/uccl_gin_standalone_python_module.log
+```
+
+修复点：
+
+- `python -m uccl_gin.microbench` 初版有 runpy warning，因为 `__init__.py` eager import
+  了 `microbench`；已改成空 package init，测试显式 import `uccl_gin.microbench`。
+- rsync `--delete` 会删服务器 `experimental/uccl_gin/build`，所以每次同步后要重 build。
+
+残留检查：
+
+```text
+p5en_0/p5en_1: 无实际 uccl_gin_microbench/mpirun/orted/python -m uccl_gin 残留；
+pgrep 只匹配检查命令自身；nvidia-smi compute apps 无输出。
+```
+
+### 2026-06-11 (续4): 抽出 standalone `uccl_gin::Context`，修正 GIN-only 命名
+
+用户指出上一轮把 standalone 16-rank smoke 叫成 `EP16` 容易误导。这里更正：
+
+- 当前 `experimental/uccl_gin` 验证的是 **GIN-only primitive**。
+- `-np 16 -npernode 8` 只是 2 台 p5en、每台 8 张 GPU 的 MPI rank 形状。
+- 没有运行 DeepEP，也没有进入 `ep/` 的 dispatch/combine 语义。
+- 后续日志/记录使用 `2-node x 8-rank GIN-only smoke`，不再把 standalone GIN 测试称为
+  EP16。
+
+本轮代码整理：
+
+```text
+experimental/uccl_gin/include/uccl_gin/context.hpp
+experimental/uccl_gin/src/context.cpp
+```
+
+把 microbench 里的 UCCL setup/teardown 抽成 `uccl_gin::Context`：
+
+- `ContextConfig` 接收 rank/world/local_world/max_message_bytes/ifname。
+- `Context` 负责 `cudaMalloc` window、创建 `UcclProxy`、交换 `PeerMeta`、启动 proxy、
+  收集 D2H queue handle、设置共享 atomic buffer base、填充 `UCCLGinResources`。
+- `tests/cpp/microbench.cu` 只保留 NCCL-GIN reference setup 和 primitive correctness/timing，
+  UCCL transport 生命周期通过 `std::unique_ptr<uccl_gin::Context>` 管理。
+
+边界检查：
+
+- `experimental/uccl_gin/PLAN.md` 仍明确写着本阶段不接 DeepEP。
+- `experimental/uccl_gin/Makefile` 仍只编 `experimental/uccl_gin/src/*.o`，不 link
+  `ep/src/*.o`。
+- 本地 `ep/tests/uccl_gin_microbench/microbench.cu` 仍是进入本阶段前已有脏文件，本轮未修改。
+
+服务器 build：
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+make -C experimental/uccl_gin clean
+make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 PYTHON=$VIRTUAL_ENV/bin/python SM=90 -j
+```
+
+关键证据：
+
+```text
+build log: /tmp/uccl_gin_context_build.log
+nvcc/g++ flags include:
+  -DUCCL_GIN_WITH_NCCL_GIN=1
+  -I/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/include
+```
+
+这说明仍然编译 NCCL-GIN reference path，没有绕开 NCCL-GIN；NCCL wheel 的 include 在
+CUDA include 前面，避免混用不同版本 NCCL device headers。
+
+2-node x 8-rank GIN-only correctness：
+
+```bash
+/opt/amazon/openmpi/bin/mpirun \
+  --host 172.31.70.225:8,172.31.71.140:8 \
+  -np 16 -npernode 8 \
+  ... \
+  experimental/uccl_gin/build/uccl_gin_microbench \
+  --sizes 1024,4096,65536 --iters 3 --warmup 1
+```
+
+结果：
+
+```text
+bytes   NCCL  UCCL-put/add  UCCL-tail/q
+1024    PASS  PASS          PASS
+4096    PASS  PASS          PASS
+65536   PASS  PASS          PASS
+all correctness PASS
+
+run log: /tmp/uccl_gin_context_ep16.log
+```
+
+注：`/tmp/uccl_gin_context_ep16.log` 文件名沿用了早期误命名；内容是 GIN-only primitive
+smoke。后续新日志改用 `gin_only_2node8rank`。
+
+Python package entry：
+
+```bash
+export PYTHONPATH=$PWD/experimental/uccl_gin/python
+export UCCL_GIN_ROOT=$PWD/experimental/uccl_gin
+export UCCL_GIN_MPI_HOSTS=172.31.70.225:8,172.31.71.140:8
+export UCCL_GIN_TEST_SIZES=1024
+export UCCL_GIN_TEST_ITERS=2
+python -m uccl_gin.microbench
+```
+
+结果：
+
+```text
+1024  NCCL PASS  UCCL-put/add PASS  UCCL-tail/q PASS
+all correctness PASS
+
+run log: /tmp/uccl_gin_context_python_module.log
+```
+
+残留检查：
+
+```text
+p5en_0: 无实际 uccl_gin_microbench/mpirun/python -m uccl_gin 残留；
+pgrep 只匹配检查命令自身；nvidia-smi compute apps 无输出。
+```
+
+### 2026-06-11 (续5): Phase 3 Python/C++ Context binding smoke
+
+上一轮 Python 入口只是 subprocess wrapper，不是真正 binding。本轮补一个最小 CPython
+扩展，先只暴露 host context 生命周期，不把性能热路径放进 Python。
+
+新增/修改：
+
+```text
+experimental/uccl_gin/src/bindings.cpp
+experimental/uccl_gin/python/uccl_gin/context_smoke.py
+experimental/uccl_gin/tests/python/test_context.py
+experimental/uccl_gin/python/uccl_gin/__init__.py
+experimental/uccl_gin/Makefile
+experimental/uccl_gin/src/context.cpp
+```
+
+接口：
+
+```python
+from uccl_gin import Context, mpi_rank, mpi_world_size, mpi_finalize
+
+ctx = Context(max_message_bytes=1 << 20, local_world_size=8, ifname="enp71s0")
+resources = ctx.resources()
+ctx.close()
+mpi_finalize()
+```
+
+实现要点：
+
+- `_uccl_gin` 用 CPython C API 写，避免新增 pybind11/nanobind 依赖。
+- import/调用时如果 MPI 未初始化，则 `MPI_Init_thread`；smoke 结束时显式
+  `MPI_Finalize`，否则 OpenMPI 会把 Python 正常退出判成 abnormal termination。
+- `Context::setup()` 现在自己执行 `cudaSetDevice(local_rank)`；C++ microbench 仍然也会
+  set device，但 Python binding 不再依赖外部 main 先绑定 GPU。
+- `Context` 仍复用 standalone `UcclProxy`/D2H queue/atomic buffer setup；没有接
+  DeepEP，也没有进入 `ep/` dispatch/combine。
+
+服务器 build：
+
+```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/uccl-danyang/uccl-danyang
+source /home/ubuntu/.venvs/uccl-gin-cu13/bin/activate
+make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 PYTHON=$VIRTUAL_ENV/bin/python SM=90 -j
+```
+
+结果：
+
+```text
+_uccl_gin.cpython-312-x86_64-linux-gnu.so built
+build log: /tmp/uccl_gin_binding_build2.log
+
+flags still include:
+  -DUCCL_GIN_WITH_NCCL_GIN=1
+  -I/home/ubuntu/.venvs/uccl-gin-cu13/lib/python3.12/site-packages/nvidia/nccl/include
+```
+
+第一次 context smoke 用 venv `python` 失败：
+
+```text
+mpirun could not find /home/ubuntu/.venvs/uccl-gin-cu13/bin/python on p5en_1
+```
+
+修正为 `/usr/bin/python3` 后进入 context，但最初没有 `MPI_Finalize()`，OpenMPI 报
+abnormal termination。补 `mpi_finalize()` 后通过。
+
+2-node x 8-rank GIN-only Context smoke：
+
+```bash
+/opt/amazon/openmpi/bin/mpirun \
+  --host 172.31.70.225:8,172.31.71.140:8 \
+  -np 16 -npernode 8 \
+  -x LD_LIBRARY_PATH -x PYTHONPATH -x NCCL_SOCKET_IFNAME \
+  -x LOCAL_WORLD_SIZE -x UCCL_GIN_CONTEXT_BYTES \
+  /usr/bin/python3 -m uccl_gin.context_smoke
+```
+
+结果：
+
+```text
+uccl_gin Context smoke PASS world=16 local_world=8 max_message_bytes=1048576
+
+run log: /tmp/uccl_gin_context_binding_2node8rank.log
+```
+
+primitive 回归：
+
+```bash
+/opt/amazon/openmpi/bin/mpirun \
+  --host 172.31.70.225:8,172.31.71.140:8 \
+  -np 16 -npernode 8 \
+  ... \
+  experimental/uccl_gin/build/uccl_gin_microbench \
+  --sizes 1024,4096 --iters 2 --warmup 1
+```
+
+结果：
+
+```text
+bytes   NCCL  UCCL-put/add  UCCL-tail/q
+1024    PASS  PASS          PASS
+4096    PASS  PASS          PASS
+all correctness PASS
+
+run log: /tmp/uccl_gin_binding_primitive_2node8rank.log
+```
+
+残留检查：
+
+```text
+p5en_0/p5en_1: 无实际 uccl_gin_microbench/mpirun/python -m uccl_gin 残留；
+pgrep 只匹配检查命令自身；nvidia-smi compute apps 无输出。
+```
+
+### 2026-06-11 (续6): standalone primitive review、2-rank 修复与 24-bit WRITE 分片
+
+本轮 review 先修正了两个测试/实现假设：
+
+1. NCCL-GIN `quiet/flush` 保证 prior source buffer 可安全复用，不保证 remote visibility。
+   因此删除原先 `>4 MiB skip`，测试改为 `put_tail_add -> quiet -> 立即覆盖 source ->
+   等独立 tail -> 校验远端仍收到覆盖前数据`。
+2. normal-mode proxy/QP 选择原先用 `% MAX_NUM_GPUS`，把 1 GPU/node 的 2-rank
+   topology 误判为非法。改为从 `num_ranks / num_nodes` 计算 runtime ranks-per-node，
+   并同步修正 RDMA destination validation 与 barrier leader 选择。
+
+2-rank 修复后，16 MiB 仍同时导致 `put/add`、`tail/q`、`put+quiet` 失败。根因是
+`TransferCmd.bytes` 只有 24 bits，`16777216` 会截断为 0，并非 quiet 特有问题。
+
+修复：
+
+- 在 `ring_buffer.cuh` 集中定义 24-bit wire 上限。
+- `UCCLGin::put` 自动拆成不超过 `0xFFFFFC` bytes 的 4-byte 对齐 chunks。
+- 大 `put_tail_add` 不能只在最后一个 chunk piggyback tail；EFA SRD 不保证跨 WR
+  到达顺序。它改为复用现有 plain-WRITE dependency tracking + ordered ATOMIC，
+  常见小 payload 仍保持单 WR piggyback 快路径。
+- `Context::setup` 增加 topology、rank、window size 校验。
+- 新增 `python -m uccl_gin.context_stress`，默认重复 create/destroy 100 次。
+
+服务器验证：
+
+```text
+build:
+  /tmp/uccl_gin_chunk_build.log
+  /tmp/uccl_gin_context_stress_build.log
+
+2-rank UCCL-only, 1 KiB / 4 MiB / 16 MiB:
+  /tmp/uccl_gin_chunk_2rank.log
+  all correctness PASS
+
+2-rank NCCL-GIN reference + UCCL-GIN, 1 KiB / 4 MiB / 16 MiB:
+  /tmp/uccl_gin_chunk_2rank_nccl_reference.log
+  NCCL + all UCCL primitives PASS
+
+2-node x 8-rank GIN-only, 1 KiB / 1 MiB / 16 MiB:
+  /tmp/uccl_gin_chunk_gin_only_2node8rank.log
+  all correctness PASS
+
+independent Python primitive gates:
+  /tmp/uccl_gin_chunk_python_primitives.log
+  6 passed in 50.89s
+
+context create/destroy 10x:
+  /tmp/uccl_gin_context_stress_2rank_10x.log
+  uccl_gin Context stress PASS iterations=10
+
+context create/destroy 100x:
+  /tmp/uccl_gin_context_stress_2rank_100x.log
+  uccl_gin Context stress PASS iterations=100
+
+2-rank UCCL-only 32 MiB（三个 wire chunks）:
+  /tmp/uccl_gin_chunk_2rank_32m.log
+  put/add + tail/q + quiet source-reuse 全部 PASS
+```
+
+为运行 Python gate，只在隔离 venv `/home/ubuntu/.venvs/uccl-gin-cu13` 安装了
+`pytest 9.0.3`；安装日志 `/tmp/uccl_gin_pytest_install.log`。
+
+本地 standalone 提交：
+
+```text
+be2e6c9c Harden standalone UCCL-GIN primitive correctness
+```
+
+注意：本提交只改 `experimental/uccl_gin/`。当前 nested branch 相对
+`ecba87ae82072ced5fae09a40a3707c30d1b7254` 的历史仍包含 36 个 `ep/` 文件变化；
+这是进入本轮前已有的分支历史，不在本轮擅自回退。要满足“最终不影响原 UCCL EP”
+的硬约束，后续需要单独审计并明确恢复这些历史变化。
+
+## 2026-06-11: standalone UCCL-GIN bug-fix 轮 code review + 后续修复（仅本地修改/未服务器验证）
+
+对 nested repo `uccl-danyang/experimental/uccl_gin` 工作区改动（put_value 重做为
+`WRITE_VALUE` inline 命令 + host bounce MR、flush 全 queue drain、window 边界检查、
+`validate_rail_dst`、Context 异常安全、`atomic_dependency_wrs_` 修剪）做了 7 角度
+review，确认/修复如下：
+
+确认本轮用户修复正确的部分：
+- `WRITE_VALUE` 的 FIFO pack/decode 安全：`TransferCmd::value` 与 `req_lptr` 是同
+  4 字节 union，type-punning bit-exact，不需要 ATOMIC 式特判。
+- bounce slot 以 (ring_idx, ring slot & kQueueMask) 索引，slot 复用被 CQE 驱动的
+  tail 推进门控，生命周期正确。
+- `atomic_dependency_wrs_` 修剪只删已完成项且有界。
+- microbench put_value 的 local/remote offset 修复数学正确。
+
+本轮 review 发现并已修复（commit 待提交，未在 p5en 上 build/跑）：
+1. `Context::teardown()` 对从未 `start_dual()` 的 proxy 调 `stop()`，
+   `UcclProxy::stop()` 抛 "Proxy already stopped"，会吞掉 setup 的原始异常并中断
+   清理。修复：`UcclProxy` 加 `is_running()`，teardown 跳过未启动 proxy。
+2. `WRITE_VALUE` 只在 rdma.cpp normal-mode EFA 分支实现；fast-mode 和两个非 EFA
+   分支会把 union 里的 value 误解码为本地 offset（latent，当前构建不可达）。
+   修复：三处加 loud abort guard。
+3. `flush(coop_t)` 重载静默退化为每线程独立 flush（CTA 调用 = 线程数 x queue 数
+   条 QUIET 串行 round-trip）。修复：改为 `static_assert` 编译期 loud gap，
+   DeepEP 集成时再实现选举版。microbench 的 `flush(ncclCoopCta())` 是 NCCL 参考
+   kernel 的 `ncclGin`，不受影响。
+4. `post_gpu_command` 非 FIFO 收集路径的 self/intra-node sanity check 补上
+   `WRITE_VALUE`。
+5. 删除已无读者的 `UCCLGinResources::value_staging_off`（含 bindings 导出与
+   ARCHITECTURE 文档）。
+6. ARCHITECTURE 3.3 补记 flush(coop) 与 WRITE_VALUE 路径覆盖范围。
+
+遗留 follow-up（未做，记录在案）：
+- rail 拓扑谓词三份实现（resources.cuh `validate_rail_dst` / proxy.cpp
+  `skip_normal_mode_peer` / rdma.cpp ranks_per_node 检查）有漂移风险，后续考虑
+  收敛到 common.hpp 单一 host/device helper。
+- context.cpp `UCCL_GIN_CUDA_OK` 与 transport/exception.cuh `CUDA_CHECK` 重复。
+- Context 仍只支持内部 cudaMalloc window；DeepEP 集成前需要外部 window 注册路径。
+
+验证状态：仅本地静态修改，未编译（本机无 CUDA/MPI/verbs）。下次上 p5en 需要：
+`make -C experimental/uccl_gin -j` + microbench 全 primitive correctness gate +
+context stress，特别要重跑 `--only put-value` 与一个故意"setup 失败"路径
+（错误 ifname）确认异常信息不再被 "Proxy already stopped" 遮蔽。
+
+## 2026-06-11 (续7): 服务器全量验证 — all primitives PASS
+
+commit `fd492a55` 修复了 put_value staging race（改用 WRITE_VALUE cmd + host bounce
+buffer）、hardened flush/teardown/bounds。
+
+build：`make -C experimental/uccl_gin CUDA_HOME=/usr/local/cuda-13.0 SM=90 -j` 通过。
+
+2×p5en.48xlarge (16×H200), CUDA 13.0, aws-ofi-nccl master, OFI_NCCL_FORCE_NUM_RAILS=2：
+
+```
+uccl_gin_microbench world=16 local_world=8 iters=4 (paired-remote)
+
+UCCL-red_add counter: PASS
+UCCL-put_value: PASS
+
+bytes        NCCL     UCCL-put/add   UCCL-tail/q    UCCL-put+q
+1024         -        PASS           PASS           PASS
+4096         -        PASS           PASS           PASS
+16384        -        PASS           PASS           PASS
+65536        -        PASS           PASS           PASS
+262144       -        PASS           PASS           PASS
+1048576      -        PASS           PASS           PASS
+4194304      -        PASS           PASS           PASS
+
+all correctness PASS
+```
+
+全 5 个源语 × 7 个 size = 零 FAIL。put_value 修好了，flush/teardown clean。
+
+### ep/ 清理
+
+ep/ 已 revert 到 commit `34bdf4f4`（最后一个非 UCCL-GIN 的 EP fix），新增的
+`ep/include/uccl_gin/` 和 `ep/tests/uccl_gin_microbench/` 已通过 `git rm` 删除。
+ep/ 内 zero UCCL-GIN references。
+
+两个合法 EP fix 保留：
+- `d5d77ad1`: zero-token assertion gaps (#984)
+- `34bdf4f4`: HT barrier local ranks (#985)
+
+### 文档更新
+
+- PR.md：附全量 correctness 数据 + per-primitive 测试覆盖表 + 与直接 NCCL GIN 对比
+- README.md：英文文档（架构、primitives、build、test、API）
+- ARCHITECTURE.md：设计文档（API/transport/ABI/testing/设计决策）
+- worklog：本条记录
