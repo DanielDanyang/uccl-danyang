@@ -6654,3 +6654,538 @@ README-like:
 两端 correctness 均退出 `0`。README-like dispatch / expanded / cached dispatch
 仍为 `38 GB/s`，约 `1.59-1.63 ms`，说明 token producer 索引与 network channel
 索引解耦在默认映射下没有性能回退。测试后两台机器无残留 GPU compute process。
+
+## 2026-06-09: pipeline 前置实验与回退
+
+目标：继续追 dispatch pipeline，让 V2 UCCL-GIN 能在保持 V2 receiver/expanded
+layout 的同时，把 payload WRITE 做大并保持 producer 不被网络 push 回压。
+
+### Forward chunk 4 sweep
+
+尝试把 `kNumSlotsPerForwardChunk` 从 3 改到 4，让 forward 一次消费的 token 数接近
+当前 compact WRITE 的常见 4-token 粒度。
+
+服务器日志：
+
+```text
+/tmp/uccl_forward_chunk4_readme_rank0.log
+/tmp/uccl_forward_chunk4_readme_rank1.log
+```
+
+结果：correctness 通过，但 README-like EP8x2 dispatch 从约 `38 GB/s` 回退到
+`36-37 GB/s`，延迟从约 `1.60-1.63 ms` 变成约 `1.66-1.70 ms`。该改动已回退。
+
+结论：forward chunk 单独调大不是 pipeline 的入口；在 sender 仍以小 WR 到达时，
+forward 更粗的领取粒度只会增加等待/气泡。
+
+### 两阶段 grouped sender 实验
+
+尝试用 `UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE=4` 把每 SM 的 4 个 producer warp 合到
+1 个 network channel：4 个 producer warp 先填 compact send/recv slots，一个
+coordinator warp 再发 16-token WRITE+piggyback tail；forward 侧只让一个 warp 消费。
+
+服务器日志：
+
+```text
+build:
+  /tmp/uccl_grouped_sender_build.log
+  /tmp/uccl_payload_merge_deepep_build.log
+
+smoke:
+  /tmp/uccl_grouped_sender_smoke_rank0.log
+  /tmp/uccl_grouped_sender_smoke_rank1.log
+
+README-like:
+  /tmp/uccl_grouped_sender_readme_rank0.log
+  /tmp/uccl_grouped_sender_readme_rank1.log
+```
+
+smoke 通过，并确认 host/JIT 使用 `4 warps per role, 4 channel group size and 1
+channels per SM`。但 README-like 大幅回退：
+
+```text
+dispatch:         25-28 GB/s, about 2.2-2.4 ms
+combine/reduced:  15-16 GB/s
+```
+
+该实验已回退。
+
+结论：这个实现不是 pipeline，而是“先填完、再发送”的两阶段结构。它减少了
+channel 并牺牲了多 forward warp 并发，虽然 WR 变大，但 producer/forward overlap
+被破坏，所以收益被气泡吃掉。真正要做的是 V1 风格 producer/coordinator pipeline：
+
+```text
+producer warps   : 持续写 per-channel ready slots，不等待网络
+coordinator warp : 独立观察 ready tail，攒 16/32 token 后发大 WRITE
+forward warps    : 保持多 warp/channel 或 ready-source-first 消费，不能退化成单 forward
+```
+
+### Proxy-side adjacent payload merge 实验
+
+尝试在 CPU proxy 的 `flush_writes()` 里把连续的同 ring / 同 dst / 同
+`atomic_offset` / local+remote contiguous 的 piggyback WRITE 合并，保持 GPU kernel
+pipeline 不变。
+
+服务器日志：
+
+```text
+README-like:
+  /tmp/uccl_payload_merge_readme_rank0.log
+  /tmp/uccl_payload_merge_readme_rank1.log
+
+profile:
+  /tmp/uccl_payload_merge_profile_rank0.log
+  /tmp/uccl_payload_merge_profile_rank1.log
+```
+
+README-like correctness 通过，但 dispatch 仍是 `38 GB/s` 左右，约 `1.60-1.63 ms`。
+profile 显示相邻合并机会太少：
+
+```text
+typical per proxy thread:
+  write_cmds            ~= 349k-350k
+  write_post_wrs        ~= 348k-350k
+  merge_saved_wrs       ~= 0.7k-1.4k
+  merge_run_max         ~= 3-6
+  merge_fail_ring       ~= 77k-90k
+  merge_fail_local_gap  ~= 42k-51k
+```
+
+即便 profile 里有 `merge_adjacent_pairs ~= 130k-150k`，真正满足 local/remote
+连续和同 ring 条件的不到 0.5%。该改动已回退。
+
+结论：proxy 侧只看已经交错进入 D2H ring 的相邻命令，太晚了。V2 的有效 batching
+必须发生在 GPU sender 侧：先按 channel/dst 把 token 编进一个可连续发送的
+ready/run，再由 coordinator 以大 WR 发出。否则 CPU proxy 只能看到被 warp/ring
+交错打碎后的命令流。
+
+### Env-gated producer/coordinator pipeline WIP
+
+实现了一个只在 `UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE>1` 时启用的实验路径：
+
+```text
+host:
+  UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE=1  默认稳定路径
+  UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE=2  每 SM 4 producer/forward warp -> 2 network channels
+
+device scratch (复用 atomic_tail_base 后半段):
+  reserve[channel, dst_rank]  : producer 按 dst rank reserve compact slot
+  done[channel]               : producer warp 完成计数
+  ready[channel, slot]        : producer TMA store wait 后发布 slot ready
+
+sender:
+  producer warp 持续 TMA store token -> per-channel compact slots
+  coordinator warp 观察连续 ready flags, 攒 16 token 后 rail_put_tail_add()
+
+forward:
+  grouped path 下每个 channel 的 forward warp 固定绑定 source rank,
+  避免多个 forward warp 重复处理同一 source。
+```
+
+服务器构建：
+
+```text
+/tmp/uccl_pipeline_ep_build.log
+/tmp/uccl_pipeline_deepep_build.log
+/tmp/uccl_pipeline_deepep_build2.log
+```
+
+已修的 bug：
+
+```text
+1. host extension 没有定义 DEEPEP_USE_UCCL_GIN，导致 group env 被 #ifdef 屏蔽。
+   修复：host 侧无条件读取 UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE。
+
+2. 初版 reserve slot 放在 ptx::deduplicate 选出的任意 topk lane，
+   但后面用 lane==dst_rank 广播，导致 remote/local slot 为 -1。
+   日志：
+     /tmp/uccl_pipeline_g2_smoke2_rank0.log
+     /tmp/uccl_pipeline_g2_smoke2_rank1.log
+   修复：先 reduce rank mask，再让 lane==dst_rank 负责 reserve。
+
+3. 多 producer reserve 后 slot 顺序不再等价于 src_token_global_idx 单调递增，
+   旧 ready metadata check 的 observed > prev 不再成立。
+   日志：
+     /tmp/uccl_pipeline_g2_smoke3_rank0.log
+     /tmp/uccl_pipeline_g2_smoke3_rank1.log
+   修复：grouped path 只检查 observed rank 是否等于 expected rank；
+   默认 one-warp-per-channel 路径继续保留 observed > prev。
+```
+
+当前状态：
+
+```text
+/tmp/uccl_pipeline_g2_smoke4_rank0.log
+/tmp/uccl_pipeline_g2_smoke4_rank1.log
+```
+
+EP8x2 小 smoke 不再出现 slot assertion 或 metadata monotonic timeout，但仍卡在 first
+dispatch，没有看到 dispatch summary。已手动清理残留进程。下一步需要继续收窄：
+
+```text
+- coordinator 是否给 remote/source finish 正确发出；
+- forward 固定 source 后是否有 source/rank lane 没有收到 finish；
+- local tail 是否应该也走 per-channel coordinator，而不是 producer per-token local tail。
+```
+
+尝试用 EP2 (`--num-processes 1`) 做最小复现无效：该 test/JIT 组合在
+`hybrid_dispatch.cuh:400` 触发上游 `Insufficient notify threads` static assert，不是本轮
+pipeline 协议的有效信号。
+
+### 2026-06-09 继续 pipeline: 启动修正、capacity 修正、chunk sweep
+
+服务器当前 IP 已变化，旧记录里的 `172.31.78.36/172.31.72.96` 已不可用：
+
+```text
+p5en_0: hostname ip-172-31-70-225, enp71s0 172.31.70.225/20
+p5en_1: hostname ip-172-31-71-140, enp71s0 172.31.71.140/20
+```
+
+因此本轮多机测试统一使用：
+
+```text
+MASTER_ADDR=172.31.70.225
+```
+
+先修了一个 grouped pipeline 的 capacity 边界：`group=2` 且小 token 数时，
+`ceil(num_max_tokens / num_channels)` 可能小于每个 grouped channel 的 producer 数。
+例如 `num_tokens=32, num_channels=40, group=2` 时旧 capacity 为 1，但 channel 0 可能
+接到两个 producer stream 的 token，导致 slot assert。现在
+`kNumMaxTokensPerChannel = max(ceil(max_tokens / channels), warps_per_channel)`。
+
+验证日志：
+
+```text
+错误启动/旧 IP 日志:
+  /tmp/uccl_pipeline_g2_t32c_rank0.log
+  /tmp/uccl_pipeline_g2_t32c_rank1.log
+  /tmp/uccl_pipeline_g2_t32d_rank0.log
+  /tmp/uccl_pipeline_g2_t32d_rank1.log
+  /tmp/uccl_pipeline_g2_t32e_rank0.log
+  /tmp/uccl_pipeline_g2_t32e_rank1.log
+
+新 IP 后 group=2 仍 hang:
+  /tmp/uccl_pipeline_g2_t32f_rank0.log
+  /tmp/uccl_pipeline_g2_t32f_rank1.log
+  /tmp/uccl_pipeline_g2_t32g_rank0.log
+  /tmp/uccl_pipeline_g2_t32g_rank1.log
+  /tmp/uccl_pipeline_g2_t32h_rank0.log
+  /tmp/uccl_pipeline_g2_t32h_rank1.log
+
+同命令 default group=1 baseline 通过:
+  /tmp/uccl_pipeline_baseline_t32_rank0.log
+  /tmp/uccl_pipeline_baseline_t32_rank1.log
+
+EP4 小复现 group=2 触发 SIGABRT:
+  /tmp/uccl_pipeline_g2_ep4_t32_rank0.log
+  /tmp/uccl_pipeline_g2_ep4_t32_rank1.log
+```
+
+结论：启动方式和服务器环境是好的；`group=2` producer/coordinator 分支仍有真实
+协议/同步问题。它没有产生 GPU timeout printf，也没有 CPU wait timeout，倾向于卡在
+CUDA kernel 内一个没有 `timeout_while` 包住的同步点，优先怀疑 grouped path 的 TMA
+store/commit/wait 或 cooperative progress，而不是 RDMA tail 本身。
+
+随后把 default group=1 的 compact chunk 从硬编码 `4` 改成 JIT 模板参数：
+
+```text
+UCCL_GIN_DISPATCH_CHUNK_TOKENS=<N>
+default: 4
+build log: /tmp/uccl_chunk_param_build.log
+```
+
+README-like EP8x2 dispatch sweep，命令形状：
+
+```bash
+python thirdparty/DeepEP-v2-d4f41e4/tests/elastic/test_ep.py \
+  --num-processes 8 --test-first-only --skip-check --num-sms 20 \
+  --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --ignore-local-traffic
+```
+
+结果：
+
+```text
+chunk=4, cap=8:
+  logs: /tmp/uccl_chunk4_readme_rank0.log, /tmp/uccl_chunk4_readme_rank1.log
+  cached dispatch: 38-39 GB/s SO, ~1.58-1.63 ms
+
+chunk=8, cap=8:
+  logs: /tmp/uccl_chunk8_readme_rank0.log, /tmp/uccl_chunk8_readme_rank1.log
+  cached dispatch: 35-37 GB/s SO, ~1.66-1.73 ms
+
+chunk=16, cap=8:
+  logs: /tmp/uccl_chunk16_readme_rank0.log, /tmp/uccl_chunk16_readme_rank1.log
+  cached dispatch: 33-34 GB/s SO, ~1.79-1.86 ms
+
+chunk=32, cap=8:
+  logs: /tmp/uccl_chunk32_readme_rank0.log, /tmp/uccl_chunk32_readme_rank1.log
+  cached dispatch: 32 GB/s SO, ~1.90-1.92 ms
+
+chunk=16, cap=0:
+  logs: /tmp/uccl_chunk16_cap0_readme_rank0.log, /tmp/uccl_chunk16_cap0_readme_rank1.log
+  cached dispatch: 9-13 GB/s SO, ~4.85-6.86 ms
+
+chunk=3, cap=8:
+  logs: /tmp/uccl_chunk3_readme_rank0.log, /tmp/uccl_chunk3_readme_rank1.log
+  cached dispatch: 10-13 GB/s SO, ~4.68-6.17 ms
+```
+
+结论：
+
+```text
+1. 只把单个 scaleout warp 的 compact batch 从 4 调大到 8/16/32 不会带来 pipeline 收益，
+   反而单调变慢。大 chunk 在当前单 warp 发射结构里会增加 forward starvation / producer
+   stall，而不是提升 NIC 效率。
+2. cap=0 + chunk=16 明显更差，说明“inflight cap 阻塞导致大 chunk 变慢”的解释不成立。
+3. 下一步真正要做的是修通 producer/coordinator split，让 producer 不被大 WR 发射回压；
+   单 warp batching 不是 V1 pipeline 的等价物。
+```
+
+又修了 grouped path 一个确定 bug：`kNumScaleoutWarpsPerChannel>1` 分支内部已经由
+coordinator 发 local/remote finish，但落出分支后仍会执行 default path 的公共
+`flush_compact_remote_batch(true); update_scaleout_tail(true);`。这会让同一 grouped
+channel 的多个 producer 重复给 local tail 发 finish，和默认 one-warp-per-channel 语义不同。
+现在公共 flush 只在 `kNumScaleoutWarpsPerChannel == 1` 时执行。
+
+验证：
+
+```text
+EP4 group=2 仍失败，说明还有其他问题:
+  /tmp/uccl_pipeline_g2_ep4_fix1_rank0.log
+  /tmp/uccl_pipeline_g2_ep4_fix1_rank1.log
+
+EP4 group=2 + --skip-check 仍失败，排除了 Python correctness check:
+  /tmp/uccl_pipeline_g2_ep4_fix1_skip_rank0.log
+  /tmp/uccl_pipeline_g2_ep4_fix1_skip_rank1.log
+```
+
+当前判断：grouped producer/coordinator 分支仍不应作为可用 pipeline 路径提交；它还需要
+更小的 isolated kernel 或 cuda-gdb 定位 SIGABRT。默认 group=1 路径仍稳定，chunk 参数化
+可作为诊断 knob 保留，但默认必须保持 4。
+
+### 2026-06-09: 回退无收益 pipeline 实验代码
+
+根据 benchmark 结果，以下未提交实验代码没有产生性能收益，且 grouped path 尚不正确，
+因此已全部回退到当前 `HEAD` 的稳定实现：
+
+```text
+thirdparty/DeepEP-v2-d4f41e4/csrc/elastic/buffer.hpp
+thirdparty/DeepEP-v2-d4f41e4/csrc/kernels/elastic/dispatch.hpp
+thirdparty/DeepEP-v2-d4f41e4/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh
+```
+
+回退内容包括：
+
+```text
+- UCCL_GIN_DISPATCH_CHANNEL_GROUP_SIZE grouped producer/coordinator WIP
+- grouped pipeline reserve/done/ready scratch
+- grouped forward source mapping
+- grouped slot-capacity 修改
+- UCCL_GIN_DISPATCH_CHUNK_TOKENS JIT 参数化
+```
+
+原因：
+
+```text
+- 稳定默认路径 cached dispatch: 38-39 GB/s SO
+- chunk=8/16/32 均低于默认 chunk=4
+- chunk=16 + cap=0 和 chunk=3 明显退化到约 9-13 GB/s
+- grouped producer/coordinator path 在 EP4 仍 SIGABRT，在 EP8x2 仍 hang
+```
+
+实验日志继续保留，作为下一次重新设计 pipeline 时的负结果依据。后续 pipeline 应从
+更小的 isolated producer/coordinator 原型开始，先证明正确性和 overlap，再接回主
+`hybrid_dispatch.cuh`，不再在稳定主路径中保留不可用 WIP。
+
+服务器同步与回退验证：
+
+```text
+稳定 DeepEP 扩展重建:
+  /tmp/uccl_pipeline_rollback_build.log
+
+README-like EP8x2:
+  /tmp/uccl_pipeline_rollback_rank0.log
+  /tmp/uccl_pipeline_rollback_rank1.log
+
+cached dispatch:
+  rank0: 38 GB/s SO, 1.610-1.621 ms
+  rank1: 37-38 GB/s SO, 1.624-1.642 ms
+```
+
+两台测试结束后均无 `test_ep.py`、`spawn_main` 或 GPU compute process 残留。
+
+## 2026-06-10: UCCL-GIN vs NCCL-GIN standalone P2P microbench (apples-to-apples)
+
+独立 P2P transport microbench (`ep/tests/uccl_gin_microbench`)，paired-remote，
+2 节点 × 8 rank (world=16)，单 stream（1 CTA / 1 D2H lane），iters=50。两条路径在
+同一 binary 内对比 NCCL-GIN（ncclGin.put + waitSignal）与 UCCL-GIN（D2H + proxy +
+EFA verbs，rail_put + rail_red_add）。
+
+### 修复（否则结果无效）
+
+1. **MPI 版本不匹配**：binary 链接 `/opt/amazon/openmpi`(v4) 的 `libmpi.so.40`，
+   之前误用 `/opt/amazon/openmpi5/bin/mpirun`(v5) 启动 → `world=1`，每 rank 单例 →
+   UCCL 走 "local mode"（无 peer）超时；NCCL 实为 self-loopback。**之前那版
+   NCCL-GIN sweep 数值作废。** 改用匹配的 `/opt/amazon/openmpi/bin/mpirun` →
+   `world=16`，真正跨节点。
+2. **timing 不对等**：原 NCCL 路径用 cudaEvent（GPU kernel 时间），UCCL 用 CPU
+   wall-clock + counter。统一为两条路径都 wall-clock + MPI_Barrier（见
+   `run_nccl_gin` 改动）。
+3. **16MB 假数据（4469 GB/s）**：`TransferCmd.bytes` 是 24-bit 字段
+   (`ring_buffer.cuh:69`)，16,777,216 溢出成 0 字节 → 50 个零字节 put → 秒回。
+   sweep 上限因此封到 8MB（dispatch 实际只发小 chunk，不触此限）。
+4. 编译阻塞：`resources.cuh` 的 `queue_index_from_hint` 用 `#if defined(__CUDA_ARCH__)`
+   守卫，nvcc host pass 看不到 → 改成 `#if defined(__CUDACC__)`（对主 JIT/device
+   构建与 g++ TU 行为不变，只让 nvcc host pass 可见）。
+
+### 结果（per-rank GB/s，single stream，world=16）
+
+```text
+bytes     NCCL-GIN   UCCL-GIN
+1KB       0.02       0.26
+2KB       0.04       0.53
+4KB       0.07       1.04
+8KB       0.16       1.93
+16KB      0.32       3.53
+32KB      0.64       6.17
+64KB      1.27       10.68
+128KB     2.55       17.03
+256KB     4.88       21.11
+512KB     9.05       22.29
+1MB       15.94      22.95
+2MB       23.19      23.34   <- 交叉点
+4MB       31.29      23.61
+8MB       37.48      23.67
+```
+
+日志：`p5en_0:/tmp/gin_cmp_fair.log`；runner 在 `ep/tests/uccl_gin_microbench`。
+
+### 结论
+
+- **小/中消息（MoE dispatch/combine 的相关区间，约 4-256KB）UCCL-GIN 全面碾压
+  NCCL-GIN**：8KB 12×、64KB 8.4×、256KB 4.3×。这解释了 DeepEP V2 集成里
+  dispatch 38 vs 2-3 GB/s（~14×）的来源——device-initiated NCCL GIN proxy 在 EFA
+  小消息上是 latency-bound。
+- **UCCL-GIN 单 lane 在 ~23-24 GB/s 饱和**，不随消息增大继续上升（单 D2H lane /
+  proxy 吞吐上限）；真实 dispatch 用多 channel 聚合到 ~38。
+- **大消息（≥4MB）NCCL-GIN 反超**（8MB 37.5 vs 23.7），逼近 NIC 上限；但这一区间
+  与 MoE 负载无关。
+- 未改动主路径性能；本轮仅本地改 `microbench.cu`(timing) 与 `resources.cuh`(守卫)，
+  均未提交。
+
+### 2026-06-10 (续): 修正公平性 + 用满 16 NIC（2 NIC/GPU 两侧对齐）
+
+上一版 P2P 对比不公平且没用满网卡：
+- UCCL kernel 所有 put 走默认 `lane_hint=0` → 单 D2H lane → 每 GPU 仅 1 NIC（~23
+  GB/s 正是单 NIC 上限）；全节点只点亮 8/16 NIC。
+- NCCL 用 `OFI_NCCL_FORCE_NUM_RAILS=4` → 每流最多 4 NIC。即 UCCL-1-NIC vs
+  NCCL-4-rail，4× 网卡让步给 UCCL，大包"NCCL 反超"是网卡数假象。
+
+修正：
+- UCCL kernel 改为把 put round-robin 到所有 D2H lane（覆盖每 GPU 绑定的 2 NIC），
+  并对每条 lane 发一个 ordered red_add 到独立 counter slot（per-lane
+  payload-before-tail 完成判定，避免 seq 冲突）。
+- NCCL 用 `OFI_NCCL_FORCE_NUM_RAILS=2`。两侧都 2 NIC/GPU = 8 GPU × 2 = 16 NIC。
+
+结果（per-rank GB/s，world=16，2 NIC/GPU 两侧）：
+
+```text
+bytes     NCCL-GIN(2rail)   UCCL-GIN(2lane)
+1KB       0.02              0.21
+4KB       0.08              1.00
+8KB       0.17              2.00
+16KB      0.33              3.99
+32KB      0.66              8.03
+64KB      1.30              15.94
+128KB     2.60              27.89
+256KB     5.01              34.41
+512KB     9.38              39.40
+1MB       16.20             42.33
+2MB       24.39             44.19
+4MB       32.34             45.39
+8MB       39.50             46.15
+```
+
+日志：`p5en_0:/tmp/gin_cmp_2nic.log`。
+
+结论：
+- UCCL 单 lane→双 lane 把上限从 ~23 翻倍到 ~46 GB/s（≈2 NIC 上限），证明 lane→NIC
+  fanout 生效。
+- 网卡数对齐后 **UCCL-GIN 在所有消息尺寸都优于 NCCL-GIN**：小包 10-12×（MoE 相关
+  区间），大包 8MB 46 vs 40（1.17×）。之前"大包 NCCL 赢"纯属网卡数不公平造成。
+- microbench 改动（multi-lane + per-lane 完成）仅在测试文件，未动主路径。
+
+### 2026-06-10 (续2): P2P microbench 加 correctness + ordering 验证后重跑
+
+之前 microbench 只测 BW，没验证数据（README 自承认 correctness stubbed）。按要求加入：
+- `fill_pattern_kernel`：每 rank 把 send 区填成 `word[i]=rank*1000003+i` 的 rank-tagged
+  pattern；recv 区先 poison 成 0xFF。
+- 传输 + 等完成信号后，校验本地 recv == **对端 peer 的 pattern**（逐 word）。
+- 因为 recv 只在**完成信号被观测之后**才读，所以 payload-before-tail 违例（tail 先于
+  data 落地）会留下 poison → FAIL。即同时验证了数据正确性与 ordering。
+- correctness pass 排在 BW 之前；任一 size FAIL 则不报 BW、退出码 2。
+
+结果（2 NIC/GPU 两侧，world=16，correctness 全过后才测的 BW）：
+
+```text
+size      NCCL  UCCL    | NCCL-GIN(2rail)  UCCL-GIN(2lane) GB/s
+1KB       PASS  PASS    | 0.02             0.25
+4KB       PASS  PASS    | 0.08             1.00
+8KB       PASS  PASS    | 0.17             2.00
+16KB      PASS  PASS    | 0.33             3.95
+32KB      PASS  PASS    | 0.66             8.08
+64KB      PASS  PASS    | 1.33             15.92
+128KB     PASS  PASS    | 2.64             28.66
+256KB     PASS  PASS    | 5.05             34.10
+512KB     PASS  PASS    | 9.36             39.26
+1MB       PASS  PASS    | 15.93            42.34
+2MB       PASS  PASS    | 24.11            44.11
+4MB       PASS  PASS    | 31.89            45.40
+8MB       PASS  PASS    | 38.38            46.17
+```
+
+所有 size 两条路径 correctness + ordering 全 PASS；BW 与上一版一致（噪声内）。
+日志：`p5en_0:/tmp/gin_cmp_correct.log`。结论不变：网卡数对齐后 UCCL-GIN 在所有尺寸
+都优于 NCCL-GIN（小包 10-12×，8MB 46 vs 38），且数据/顺序均已校验。
+
+## 2026-06-10 干净库 step-1：把 UCCL-GIN 设备接口 merge 进 clean repo（未上服务器验证）
+
+把脏的 `uccl-gin` dev 分支按 plan 分步、干净地落进 clean 库
+`/Users/daniel/Documents/code/uccl-danyang/uccl-danyang`（main @ `34bdf4f4`），
+新分支 `uccl-gin-rail-primitives`。**只接 GIN 接口 + 必需 substrate，不碰 DeepEP，不接
+profiling**。clean 库本就和 dev 共享 ordered-atomic substrate（`PackAtomicWithSeq` /
+`atomic_val` / `atomic_offset` 来自分叉前的 `ecba87ae`），所以是受控移植不是重写。
+
+7 个原子 commit（每个都保持 V1 可编译）：
+1. `common.hpp`：`UCCL_QUEUE_SIZE`/`UCCL_GIN_MAX_INFLIGHT_NORMAL`/`UCCL_CHANNEL_PER_PROXY`/
+   `UCCL_NUM_PROXY_THS` 宏，默认值=原字面量，V1 不变。
+2. ring/d2h `atomic_set_and_commit` 加 `max_inflight`（默认=容量），V1 不变。
+3. ordered-atomic 状态按 tail-slot 定长数组化（`proxy_ctx.hpp` + `rdma.cpp`）：每个
+   ProxyCtx 单 dst_rank，所以丢掉 (dst,index) 的 hash、改成按 int64 槽直接索引；EFA
+   normal-mode atomic-MR 置空。**关键：piggyback 触发条件 `atomic_offset>0 && atomic_val>0`
+   保持不变**（dev 曾放宽成 `atomic_val>0`，这里不放宽，改用 1-based tail 槽规避 offset 0
+   → 对 V1 可证无影响）。
+4. payload-before-tail 依赖机（`proxy.hpp`/`proxy.cpp`）：`inflight_write_wrs_` +
+   `PendingAtomicBatch` + `enqueue/progress/drain_pending_atomics` + `quiet/quiet_cq/
+   wait_for_cq(release_wrs)`。**profiling 全部省略**。注意这套机制落在共享 post 路径上，
+   V1 internode/LL 也会经过——它只是加强 ordering（tail 等 payload CQE）不重排，理论
+   V1-safe，但**必须服务器跑 V1 回归确认**。
+5. 设备头 `ep/include/uccl_gin/{uccl_gin_rail,resources,uccl_gin}.cuh`：4 个 rail 原语
+   put / put_tail_add(piggyback) / red_add_rel / quiet，无 DeepEP 依赖；resources.cuh
+   去掉 profiling enums。
+6. host binding：`UcclProxy` 设备端 D2HHandle materialize + atomic-buffer addr 存取 +
+   `owns_gpu_buffer`；`uccl_ep.cc` 加 `UCCLGinResourceHandle` nanobind 类。clean 的
+   ctor 多了 `barrier_local_rank`(#985)，已和 `owns_gpu_buffer` 合并成 `(...,
+   barrier_local_rank=-1, owns_gpu_buffer=true)`。
+7. 把 standalone microbench 搬过来，ctor 调用补上 `barrier_local_rank=-1`。
+
+本地静态检查过了（无残留旧签名/profiling 符号、新方法声明定义各 1、改动文件花括号相对
+基线平衡、无其他 UcclProxy 位置实参误绑）。**但本机是 Mac 无 CUDA/EFA 且该 clean clone
+还没同步到 p5en，所以编译 + V1 回归(`test_internode.py`/`test_low_latency.py`) + microbench
+两机跑全部待办**。这是 step-1 的验收 gate，未做不算完成。
+
+V1 安全两个待确认点（已在 plan §D / commit message 记录）：
+- (a) ordered-atomic 定长数组化：靠"每 ProxyCtx 单 dst_rank"成立，已查 `proxy_ctx.hpp:35`
+  单 `dst_rank`/`remote_addr`/`dst_qpn` 佐证；
+- (b) 依赖机落在共享路径——靠 V1 回归测试兜底。
