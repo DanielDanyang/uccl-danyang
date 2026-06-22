@@ -7905,3 +7905,31 @@ ep/ 内 zero UCCL-GIN references。
 - README.md：英文文档（架构、primitives、build、test、API）
 - ARCHITECTURE.md：设计文档（API/transport/ABI/testing/设计决策）
 - worklog：本条记录
+
+## 2026-06-22: 重写 PR stack 的 PR1 机械提取快照
+
+用户决定不再一次性提交 standalone UCCL-GIN 的巨大 diff，而是在
+top-level `experimental/uccl_gin/` 中按 transport 提取、transport 改造、
+device API、host glue、测试、AMD 支持分成多个 stacked PR。
+
+本轮 review 明确了 PR1 的边界：
+
+- PR1 是 provenance/substrate 的**机械文本快照**，不是可编译中间态。
+- 来源 `ep/` 锚定为 top-level commit `0f6bb5ab`；standalone 判定树锚定为
+  nested clone commit `b2a60464`。
+- 之前将 `proxy.cpp` 的 808 行删除统称为 profiling、将 `rdma.cpp`
+  和 `rdma.hpp` 的删除统称为死代码不够准确。其中还包括 PR2 会整段
+  替换的 dependency/coalescing/progress 和 receiver atomic 实现。
+- 因此 PR1 中暂时存在 `commit`、`progress_pending_atomics`、
+  `kIS_COMBINE` 等未闭合引用是已知且有意的，到 PR2 才开启编译/链接 gate。
+
+已用固定 commit 而不是浮动 working-tree `ep/` 重新验证 24 个 transport
+文件：每个文件相对来源的新增行数均为 0，文件数为 24，验证通过。
+
+分支状态：
+
+- 已从 top-level `main` 创建 `uccl-gin-pr1-transport-extract` 分支引用。
+- 当前 worktree 仍停在 `uccl-gin`；因六个 tracked 文件有用户未提交改动，
+  Git 拒绝 switch。本轮没有 stash、丢弃或覆盖这些改动。
+
+仅本地文档/机械子集验证；PR1 按设计无服务器编译或 GPU 测试。

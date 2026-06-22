@@ -1,10 +1,10 @@
 # UCCL-GIN Architecture Document
 
-## 从 `495b7221` (UCCL/EP V1) 到当前 `uccl-gin` (compact32 + piggyback tail)
+## 从 `495b7221` (UCCL/EP V1) 到当前 `uccl-gin` (compact chunking + piggyback tail)
 
 本文档讲解三个独立子系统(NCCL-GIN, DeepEP V2, UCCL/EP V1),然后解释如何将它们
-缝合为 UCCL-GIN,以及 compact32 + piggyback tail 如何把 dispatch 从 ~5 GB/s 推到
-~30 GB/s。
+缝合为 UCCL-GIN,以及 compact channel staging + piggyback tail 如何把 dispatch 从
+~5 GB/s 推到 ~38 GB/s。
 
 ---
 
@@ -17,10 +17,11 @@
 5. [UCCL-GIN 合成: 把 V2 的 scale-out 映射到 V1 的传输底座](#5-uccl-gin-合成-把-v2-的-scale-out-映射到-v1-的传输底座)
 6. [修改清单: 当前 vs `495b7221`](#6-修改清单-当前-vs-495b7221)
 7. [关键数据流详解](#7-关键数据流详解)
-8. [Compact32: 从 1-token WRITE 到 32-token chunk](#8-compact32-从-1-token-write-到-32-token-chunk)
+8. [Compact Channel Staging: 从 per-token WRITE 到 multi-token chunk](#8-compact-channel-staging-从-per-token-write-到-multi-token-chunk)
 9. [Piggyback tail: 消除独立 tail WRITE_WITH_IMM](#9-piggyback-tail-消除独立-tail-write_with_imm)
-10. [Ordering 保证](#10-ordering-保证)
-11. [当前性能状态](#11-当前性能状态)
+10. [Sender-side completion dependency: 在 EFA 上实现 payload-before-tail](#10-sender-side-completion-dependency-在-efa-上实现-payload-before-tail)
+11. [Combine 迁移](#11-combine-迁移)
+12. [当前性能状态](#12-当前性能状态)
 
 ---
 
@@ -41,19 +42,20 @@
 │   ┌──────────────┐          ┌──────────────┐   ┌──────────────┐          │
 │   │  NCCL-GIN     │          │  UCCL-GIN    │   │  NCCL-GIN    │          │
 │   │  (原生路径)    │    vs    │  (我们的路径) │   │  (Lsa/NVLink) │          │
-│   │  ~5 GB/s EFA  │          │  ~30 GB/s EFA│   │  ~120 GB/s    │          │
+│   │  ~5 GB/s EFA  │          │  ~38 GB/s EFA│   │  ~120 GB/s    │          │
 │   └──────┬───────┘          └──────┬───────┘   └──────────────┘          │
 │          │                         │                                      │
 │          ▼                         ▼                                      │
 │   aws-ofi-nccl               UCCL CPU proxy                               │
 │   libfabric/EFA              D2H ring + raw ibverbs/EFA                   │
-│   GIN proxy                  compact32 chunk + piggyback tail             │
-│   (FORCE_SO signals MR)      (async per-tail dep + receiver metadata)     │
+│   GIN proxy                  compact channel staging + piggyback tail     │
+│   (FORCE_SO signals MR)      (sender-side dep + per-slot metadata check)  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**核心差异**: NCCL-GIN 靠 NIC 强序(FORCE_SO MR)发小消息;UCCL-GIN 靠 GPU 侧 compact
-staging 发 32-token chunk + piggyback tail,把消息大小从 14KB 拉到 ~450KB。
+**核心差异**: NCCL-GIN 靠 NIC 强序(FORCE_SO MR)保证 payload-before-signal;UCCL-GIN
+靠 GPU 侧 compact channel staging + piggyback tail + sender-side dependency +
+per-slot metadata readiness 四重机制重建等价保证。
 
 ---
 
@@ -116,19 +118,18 @@ NIC (SO MR):  WRITE 数据到达 remote memory 后,SIGNAL (atomic add) 才可见
 这是 **NIC 级强序**: FORCE_SO MR 上的操作不会互相超越。UCCL-GIN 不能依赖这个
 (EFA SRD 不保证顺序),必须自己重建等价保证(见 §10)。
 
-### 2.4 NCCLGin::put\<Rail\> 和 red_add_rel\<Rail\>
+### 2.4 `ncclGinOptFlagsAggregateRequests` 的真实含义
 
-```cpp
-// put: 一次 RDMA WRITE
-gin.put(TEAM_WORLD_RAIL(), dst_rank_idx,
-        nccl_window, recv_offset,
-        nccl_window, send_offset,
-        num_bytes, remote_action, ...);
-
-// red_add_rel: 对 window 内的 counter 做 atomic add
-// 非 NVLink 可达 → gin.signal(VASignalAdd(window, offset, value))
-// NVLink 可达     → ptx::red_add_rel_sys(dst_ptr, value)
 ```
+gin_device_common.h:  ncclGinOptFlagsAggregateRequests = (1 << 1)
+gin_gdaki.h:          DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_SKIP_DB_RINGING
+gin/proxy/:           未引用 — EFA proxy 下标志被忽略
+```
+
+这不是合并多个 put 为一条 RDMA WRITE。它只是延迟 NIC doorbell:
+连续 `gin.put()` 写 WR 到 NIC submission queue,不敲中间门铃;最后一条不带 flag
+的 put 或 flush 才敲一次。减少的是 GPU→NIC doorbell 写的开销,不是 RDMA 操作数。
+每个 `gin.put()` 仍是独立 WR。
 
 ---
 
@@ -148,31 +149,52 @@ gin.put(TEAM_WORLD_RAIL(), dst_rank_idx,
 │  │  SCALEOUT warps       │  每个 warp = 一个 channel              │
 │  │  = kNumScaleoutWarps  │                                        │
 │  │                       │  route token → dst                    │
-│  │                       │  compact32 batch TMA store            │
+│  │                       │  compact batch TMA store              │
 │  │                       │  rail_put_tail_add(piggyback tail)    │
 │  └──────────────────────┘                                        │
 │                                                                   │
 │  ┌──────────────────────┐                                        │
 │  │  FORWARD warps        │  每个 warp = 一个 channel              │
 │  │                       │                                        │
-│  │                       │  读 signaled tail → 消费 recv slot    │
+│  │                       │  读 tail counter → 消费 recv slot     │
 │  │                       │  per-slot metadata readiness check    │
 │  │                       │  route → scaleup (NVLink/本地)        │
 │  └──────────────────────┘                                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Buffer 布局
+### 3.2 原始 DeepEP V2 的 per-token put
+
+原始代码 (`DeepEP/.../hybrid_dispatch.cuh:444`):
+
+```cpp
+// 每个 token 一条 gin.put — 一条 RDMA WRITE
+gin.put<ncclTeamTagRail>(
+    scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+    scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
+    tma_buffer.get_num_bytes<false>(),
+    stored_dst_scaleout_rank_idx,
+    ncclGinOptFlagsAggregateRequests);
+```
+
+`send_buffer` 按 `token_idx` 索引 — 同 dst 的 token 在内存里不连续。
+FP8 hidden=7168 时每条 WRITE ~14KB,在 EFA 上只能打到 ~5 GB/s。
+
+### 3.3 Buffer 布局改造
 
 ```
 buffer (一段连续 GPU HBM):
   ├─ scaleup_buffer          = kNumScaleupRanks × kNumScaleoutRanks × kNumMaxTokensPerRank
   ├─ scaleout_send_buffer    = kNumChannels × kNumMaxTokensPerChannel     ← compact per-channel
   └─ scaleout_recv_buffer    = kNumScaleoutRanks × kNumChannels × kNumMaxTokensPerChannel
-```
 
-`scaleout_send_buffer` 从原来的 `1 × kNumMaxTokensPerRank`(token_idx 索引,稀疏)
-改为 `kNumChannels × kNumMaxTokensPerChannel`(channel 索引,同 channel 内 compact 连续)。
+原来: scaleout_send_buffer = BufferLayout(token_layout, 1, kNumMaxTokensPerRank, ...)
+       send_buffer[token_idx]  ← 稀疏,dst 穿插
+
+现在: scaleout_send_buffer = BufferLayout(token_layout, 1, kNumCompactSendTokens, ...)
+       其中 kNumCompactSendTokens = kNumChannels × kNumMaxTokensPerChannel
+       send_buffer[channel][compact_slot]  ← 同 channel 内 compact 连续
+```
 
 ---
 
@@ -199,20 +221,41 @@ buffer (一段连续 GPU HBM):
 Byte:  0        1        2      4        6        8       12
      ┌────────┬────────┬────────┬────────┬────────┬────────┐
      │cmd_type│dst_rank│bytes   │req_rptr│req_lptr│atomic  │
-     │(1B)    │(1B)    │(3B)    │(4B)    │/value  │_offset │
-     │        │        │+atomic │        │(4B)    │/expert │
-     │        │        │_val(1B)│        │        │_idx(2B)│
+     │(1B)    │(1B)    │(2B)    │(4B)    │/value  │_offset │
+     │        │        │+atomic │        │(4B)    │(2B)    │
+     │        │        │_val(1B)│        │        │        │
      └────────┴────────┴────────┴────────┴────────┴────────┘
 
 CmdType: EMPTY=0, WRITE=1, ATOMIC=2, QUIET=3, BARRIER=4
 ```
 
-Piggyback tail 复用 `atomic_val`(8-bit) 字段携带 count delta,`atomic_offset` 携带
-tail buffer byte offset——不改变 16B ABI。
+Piggyback tail 复用 `atomic_val`(8-bit) 字段携带 count delta (1..255),
+`atomic_offset` 携带 tail buffer byte offset — 不改变 16B ABI。
 
-### 4.3 V1 的 chunked RDMA
+### 4.3 WRITE cmd vs ATOMIC cmd 的差异
 
-V1 的 coordinator warp 等 sender warp 攒够 6-32 token 后,发一条大 RDMA WRITE:
+```
+WRITE cmd (payload transfer):
+  cmd_type = WRITE
+  req_lptr = local window offset (4-byte shifted)
+  req_rptr = remote window offset (4-byte shifted)
+  bytes    = payload bytes
+
+WRITE cmd + piggyback tail:
+  同上, 但 atomic_val   = count_delta (1..255)
+          atomic_offset = tail buffer byte offset
+
+ATOMIC cmd (standalone tail/finish):
+  cmd_type  = ATOMIC
+  value     = signed delta (±16383)
+  req_rptr  = tail buffer byte offset
+  atomic_offset = 1 (non-zero → ordered PackAtomicWithSeq path)
+```
+
+### 4.4 V1 的 chunked RDMA
+
+V1 的 send buffer 按 `send_buffer[dst][slot]` 布局 — 同 dst 天然连续。
+coordinator warp 可攒 16 token 发一条大 RDMA WRITE:
 
 ```cpp
 // internode.cu:1080-1106
@@ -221,27 +264,7 @@ uccl::nvshmemi_ibgda_put_nbi_warp(..., num_bytes_per_msg, ...);
 // EFA 路径: tail offset + count 嵌入同一 WR (piggyback)
 ```
 
-V1 之所以能做到,是因为 `send_buffer[dst][slot]` 天然连续——sender warp 按 dst 写,
-coordinator 按 dst 发。这是 V2 缺的东西,compact32 补回来了。
-
-### 4.4 V1 的 epoch tag
-
-V1 不依赖 NIC 排序。每个 token 的 metadata 里嵌入递增 epoch number,receiver
-逐 token 自旋验证:
-
-```cpp
-// internode.cu:1268-1297
-int expected_tag = ((i + 1) & 0xFFFFFF) << 8;
-int raw = ld_acquire_sys_global(ptr);
-if ((raw & 0xFFFFFF00) == expected_tag) {
-    seen_bits = raw & 0xFF;  // 新鲜
-} else {
-    while (true) {           // 自旋直到 epoch 匹配
-        raw = ld_volatile_global(ptr);
-        if ((raw & 0xFFFFFF00) == expected_tag) break;
-    }
-}
-```
+V2 缺这个"同 dst 连续"性质,compact channel staging 把它补回来。
 
 ---
 
@@ -251,7 +274,7 @@ if ((raw & 0xFFFFFF00) == expected_tag) {
 
 ```
 handle::UCCLGin {
-    nccl_dev_comm, nccl_window;    // 兼容 NCCLGin 的构造参数
+    nccl_dev_comm, nccl_window;    // 兼容 NCCLGin 的构造签名
     NCCLGin nccl;                  // 组合: Lsa/World 仍走原生 NCCL-GIN
     UCCLGinResources res;         // Rail 后端资源
 }
@@ -259,8 +282,14 @@ handle::UCCLGin {
 put<Rail>()         → rail_put / rail_put_tail_add  → D2H → proxy → EFA
 put<Lsa>()          → nccl.put<Lsa>()               → 原生 NCCL NVLink
 put<World>()        → nccl.put<World>()              → 原生 NCCL
+put_value<Rail>()   → __trap() (P2 TODO)
+red_add_rel<Rail>() → __trap() (已用 compact-index API 替代)
+red_add_rel<Lsa>()  → nccl.red_add_rel<Lsa>()        → 原生 NCCL
+
+Explicit compact-index tail API:
 rail_put_tail_add() → 一条 WRITE cmd + piggyback tail (atomic_val + atomic_offset)
 rail_tail_add()     → 独立 tail ATOMIC cmd (finish flag 用)
+rail_red_add()      → 独立 ordered ATOMIC cmd (single delta)
 ```
 
 ### 5.2 为什么 tail 需要 compact-index API
@@ -274,36 +303,63 @@ NCCL-GIN 的 `red_add_rel` 传 window 内的 `sym_ptr`。UCCL 做不到:
 ```
 atomic_tail_base[channel_idx * num_scaleout_ranks + src_rank_idx]
 ```
-每个条目 8 字节(int64_t),finish bit = `kUCCLGinTailFinishDelta = 8192`,count mask = 8191。
+每个条目 8 字节(int64_t)。编码:finish bit = `kUCCLGinTailFinishDelta = 8192`,
+count 部分 = raw % 8192。forward warp 解码:
+```
+finish = raw >= 8192
+count  = raw - (finish ? 8192 : 0)
+```
 
-### 5.3 文件结构
+### 5.3 UCCLGinResources
+
+```cpp
+struct UCCLGinResources {
+    d2hq::D2HHandle** d2h_queues;    // device array of D2H handle pointers
+    uint32_t num_queues;
+    uint64_t window_base;            // registered window offset origin
+    uint64_t atomic_tail_base;       // tail counter buffer base
+    int num_scaleout_ranks;
+    int num_scaleup_ranks;
+    int scaleout_rank;
+    int scaleup_rank;
+    uint32_t num_lanes;
+};
+```
+
+### 5.4 文件结构
 
 ```
 ep/
 ├── include/
 │   ├── uccl_gin/
-│   │   ├── uccl_gin_handle.cuh       ← handle::UCCLGin (DeepEP 集成)
-│   │   ├── uccl_gin_rail.cuh         ← rail_put / rail_red_add / rail_put_tail_add
-│   │   └── resources.cuh             ← UCCLGinResources POD
-│   ├── proxy.hpp                     ← PendingAtomicBatch, profile counters
-│   ├── ring_buffer.cuh               ← TransferCmd, CmdType (V1 继承)
-│   └── d2h_queue_device.cuh          ← d2hq::D2HHandle (V1 继承)
+│   │   ├── uccl_gin_handle.cuh      ← handle::UCCLGin (DeepEP 集成)
+│   │   ├── uccl_gin_rail.cuh        ← rail_put / rail_put_tail_add / rail_red_add
+│   │   └── resources.cuh            ← UCCLGinResources POD + profile counters
+│   ├── proxy.hpp                    ← proxy context, atomic batch, profile
+│   ├── ring_buffer.cuh              ← TransferCmd, CmdType (V1 继承)
+│   └── d2h_queue_device.cuh         ← d2hq::D2HHandle (V1 继承)
 ├── src/
-│   ├── proxy.cpp                     ← async per-tail dep, piggyback decode, compact profile
-│   ├── rdma.cpp                      ← WRITE_WITH_IMM + PackAtomicWithSeq + piggyback
-│   └── uccl_ep.cc                    ← 资源初始化 + JIT 编译入口
+│   ├── proxy.cpp                    ← async per-tail dep, piggyback decode, profiling
+│   ├── rdma.cpp                     ← WRITE_WITH_IMM + PackAtomicWithSeq + piggyback
+│   └── uccl_ep.cc                   ← 资源初始化 + JIT 编译入口
+├── tests/
+│   └── uccl_gin_microbench/         ← 独立 microbench (vs NCCL GIN)
 └── docs/
     ├── uccl_gin_plan.md
-    ├── uccl_gin_architecture.md      ← 本文档
-    └── uccl_gin_compact_staging.md   ← compact32 设计讨论
+    ├── uccl_gin_architecture.md     ← 本文档
+    ├── uccl_gin_perf_plan.md        ← 性能优化计划与数据
+    └── uccl_gin_perf_cx7_vs_efa.md  ← CX7 vs EFA benchmark
 
-thirdparty/DeepEP-v2-d4f41e4/         ← vendored DeepEP V2 (in-tree)
-└── deep_ep/
-    ├── include/deep_ep/
-    │   ├── common/handle.cuh         ← NCCLGin (纯净)
-    │   └── impls/
-    │       └── hybrid_dispatch.cuh   ← 主 kernel (compact32 + piggyback patch)
-    └── buffers/elastic.py            ← Python buffer (atomic_tail_base 分配)
+thirdparty/DeepEP-v2-d4f41e4/        ← vendored DeepEP V2 (in-tree)
+├── deep_ep/
+│   ├── include/deep_ep/
+│   │   ├── common/handle.cuh        ← NCCLGin (纯净)
+│   │   └── impls/
+│   │       └── hybrid_dispatch.cuh  ← 主 dispatch kernel (UCCL-GIN patch)
+│   └── buffers/elastic.py           ← Python buffer (atomic_tail_base 分配)
+└── csrc/
+    ├── elastic/buffer.hpp           ← get_native_v2_resources() 接口注入
+    └── jit/                         ← JIT compiler include path 注入
 ```
 
 ---
@@ -315,11 +371,11 @@ thirdparty/DeepEP-v2-d4f41e4/         ← vendored DeepEP V2 (in-tree)
 | 文件 | 用途 |
 |------|------|
 | `ep/include/uccl_gin/uccl_gin_handle.cuh` | `handle::UCCLGin`: Rail→UCCL D2H, Lsa/World→NCCL delegate |
-| `ep/include/uccl_gin/uccl_gin_rail.cuh` | `rail_put` / `rail_red_add` / `rail_put_tail_add` |
-| `ep/include/uccl_gin/resources.cuh` | `UCCLGinResources` POD |
-| `ep/docs/uccl_gin_architecture.md` | 本文档 |
-| `ep/docs/uccl_gin_compact_staging.md` | compact32 设计讨论 |
+| `ep/include/uccl_gin/uccl_gin_rail.cuh` | `rail_put` / `rail_put_tail_add` / `rail_red_add` |
+| `ep/include/uccl_gin/resources.cuh` | `UCCLGinResources` POD + profiling counters |
+| `ep/tests/uccl_gin_microbench/` | 独立 microbench: put + red_add vs 原生 NCCL GIN |
 | `thirdparty/DeepEP-v2-d4f41e4/` | Vendored DeepEP V2 (upstream `d4f41e4`) |
+| `ep/docs/uccl_gin_*.md` | 设计/性能/架构文档 |
 
 ### 6.2 proxy.cpp 修改
 
@@ -328,32 +384,38 @@ thirdparty/DeepEP-v2-d4f41e4/         ← vendored DeepEP V2 (in-tree)
 - `retire_inflight_write()`: WRITE CQE 完成时递减依赖 batch 的 `pending_writes`
 - `progress_pending_atomics()`: 队首 batch 依赖满足时 post atomics
 - `enqueue_atomics_ordered()`: 替代旧的 `flush_atomics()`,不再同步 drain
-- `drain_pending_atomics()`: QUIET/BARRIER 时阻塞排空所有 pending batch
 
 **Piggyback tail decode**:
 - `rdma.cpp`: WRITE cmd 的 `atomic_val > 0` 时 piggyback tail delta + offset,
   复用已有 `WRITE_WITH_IMM` + `PackAtomicWithSeq` receiver reorder/apply 逻辑
 
-**Profiling**:
-- `piggyback_atomic_write_cmds`: 统计 payload WR 中携带的 tail count update
-- `semantic_remote_*`: 统计 per (ring,dst) 的 token 连续性
+**Finish dependency 收窄**:
+- 只有 plain WRITE (`atomic_val == 0`) 进入 `atomic_dependency_wrs_`
+- WRITE_WITH_IMM 的 count delta 和 finish ATOMIC 共享 per-tail sequence,
+  receiver 按 seq 顺序 apply,所以 sender 端不需要额外依赖
 
-### 6.3 hybrid_dispatch.cuh 修改 (compact32 + piggyback)
+**Profiling**:
+- `profile_commands_`: 拆解 poll/progress/post 耗时
+- `piggyback_atomic_write_cmds`: 统计 payload WR 中携带的 tail count
+
+### 6.3 hybrid_dispatch.cuh 修改 (compact channel staging)
 
 **Buffer 重索引**:
 ```
 原来: scaleout_send_buffer = BufferLayout(token_layout, 1, kNumMaxTokensPerRank, ...)
       send_buffer[token_idx]  ← 稀疏,dst 穿插
-现在: scaleout_send_buffer = BufferLayout(token_layout, kNumChannels, kNumMaxTokensPerChannel, ...)
+
+现在: constexpr int kNumCompactSendTokens = kNumChannels * kNumMaxTokensPerChannel;
+      scaleout_send_buffer = BufferLayout(token_layout, 1, kNumCompactSendTokens, ...)
       send_buffer[channel][compact_slot]  ← compact,同 dst 连续
 ```
 
 **Scaleout warp compact batch**:
 ```cpp
-constexpr int kUCCLGinCompactChunkTokens = 32;       // chunk 目标
+constexpr int kUCCLGinCompactChunkTokens = 4;           // chunk 目标
 const int remote_scaleout_rank_idx = scaleout_rank_idx ^ 1;  // EP8x2: 唯一 remote dst
 
-// compact slot = V2 已分配的 expanded recv slot
+// compact slot = exchange(tail, remote_dst) → V2 recv slot, monotonic 递增
 const int compact_remote_slot_idx = ptx::exchange(stored_scaleout_tail, remote_scaleout_rank_idx);
 
 // TMA store 到 compact slot (同 dst 连续)
@@ -370,11 +432,11 @@ flush_compact_remote_batch():
     gin.rail_put_tail_add(
         recv[first_slot],              // 目标连续 (V2 expanded layout)
         send_channel[first_slot],      // 源连续 (compact staging)
-        count * token_bytes,           // ~450KB for 32 tokens
+        count * token_bytes,           // 4 × ~14KB ≈ 56KB for FP8 hidden=7168
         remote_scaleout_rank_idx,
         channel_idx, scaleout_rank_idx,
-        count);                        // tail delta = chunk token count
-    // finish flag 单独走 rail_tail_add(0, finish=true)
+        count);                        // tail delta = chunk token count (1..255)
+    // finish flag 单独走 rail_tail_add(count=0, finish=true)
 ```
 
 **Forward warp metadata readiness**:
@@ -387,15 +449,29 @@ comm::timeout_while([&]() {
 });
 ```
 
+### 6.4 vendored DeepEP V2 注入 (`get_native_v2_resources`)
+
+在 `csrc/elastic/buffer.hpp::ElasticBuffer` 新增方法:
+```
+get_native_v2_resources() → pybind11::dict {
+    workspace_bytes, buffer_bytes, cpu_buffer_bytes,
+    workspace_ptr, buffer_ptr, rdma_workspace_ptr,
+    mapped_host_workspace_ptr, host_workspace_ptr,
+    nccl_dev_comm_ptr, nccl_window_ptr
+}
+```
+暴露 symmetric window 基地址、MR 原地址和 NCCL handle 给 UCCL-GIN proxy 层,
+用于 `ibv_reg_mr` 和 window offset 计算。
+
 ---
 
 ## 7. 关键数据流详解
 
-### 7.1 Dispatch 全链路 (compact32 + piggyback)
+### 7.1 Dispatch 全链路
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                    DeepEP V2 Dispatch — compact32 + piggyback tail                    ║
+║                    DeepEP V2 Dispatch — compact + piggyback tail                      ║
 ╠══════════════════════════════════════════════════════════════════════════════════════╣
 ║                                                                                      ║
 ║  ┌─ GPU SM [scaleout warp, channel c] ──────────────────────────────────────────┐   ║
@@ -405,35 +481,39 @@ comm::timeout_while([&]() {
 ║  │    dedup → dst_rank, slot                                                    │    ║
 ║  │    if dst is remote:                                                         │    ║
 ║  │      compact_slot = exchange(tail, remote_dst)  ← V2 已分配的 recv slot      │    ║
-║  │      TMA store → send[channel][compact_slot]    ← compact 连续!              │    ║
+║  │      TMA store → send[channel][compact_slot]    ← compact,同 dst 连续!       │    ║
 ║  │      batch.count++                                                           │    ║
-║  │      if batch.count == 32:                                                   │    ║
+║  │      if batch.count == 4:                                                    │    ║
 ║  │        flush:                                                                │    ║
 ║  │          rail_put_tail_add(send[channel][first], recv[first],                │    ║
-║  │                            32×14KB, dst, ch, src, count=32)                  │    ║
+║  │                            4×14KB, dst, ch, src, count=4)                    │    ║
 ║  │            │                                                                 │    ║
 ║  │            ▼                                                                 │    ║
-║  │        TransferCmd{WRITE, bytes=32×14KB, atomic_val=32,                      │    ║
+║  │        TransferCmd{WRITE, bytes=4×14KB, atomic_val=4,                        │    ║
 ║  │                    atomic_offset=tail_byte_off}                               │    ║
 ║  │        → D2H ring: 一条 WRITE cmd 同时带 payload + tail delta                │    ║
 ║  │                                                                              │    ║
 ║  └──────────────────────────────────────────────────────────────────────────────┘   ║
 ║                                          │                                           ║
-║                          D2H ring buffer (一条 cmd = 32 token)                       ║
+║                          D2H ring buffer (一条 cmd ≈ 4 token payload)                 ║
 ║                                          │                                           ║
 ║  ┌─ CPU Proxy thread ───────────────────────────────────────────────────────────┐   ║
 ║  │                                                                              │    ║
 ║  │  cmd.atomic_val > 0:                                                         │    ║
 ║  │    → ibv_post_send(WRITE_WITH_IMM,                                           │    ║
-║  │        imm=PackAtomicWithSeq(count=32, offset=tail_byte_off, seq))           │    ║
-║  │    一条 EFA WRITE_WITH_IMM: payload 32 token + imm 带 tail delta             │    ║
+║  │        imm=PackAtomicWithSeq(count=4, offset=tail_byte_off, seq))            │    ║
+║  │    一条 EFA WRITE_WITH_IMM: payload 4 token + imm 带 tail delta              │    ║
+║  │    → inflight_write_wrs_ (retirement tracking)                               │    ║
+║  │    → 因为 atomic_val != 0, 不进入 finish dependency                          │    ║
 ║  │                                                                              │    ║
 ║  │  cmd.atomic_val == 0:                                                        │    ║
 ║  │    → ibv_post_send(RDMA_WRITE)  ← 纯 payload,无 tail                         │    ║
+║  │    → atomic_dependency_wrs_  ← 需要等 CQE 才能发 finish                      │    ║
 ║  │                                                                              │    ║
 ║  │  cmd.cmd_type == ATOMIC:                                                     │    ║
+║  │    → enqueue_atomics_ordered()  ← 依赖 plain WRITE CQE 全部完成后才 post     │    ║
 ║  │    → ibv_post_send(WRITE_WITH_IMM,                                           │    ║
-║  │        imm=PackAtomicWithSeq(value, offset, seq))  ← finish flag,独立 tail   │    ║
+║  │        imm=PackAtomicWithSeq(delta, offset, seq))  ← finish flag,独立 tail   │    ║
 ║  │                                                                              │    ║
 ║  └──────────────────────────────────────────────────────────────────────────────┘   ║
 ║                                          │                                           ║
@@ -442,12 +522,12 @@ comm::timeout_while([&]() {
 ║  ┌─ Node 1 (receiver) ──────────────────────────────────────────────────────────┐   ║
 ║  │                                                                              │    ║
 ║  │  WRITE_WITH_IMM → NIC DMA 写入 payload + receiver CPU 收到 imm               │    ║
-║  │    → CPU proxy 解码 PackAtomicWithSeq(seq, offset, count)                    │    ║
-║  │    → 如果 seq 乱序,暂存 reorder buffer                                       │    ║
-║  │    → seq 就绪时: atomicAdd(atomic_tail_base[offset], count)                  │    ║
+║  │    → CPU proxy 解码 PackAtomicWithSeq(seq, offset, delta)                    │    ║
+║  │    → 如果 seq 乱序,暂存 reorder buffer (深度浅,绝大多数按序)                 │    ║
+║  │    → seq 就绪时: atomicAdd(atomic_tail_base[offset], delta)                  │    ║
 ║  │                                                                              │    ║
 ║  │  GPU SM [forward warp, same channel c]:                                       │    ║
-║  │    ld_acquire_sys(rail_tail_ptr) → signaled tail                             │    ║
+║  │    ld_acquire_sys(rail_tail_ptr) → signaled tail (count + finish bit)        │    ║
 ║  │    for slot in [old_tail, new_tail):                                         │    ║
 ║  │      ① metadata readiness: spin on src_token_global_idx                      │    ║
 ║  │      ② TMA store wait (NIC DMA 长尾)                                         │    ║
@@ -459,18 +539,16 @@ comm::timeout_while([&]() {
 
 ---
 
-## 8. Compact32: 从 1-token WRITE 到 32-token chunk
+## 8. Compact Channel Staging: 从 per-token WRITE 到 multi-token chunk
 
 ### 8.1 问题
 
-V2 的 `scaleout_send_buffer` 原先按 `token_idx` 索引——token 0(dst=1) → slot 0,
-token 1(dst=0) → slot 1,同 dst 的 token 在本地内存里**从来不连续**。每条
-`gin.put` 发 1 token(~14KB),在 EFA 上只能打到 ~5 GB/s。
+V2 的 `scaleout_send_buffer` 原先按 `token_idx` 索引 — 同 dst 的 token 在本地内存里
+不连续。每条 `gin.put` 发 1 token(~14KB FP8),在 EFA 上只能打到 ~5 GB/s。
 
-V1 每条 RDMA WRITE 发 6-32 token(~84-450KB),因为 `send_buffer[dst][slot]` 天然
-连续。UCCL-EP 论文 §3.3 明确说 HT 模式 chunk 典型值是 **32 tokens**。
+V1 每条 RDMA WRITE 发 16 token(~225KB),因为 `send_buffer[dst][slot]` 天然连续。
 
-EFA 小包性能 microbench 数据:
+EFA 小包性能 microbench 数据 (gin_proxy_bench, 2 节点 × 1 GPU, 2 rails):
 
 ```
  4 KiB →  2.8 GB/s
@@ -480,50 +558,50 @@ EFA 小包性能 microbench 数据:
  1 GiB → 44.8 GB/s
 ```
 
-当前 14KB/token 在曲线底部;32 token × 14KB ≈ 450KB 进入大消息区间。
-
 ### 8.2 设计
 
 **同一个 `scaleout_send_buffer`,换索引方式。不新增 buffer,不新增 TMA store。**
 
 ```
-当前 (sparse):
+原始 (sparse):
   TMA store → send_buffer[token_idx]           // dst 穿插
   gin.put(send_buffer[token_idx], recv[slot])  // 每 token 一条小 WRITE
 
-Compact32:
-  compact_slot = exchange(tail, remote_dst)  // V2 已分配的 recv slot,monotonic
+Compact:
+  compact_slot = exchange(tail, remote_dst)  // V2 recv slot, monotonic
   TMA store → send_buffer[channel][compact_slot]  // 同 dst 连续!
-  攒够 32 token:
+  攒够 4 token:
     rail_put_tail_add(send[channel][first], recv[first],
-                      32 × token_bytes, dst, ch, src, count=32)
+                      4 × token_bytes, dst, ch, src, count=4)
     // 一条大 WRITE = 一条 D2H cmd
-```
-
-```
-scaleout_send_buffer 分区:
-
-  ┌────────────────────────────────────────────────────────────┐
-  │              scaleout_send_buffer                           │
-  │        (kNumChannels × kNumMaxTokensPerChannel tokens)      │
-  │                                                             │
-  │  channel 0:  [slot 0][slot 1][slot 2]...[slot N-1]         │
-  │              └── compact, 同 dst 连续 ──┘                   │
-  │  channel 1:  [slot 0][slot 1][slot 2]...[slot N-1]         │
-  │  ...                                                        │
-  └────────────────────────────────────────────────────────────┘
 ```
 
 **EP8x2 关键简化**: 每个 rank 只有一个 remote scaleout dst
 (`remote_scaleout_rank_idx = scaleout_rank_idx ^ 1`)。local dst 走 bypass
 (TMA store 直接到 recv buffer),不占 send buffer。所以 `send[channel][slot]` 里
-所有 token 都去同一个 remote dst,`stored_dst_slot_idx` 本身 monotonic 递增,
-就是天然的 compact slot index。
+所有 token 都去同一个 remote dst,slot index monotonic 递增,天然连续。
 
 **Buffer 大小不变**: `kNumChannels × kNumMaxTokensPerChannel ≈ kNumMaxTokensPerRank`,
-和原来 `1 × kNumMaxTokensPerRank` 相近。
+和原来 `1 × kNumMaxTokensPerRank` 相近 (带 compact padding)。
 
-### 8.3 Batch flush 逻辑
+### 8.3 为什么 chunk size 是 4 而不是 32
+
+Chunk sweep 实测结果 (EP8x2, tokens=8192, hidden=7168, FP8):
+
+```
+tokens/chunk   cache dispatch SO BW   dispatch_impl latency
+64             ~27 GB/s               2.23-2.31 ms
+32             ~31-32 GB/s            1.93-2.00 ms
+16             ~33-34 GB/s            1.79-1.83 ms
+ 8             ~35-36 GB/s            1.70-1.73 ms
+ 4             ~37-38 GB/s            1.59-1.64 ms  ← 最优
+ 2             ~32 GB/s               1.90-1.93 ms
+```
+
+4-token 是当前最优平衡:chunk 再大,count/tail update 推迟,forward warp 更晚知道
+payload 可消费,overlap 损失超过 WR 减少的收益。
+
+### 8.4 Batch flush 逻辑
 
 ```cpp
 // 每 token:
@@ -533,23 +611,15 @@ elif first_slot + batch_count != compact_slot:
     flush()  // 不连续 → 前一批结束
     first_slot = compact_slot
 batch_count++
-if batch_count >= 32:
+if batch_count >= kUCCLGinCompactChunkTokens:  // = 4
     flush()
 
 // Channel 结束时:
 flush(finish=true)  // 残余 batch + finish flag
+
+// 注意: EP8x2 下 local bypass 不占 send slot,slot 天然连续,
+// NonContig flush 极少发生 (profile 显示 ~0)
 ```
-
-`stored_dst_slot_idx` 在 EP8x2 下 monotonic 递增,所以 `first_slot + count == next_slot`
-基本总是成立。不连续的情况只出现在中间有 local-dst token 跳过 send buffer——但
-EP8x2 下 local 和 remote 是不同 dst,local bypass 不消耗 send slot,所以 slot 序列
-天然连续。
-
-### 8.4 为什么不用 smem batch
-
-H200 单 SM 228KB shared memory,16 warps/SM 同时工作。每个 token ~14KB,32 token
-= 448KB,远超 SM 容量。compact staging 在 HBM 里做,利用已有 TMA store,零额外
-GPU copy。
 
 ---
 
@@ -557,31 +627,10 @@ GPU copy。
 
 ### 9.1 问题
 
-Compact32 之前,每 3 token 一条独立 tail ATOMIC(WRITE_WITH_IMM)。profile 显示
-`atomic_cmds ≈ 155k` per proxy thread——每条都需要一次 `ibv_post_send` + receiver
-CQE + CPU software atomic apply。
+如果每个 chunk 都要一条独立 tail ATOMIC,proxy 每轮多跑一条
+`ibv_post_send` + receiver CQE + software atomic apply。
 
-Compact32 减少了 WRITE cmd 数量(455k → ~3k),但如果不 piggyback,每个 chunk 仍需
-一条独立 tail ATOMIC: ~3k 条。
-
-### 9.2 设计: 复用 16B TransferCmd 的 atomic_val 字段
-
-```
-TransferCmd (16 bytes):
-  WRITE cmd + piggyback tail:
-    cmd_type  = WRITE
-    bytes     = 32 × 14KB
-    atomic_val = 32 (count delta, 1..255)
-    atomic_offset = tail_byte_off (13-bit)
-    req_lptr  = local window offset
-    req_rptr  = remote window offset
-
-  vs 独立 ATOMIC cmd (finish flag):
-    cmd_type  = ATOMIC
-    value     = finish_delta (8192 + 0)
-    req_rptr  = tail_byte_off
-    atomic_offset = 1 (ordered path)
-```
+### 9.2 设计: 复用 16B TransferCmd 的 fields
 
 `rail_put_tail_add` (device side):
 
@@ -607,55 +656,66 @@ if (cmd.atomic_val > 0) {
 }
 ```
 
-一条 EFA WRITE_WITH_IMM = payload(32 token) + imm(tail delta + offset + seq)。
+一条 EFA WRITE_WITH_IMM = payload(4 token) + imm(tail delta + byte offset + sequence)。
 Receiver proxy 解码 imm,reorder buffer 按 seq 排序后 apply atomicAdd。
 
-### 9.3 Profile 验证
+### 9.3 与 finish 的 sequence 共享
 
-```
-                   compact32 only    compact32 + piggyback
-                   ─────────────     ────────────────────
-write_cmds:        ~956k              ~956k  (不变)
-piggyback:         0                  ~952k  (count tail 并入 payload)
-atomic_cmds:       ~952k              ~238k  (只剩 finish flag)
-dispatch SO BW:    ~18 GB/s           ~30 GB/s
-```
+Piggyback WRITE_WITH_IMM 的 count delta 和后续的 finish ATOMIC 打到
+**同一个 per-(channel, src_rank) tail counter**。两者共享 receiver 端 sequence
+计数器。因为 receiver 按 seq apply:
+1. count delta 先 apply (在 payload WRITE 的 imm 中)
+2. finish delta 后 apply (独立的 ATOMIC,更大 seq)
+3. 中间如有乱序,reorder buffer 缓冲
 
-独立的 count tail WRITE_WITH_IMM 基本消除。剩余 `atomic_cmds` 主要是每个 channel
-的 finish flag 更新。
+所以 sender 端:只有 `atomic_val == 0` 的 plain WRITE 才需要追踪 completion
+dependency。Piggyback WRITE_WITH_IMM 不需要。这使得 dependency_max 从 72 降到 2。
 
 ---
 
-## 10. Ordering 保证
+## 10. Sender-side completion dependency: 在 EFA 上实现 payload-before-tail
 
-### 10.1 双层保证
+### 10.1 问题
 
-UCCL-GIN 没有 NCCL 的 FORCE_SO signals MR(NIC 强序),用双层保证重建等价的
-payload-before-tail 语义:
+EFA SRD 不保证多个 RDMA WRITE 按发出顺序到达。如果 finish ATOMIC 比某条 payload
+WRITE 先到,receiver 可能读到 finish flag 后立即消费 slot,但 slot 里的 payload 还未
+落盘 → 读到垃圾。
+
+NCCL 用 FORCE_SO signals MR (NIC 级强序) 解决。EFA 不支持。
+
+### 10.2 双层保证
 
 **Layer 1: Sender-side async per-tail dependency** (proxy.cpp)
 
 ```
 WRITE W0..W31 posted → inflight_write_wrs_
-                         atomic_dependency_wrs_ = [W0..W31]
 
-Piggyback tail ATOMIC:
-  batch.pending_writes = count of still-inflight WRITEs
-  atomic_dep_by_wr_[W0] = &batch
-  ...
+Piggyback WRITE_WITH_IMM (atomic_val > 0):
+  → 不进入 atomic_dependency_wrs_  ← 与 finish 共享 sequence
 
-  后续 WRITE 继续 post,不受阻碍  ← 与早期同步 drain 不同
+Plain WRITE (atomic_val == 0):
+  → atomic_dependency_wrs_.push_back(wr_id)
+
+Finish ATOMIC:
+  → enqueue_atomics_ordered():
+      batch = {pending_writes = |dependency_wrs_|}
+      for each wr_id: atomic_dep_by_wr_[wr_id] = &batch
+      pending_atomics_.push_back(batch)
 
 CQ poll:
-  W0 acked → retire_inflight_write(W0) → batch.pending_writes--
-  ...
-  pending_writes == 0 → post atomic batch
+  retire_inflight_write(wr_id):
+    batch = atomic_dep_by_wr_[wr_id]
+    if (--batch->pending_writes == 0)
+      → post finish ATOMIC   ← 所有 payload CQE 已回
 ```
 
-**Layer 2: Receiver-side metadata readiness** (hybrid_dispatch.cuh)
+关键:后续 WRITE 继续 post,不受 finish dependency 阻塞。旧的同步 drain 会等所有
+WRITE CQE 才能发下一个 batch,新路径去掉了这个瓶颈。
+
+**Layer 2: Receiver-side per-slot metadata readiness** (hybrid_dispatch.cuh)
 
 ```cpp
-// tail 公布 slot range; 每个 slot 独立验证 payload 可见性
+// tail 公布 slot range; 每个 slot 独立验证 payload 落地
 observed = ld_acquire_sys(token_buffer.get_src_token_global_idx_ptr());
 ready = (observed / kNumMaxTokensPerRank == expected_rank) && (observed > old);
 ```
@@ -663,7 +723,7 @@ ready = (observed / kNumMaxTokensPerRank == expected_rank) && (observed > old);
 UCCL-EP 论文 §3.3 Figure 7 确认 receiver-side ordering 优于 sender-side
 CQE drain(sender 端等 CQE 多一个 RTT)。
 
-### 10.2 与 NCCL FORCE_SO 的等价性
+### 10.3 与 NCCL FORCE_SO 的等价性
 
 ```
 NCCL FORCE_SO:
@@ -676,41 +736,91 @@ UCCL-GIN 等价:
   → receiver GPU 信任 signaled tail + per-slot check
 ```
 
+### 10.4 D2H inflight cap
+
+`kUCCLGinMaxInflightNormal` 限制每个 D2H ring 内同时 inflight (已 commit 但未 ack)
+的命令数量。防止 GPU 侧过快灌满 ring + proxy 来不及 drain。当前值:
+```
+UCCL_GIN_MAX_INFLIGHT_NORMAL = 8  (编译时宏,可通过 Makefile 调整)
+```
+
+Sweep 已证明 cap=0 (无限) 无改善,cap=8 仅用于 sequence 安全 (4-bit seq 最多 16 条
+inflight 不 wrap) 和可控背压。
+
 ---
 
-## 11. 当前性能状态
+## 11. Combine 迁移
 
-### 11.1 已验证配置 (EP8x2, CUDA 13.0, NCCL 2.30.4, aws-ofi-nccl master)
+Combine 与 dispatch 共享同一个 UCCL-GIN transport 底座:
 
-| 版本 | dispatch SO BW | write_cmds | atomic_cmds | 说明 |
-|------|---------------|------------|-------------|------|
-| per-token gin.put | ~4-8 GB/s | ~455k | ~155k | 每条 token 独立小 WRITE |
-| per-token + async tail | ~8 GB/s | ~455k | ~155k | 删除了同步 drain |
-| compact32 | ~18 GB/s | ~956k | ~952k | 32-token chunk,独立 tail |
-| compact32 + piggyback | **~30 GB/s** | ~956k | ~238k | tail 嵌入 payload WRITE |
+```
+GPU combine forward warp
+  → replay token_metadata_at_forward
+  → reduce / TMA store 到 V2 scaleout send buffer
+  → 每个 remote token gin.put<Rail> → rail_put → D2H WRITE cmd
+  → 每 channel/source 结束发 standalone finish ATOMIC
 
-### 11.2 已知差距
+CPU proxy
+  → plain payload WRITE 进入 finish dependency tracking
+  → finish 等这些 WRITE CQE 后发送
+  → receiver 等 finish apply 后清 tail
+```
 
-| 项目 | 当前 | 目标 |
-|------|------|------|
-| dispatch SO BW | ~30 GB/s | ~44 GB/s (EFA 理论上限) |
-| combine SO BW | ~7-11 GB/s | 30+ GB/s (待 compact/piggyback) |
-| `AggregateRequests` | 被丢弃 | proxy payload coalescing |
-| EP 配置 | EP8x2 only | EP16, EP24+ |
-| `put_value` | `__trap()` | 实现(notify count path) |
-| `red_add_rel<Rail>` | `__trap()` | compact-index API 替代 |
-| `kAtomicOffMask` channel 上限 | ~511 channels | 全 H200 132SM |
-| 跨迭代 tail race | `atomic_tail_base` clear 不保证 proxy 已 drain | gin.quiet() 或 host-side drain |
+Combine 与 dispatch 的关键差异:
+- **没有 compact staging**: combine 的 emission order 导致 remote_contig=0%
+  (P1.2 merge-opportunity profile 证实)
+- **没有 piggyback tail**: 每条 token 独立 `gin.put<Rail>`,count 由独立的
+  finish ATOMIC 传达
+- **per-token WRITE 数量**: ~8155 条 vs dispatch compact 后的 ~2000 条
 
-### 11.3 UCCL-EP 论文对照
+这解释了 combine 的 `28-30 GB/s SO` 低于 dispatch `37-38 GB/s SO`。combine 的
+receiver-facing staging/layout-aware compact 是主要候选优化,但需要先量化
+local copy 成本 vs 减少 WR 的收益 (§PT.2 of perf plan)。
+
+---
+
+## 12. 当前性能状态
+
+### 12.1 已验证配置 (EP16, CUDA 13.0, NCCL 2.30.4, aws-ofi-nccl master)
+
+```
+dispatch:          37-38 GB/s SO, 1.60-1.64 ms
+expanded dispatch: 37-38 GB/s SO, 1.61-1.64 ms
+cached dispatch:   37-38 GB/s SO, 1.60-1.63 ms
+combine:           28-30 GB/s SO, 3.96-4.16 ms
+reduced combine:   ~31 GB/s SO, 3.75-3.82 ms
+```
+
+### 12.2 演进路线
+
+| 版本 | dispatch SO BW | 关键改动 |
+|------|---------------|---------|
+| per-token gin.put (原始) | ~5 GB/s | 每 token 一条 WRITE |
+| + async tail | ~8 GB/s | 删除同步 drain |
+| + compact channel staging | 逐步提升 | 4-token chunk, per-channel buffer |
+| + piggyback tail | ~38 GB/s | tail 嵌入 payload WRITE_WITH_IMM |
+| + dependency narrowing | ~38 GB/s | dependency_max 72→2, ~2-4% |
+| + inflight cap + cleanups | ~38 GB/s | 背压, profiling |
+
+### 12.3 已知差距与方向
+
+| 项目 | 当前 | V1 baseline | 方向 |
+|------|------|-----------|------|
+| dispatch SO BW | 37-38 GB/s | 59 GB/s | ready/tag/landing 解耦 payload 大小与 tail 可见性 |
+| combine SO BW | 28-30 GB/s | — | receiver-facing staging,减少 per-token WR |
+| EP 配置 | EP8x2 | 通用 | 泛化 compact state 到 >2 scaleout ranks |
+| `put_value<Rail>` | `__trap()` | functional | P2 实现 |
+| 跨迭代 tail race | 未解决 | — | gin.quiet() 或 epoch/double buffer |
+
+### 12.4 UCCL-EP 论文对照
 
 | 论文结论 | UCCL-GIN 现状 |
 |----------|--------------|
-| HT mode chunk = 32 tokens | ✅ compact32 = 32 tokens |
-| Write + piggyback atomic | ✅ `rail_put_tail_add` |
-| Receiver-side ordering | ✅ metadata readiness + proxy reorder buffer |
-| Per-channel FIFO ordering | ✅ `lane(channel_idx)` |
-| LL mode token packing = future work | 本设计就是 LL 粒度的 HT-style chunking |
+| chunk RDMA + piggyback atomic | ✅ rail_put_tail_add |
+| Receiver-side ordering | ✅ per-slot metadata readiness + proxy reorder buffer |
+| Per-channel FIFO ordering | ✅ lane(channel_idx) |
+| HT mode chunk = 16 tokens (default) | △ 4 tokens 最优 (EFA 约束) |
+| LL mode token packing = future work | △ 方向一致,当前 compact 即为类似思路 |
 
 ---
 
@@ -718,16 +828,19 @@ UCCL-GIN 等价:
 
 | 常量 | 值 | 来源 | 含义 |
 |------|-----|------|------|
-| `kUCCLGinCompactChunkTokens` | 32 | hybrid_dispatch.cuh | compact batch 目标 |
-| `kUCCLGinTailFinishDelta` | 8192 | uccl_gin_handle.cuh | Tail finish bit |
+| `kUCCLGinCompactChunkTokens` | 4 | hybrid_dispatch.cuh | Compact batch 目标 |
+| `kUCCLGinMaxInflightNormal` | 8 | common.hpp | D2H ring inflight cap |
+| `kUCCLGinTailFinishDelta` | 8192 | uccl_gin_handle.cuh | Tail finish bit (1<<13) |
+| `kUCCLGinTailCountMask` | 8191 | uccl_gin_handle.cuh | Tail count 掩码 |
 | `kAtomicOffMask` | 0x1FFF (8191) | uccl_gin_rail.cuh | Ordered atomic offset 上限 |
-| `kAtomicValueMax` | 16383 | uccl_gin_rail.cuh | Atomic delta 上限 (15-bit) |
+| `kAtomicValueMax` | 16383 | uccl_gin_rail.cuh | Atomic delta 上限 (15-bit signed) |
+| `kAtomicValueMin` | -16384 | uccl_gin_rail.cuh | Atomic delta 下限 |
 | `kWriteAddrShiftNormal` | 2 | ring_buffer.cuh | WRITE offset 4-byte 移位 |
 | `TransferCmd` 大小 | 16 bytes | ring_buffer.cuh | D2H 命令大小 |
-| `kMaxSendAtomicValue` | 16383 | common.hpp | Piggyback delta upper bound |
-| piggyback `atomic_val` | 1..255 | uccl_gin_rail.cuh | 单次 piggyback count delta 上限 |
+| `kMaxSendAtomicValue` | 16383 | common.hpp | 最大 atomic 值 |
+| `kAtomicBufferSize` | 81960 | common.hpp | Host atomic buffer 大小 |
 
 ---
 
-*文档更新于 2026-06-06,基于 compact32 + piggyback tail 代码状态。*
+*文档更新于 2026-06-08,基于当前 uccl-gin 分支代码状态。*
 *参考: UCCL-EP 论文 (arXiv:2512.19849v2), 参考 commit `495b7221`, NCCL 源码 (`nccl/src/gin/`).*

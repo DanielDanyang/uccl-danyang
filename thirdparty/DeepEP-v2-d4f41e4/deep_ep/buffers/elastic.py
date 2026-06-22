@@ -289,6 +289,26 @@ class ElasticBuffer:
             os.environ['EP_JIT_EXTRA_FLAGS'] = (
                 extra_flags + ' -DDEEPEP_UCCL_GIN_CHUNK_PROFILE'
             ).strip()
+            extra_flags = os.environ['EP_JIT_EXTRA_FLAGS']
+        combine_profile = os.environ.get('UCCL_GIN_COMBINE_PROFILE', '') not in ('', '0')
+        if combine_profile and '-DDEEPEP_UCCL_GIN_COMBINE_PROFILE' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (
+                extra_flags + ' -DDEEPEP_UCCL_GIN_COMBINE_PROFILE'
+            ).strip()
+            extra_flags = os.environ['EP_JIT_EXTRA_FLAGS']
+        combine_clock_profile = os.environ.get('UCCL_GIN_COMBINE_CLOCK_PROFILE', '') not in ('', '0')
+        if combine_clock_profile and '-DDEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (
+                extra_flags +
+                ' -DDEEPEP_UCCL_GIN_COMBINE_PROFILE'
+                ' -DDEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY'
+            ).strip()
+            extra_flags = os.environ['EP_JIT_EXTRA_FLAGS']
+        combine_reorder_profile = os.environ.get('UCCL_GIN_COMBINE_REORDER_PROFILE', '') not in ('', '0')
+        if combine_reorder_profile and '-DDEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE' not in extra_flags:
+            os.environ['EP_JIT_EXTRA_FLAGS'] = (
+                extra_flags + ' -DDEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE'
+            ).strip()
 
         resources = self.runtime.get_native_v2_resources()
         window_base = int(resources['workspace_ptr'])

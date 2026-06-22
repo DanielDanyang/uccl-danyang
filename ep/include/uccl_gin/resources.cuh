@@ -134,7 +134,7 @@ struct UCCLGinResources {
   uint32_t num_lanes = 1;
 };
 
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDACC__)
 __device__ __forceinline__ uint32_t queue_index_from_hint(
     const UCCLGinResources& resources, int hint) {
   if (resources.num_queues == 0 || resources.num_lanes == 0 ||

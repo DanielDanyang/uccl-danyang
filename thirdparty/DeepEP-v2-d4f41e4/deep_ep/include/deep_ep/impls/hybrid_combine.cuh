@@ -101,6 +101,12 @@ hybrid_combine_impl(nv_bfloat16* x,
         nccl_dev_comm, nccl_window, uccl_gin_resources, qp_idx, sharing_mode);
     EP_STATIC_ASSERT(kNumChannels * kNumScaleoutRanks * sizeof(int64_t) <= uccl_gin::kAtomicOffMask + 1,
                      "UCCL-GIN combine tail buffer must fit the ordered atomic offset field");
+    constexpr int kUCCLGinAtomicTailWords = kNumChannels * kNumScaleoutRanks;
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+    auto* combine_profile_counters =
+        reinterpret_cast<uint64_t*>(uccl_gin_resources.atomic_tail_base) +
+        kUCCLGinAtomicTailWords;
+#endif
     // Combine reuses the dispatch compact (channel, source-rank) tail buffer.
     // The previous receiver kernel waits until every incoming finish has been
     // applied, then clears its slots before returning. Therefore no old remote
@@ -108,6 +114,10 @@ hybrid_combine_impl(nv_bfloat16* x,
     // the transport. Keep the start reset as defensive initialization.
     for (int i = sm_idx * kNumThreads + thread_idx; i < kNumChannels * kNumScaleoutRanks; i += kNumSMs * kNumThreads)
         reinterpret_cast<int64_t*>(uccl_gin_resources.atomic_tail_base)[i] = 0;
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+    for (int i = sm_idx * kNumThreads + thread_idx; i < uccl_gin::kCombineProfileNumCounters; i += kNumSMs * kNumThreads)
+        combine_profile_counters[i] = 0;
+#endif
     __threadfence_system();
     cooperative_groups::this_grid().sync();
 #else
@@ -282,6 +292,9 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                     // Reduce into shared memory
                     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                    const auto reduce_profile_start = clock64();
+#endif
                     combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
                         lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                         /* Get source base */ [=](const int& slot_idx) {
@@ -293,6 +306,15 @@ hybrid_combine_impl(nv_bfloat16* x,
                             __syncwarp();
                         }
                     );
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                    if (ptx::elect_one_sync()) {
+                        uccl_gin::combine_profile_add(
+                            combine_profile_counters, uccl_gin::kCombineProfileReduceCycles,
+                            clock64() - reduce_profile_start);
+                        uccl_gin::combine_profile_add(
+                            combine_profile_counters, uccl_gin::kCombineProfileReduceEvents, 1);
+                    }
+#endif
                     ptx::tma_store_fence();
                     __syncwarp();
                 } else {
@@ -386,6 +408,88 @@ hybrid_combine_impl(nv_bfloat16* x,
         int last_is_token_last_in_chunk = 0;
         void* last_recv_token_buffer_ptr = nullptr;
         void* last_send_token_buffer_ptr = nullptr;
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE) && \
+    !defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+        uint64_t profile_last_local_ptr = 0;
+        uint64_t profile_last_remote_ptr = 0;
+        int profile_last_dst = -1;
+        uint32_t profile_run_length = 0;
+        const auto profile_flush_run = [&]() {
+            if (profile_run_length == 0)
+                return;
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileRuns, 1);
+            uccl_gin::combine_profile_add(
+                combine_profile_counters,
+                uccl_gin::combine_profile_run_bin(profile_run_length), 1);
+            profile_run_length = 0;
+        };
+        const auto profile_remote_put = [&](void* remote_ptr, void* local_ptr, const int& dst) {
+            const auto remote = reinterpret_cast<uint64_t>(remote_ptr);
+            const auto local = reinterpret_cast<uint64_t>(local_ptr);
+            const auto bytes = static_cast<uint64_t>(token_layout.get_num_bytes<false>());
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileRemotePuts, 1);
+            if (profile_last_dst < 0) {
+                profile_run_length = 1;
+            } else {
+                const bool same_dst = profile_last_dst == dst;
+                const bool local_contiguous = profile_last_local_ptr + bytes == local;
+                const bool remote_contiguous = profile_last_remote_ptr + bytes == remote;
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileTransitions, 1);
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileSameDstTransitions,
+                    same_dst);
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileLocalContiguousTransitions,
+                    local_contiguous);
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileRemoteContiguousTransitions,
+                    remote_contiguous);
+                const bool both_contiguous = same_dst and local_contiguous and remote_contiguous;
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileBothContiguousTransitions,
+                    both_contiguous);
+                if (both_contiguous) {
+                    ++profile_run_length;
+                } else {
+                    profile_flush_run();
+                    profile_run_length = 1;
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileBreakDst,
+                        not same_dst);
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileBreakLocalGap,
+                        not local_contiguous);
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileBreakRemoteGap,
+                        not remote_contiguous);
+                }
+            }
+            profile_last_dst = dst;
+            profile_last_local_ptr = local;
+            profile_last_remote_ptr = remote;
+        };
+#endif
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE)
+        uint32_t reorder_dump_count = 0;
+        const auto profile_reorder_put = [&](void* remote_ptr, void* local_ptr, const int& dst) {
+            if (channel_idx != 0 or reorder_dump_count >= 256)
+                return;
+            const auto remote = reinterpret_cast<uint64_t>(remote_ptr);
+            const auto local = reinterpret_cast<uint64_t>(local_ptr);
+            printf("UCCL_GIN_COMBINE_REORDER_CAND rank=%d expanded=%d multiple_reduction=%d "
+                   "channel=%d seq=%u dst=%d local_off=%llu remote_off=%llu bytes=%u\n",
+                   scaleout_rank_idx, static_cast<int>(kUseExpandedLayout),
+                   static_cast<int>(kAllowMultipleReduction), channel_idx,
+                   reorder_dump_count, dst,
+                   static_cast<unsigned long long>(local - uccl_gin_resources.window_base),
+                   static_cast<unsigned long long>(remote - uccl_gin_resources.window_base),
+                   static_cast<uint32_t>(token_layout.get_num_bytes<false>()));
+            ++reorder_dump_count;
+        };
+#endif
         const auto flush_last_tma_and_issue_rdma = [&]() {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
                 ptx::tma_store_wait();
@@ -393,6 +497,17 @@ hybrid_combine_impl(nv_bfloat16* x,
                 // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx) {
 #ifdef DEEPEP_USE_UCCL_GIN
+#if defined(DEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE)
+                    profile_reorder_put(last_recv_token_buffer_ptr, last_send_token_buffer_ptr,
+                                        last_src_scaleout_rank_idx);
+#endif
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE) && !defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+                    profile_remote_put(last_recv_token_buffer_ptr, last_send_token_buffer_ptr,
+                                       last_src_scaleout_rank_idx);
+#endif
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                    const auto d2h_profile_start = clock64();
+#endif
                     gin.put<ncclTeamTagRail>(
                         last_recv_token_buffer_ptr,
                         last_send_token_buffer_ptr,
@@ -402,6 +517,18 @@ hybrid_combine_impl(nv_bfloat16* x,
                         ncclGin_None(),
                         channel_idx
                     );
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                    const auto d2h_profile_cycles = clock64() - d2h_profile_start;
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileD2HCycles,
+                        d2h_profile_cycles);
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileD2HEvents, 1);
+                    uccl_gin::combine_profile_max(
+                        combine_profile_counters, uccl_gin::kCombineProfileD2HMaxPacked,
+                        d2h_profile_cycles,
+                        uccl_gin::dispatch_clock_detail(channel_idx, channel_idx % uccl_gin_resources.num_queues));
+#endif
 #else
                     gin.put<ncclTeamTagRail>(
                         last_recv_token_buffer_ptr,
@@ -443,6 +570,9 @@ hybrid_combine_impl(nv_bfloat16* x,
                 stored_is_scaleup_rank_needed[j] = (scaleup_mask >> (j * 32 + lane_idx)) & 1;
 
             // Wait all tails to arrive
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            const auto scaleup_wait_profile_start = clock64();
+#endif
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 bool arrived = true;
                 #pragma unroll
@@ -474,6 +604,15 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
                 return false;
             });
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            if (ptx::elect_one_sync()) {
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileScaleupWaitCycles,
+                    clock64() - scaleup_wait_profile_start);
+                uccl_gin::combine_profile_add(
+                    combine_profile_counters, uccl_gin::kCombineProfileScaleupWaitEvents, 1);
+            }
+#endif
 
             // Increase received count
             #pragma unroll
@@ -512,6 +651,17 @@ hybrid_combine_impl(nv_bfloat16* x,
                         topk_valid_mask ^= 1u << k;
                         if (src_scaleout_rank_idx != scaleout_rank_idx) {
 #ifdef DEEPEP_USE_UCCL_GIN
+#if defined(DEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE)
+                            profile_reorder_put(recv_buffer_ptr, send_buffer_ptr,
+                                                src_scaleout_rank_idx);
+#endif
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE) && !defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+                            profile_remote_put(recv_buffer_ptr, send_buffer_ptr,
+                                               src_scaleout_rank_idx);
+#endif
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                            const auto d2h_profile_start = clock64();
+#endif
                             gin.put<ncclTeamTagRail>(
                                 recv_buffer_ptr,
                                 send_buffer_ptr,
@@ -521,6 +671,18 @@ hybrid_combine_impl(nv_bfloat16* x,
                                 ncclGin_None(),
                                 channel_idx
                             );
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                            const auto d2h_profile_cycles = clock64() - d2h_profile_start;
+                            uccl_gin::combine_profile_add(
+                                combine_profile_counters, uccl_gin::kCombineProfileD2HCycles,
+                                d2h_profile_cycles);
+                            uccl_gin::combine_profile_add(
+                                combine_profile_counters, uccl_gin::kCombineProfileD2HEvents, 1);
+                            uccl_gin::combine_profile_max(
+                                combine_profile_counters, uccl_gin::kCombineProfileD2HMaxPacked,
+                                d2h_profile_cycles,
+                                uccl_gin::dispatch_clock_detail(channel_idx, channel_idx % uccl_gin_resources.num_queues));
+#endif
 #else
                             gin.put<ncclTeamTagRail>(
                                 recv_buffer_ptr,
@@ -561,6 +723,9 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 // Do reduce
                 constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, kAdjustRegisters ? 8 : 4>();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                const auto reduce_profile_start = clock64();
+#endif
                 combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
                     lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                     /* Get source base */ [=](const int& slot_idx) {
@@ -570,6 +735,15 @@ hybrid_combine_impl(nv_bfloat16* x,
                         flush_last_tma_and_issue_rdma();
                     }
                 );
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+                if (ptx::elect_one_sync()) {
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileReduceCycles,
+                        clock64() - reduce_profile_start);
+                    uccl_gin::combine_profile_add(
+                        combine_profile_counters, uccl_gin::kCombineProfileReduceEvents, 1);
+                }
+#endif
 
                 // Merge topk weights
                 // NOTES: the slot indices must follow the master lane
@@ -616,6 +790,14 @@ hybrid_combine_impl(nv_bfloat16* x,
         // Issue the last RDMA
         if constexpr (kAllowMultipleReduction)
             flush_last_tma_and_issue_rdma();
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE) && \
+    !defined(DEEPEP_UCCL_GIN_COMBINE_CLOCK_ONLY)
+        if (ptx::elect_one_sync())
+            profile_flush_run();
+#endif
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_REORDER_PROFILE)
+        (void)reorder_dump_count;
+#endif
 
         // Clean scaleup tails
         #pragma unroll
@@ -634,13 +816,26 @@ hybrid_combine_impl(nv_bfloat16* x,
         // finish ATOMIC posts on the same lane only after those WRITEs complete,
         // so no device-side flush is needed (proxy enforces payload-before-tail).
         if (lane_idx < kNumScaleoutRanks) {
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            const auto finish_d2h_profile_start = clock64();
+#endif
             gin.rail_tail_add(channel_idx, scaleout_rank_idx, lane_idx,
                               /*count_delta=*/0, /*finish=*/true, channel_idx);
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileFinishD2HCycles,
+                clock64() - finish_d2h_profile_start);
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileFinishD2HEvents, 1);
+#endif
         }
         __syncwarp();
 
         // Wait finish signal arrival from the corresponding source rank.
         if (lane_idx < kNumScaleoutRanks) {
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            const auto finish_wait_profile_start = clock64();
+#endif
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 int finish = 0, count = 0;
                 gin.decode_rail_tail(
@@ -660,6 +855,18 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
                 return false;
             });
+#if defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+            const auto finish_wait_profile_cycles = clock64() - finish_wait_profile_start;
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileFinishWaitCycles,
+                finish_wait_profile_cycles);
+            uccl_gin::combine_profile_add(
+                combine_profile_counters, uccl_gin::kCombineProfileFinishWaitEvents, 1);
+            uccl_gin::combine_profile_max(
+                combine_profile_counters, uccl_gin::kCombineProfileFinishWaitMaxPacked,
+                finish_wait_profile_cycles,
+                uccl_gin::dispatch_clock_detail(channel_idx, lane_idx));
+#endif
         }
         __syncwarp();
 #else
@@ -697,6 +904,56 @@ hybrid_combine_impl(nv_bfloat16* x,
         __syncwarp();
 #endif
     }
+
+#if defined(DEEPEP_USE_UCCL_GIN) && defined(DEEPEP_UCCL_GIN_COMBINE_PROFILE)
+    cooperative_groups::this_grid().sync();
+    if (sm_idx == 0 and thread_idx == 0) {
+        const auto* c = combine_profile_counters;
+        printf("UCCL_GIN_COMBINE_PROFILE rank=%d expanded=%d multiple_reduction=%d "
+               "scaleup_wait_cycles=%llu scaleup_wait_events=%llu "
+               "reduce_cycles=%llu reduce_events=%llu "
+               "d2h_cycles=%llu d2h_events=%llu "
+               "finish_d2h_cycles=%llu finish_d2h_events=%llu "
+               "finish_wait_cycles=%llu finish_wait_events=%llu "
+               "remote_puts=%llu transitions=%llu same_dst=%llu "
+               "local_contig=%llu remote_contig=%llu both_contig=%llu "
+               "runs=%llu run_1=%llu run_2=%llu run_3_4=%llu run_5_8=%llu "
+               "run_9_16=%llu run_17_32=%llu run_gt32=%llu "
+               "break_dst=%llu break_local_gap=%llu break_remote_gap=%llu "
+               "d2h_max_packed=%llu finish_wait_max_packed=%llu\n",
+               scaleout_rank_idx, static_cast<int>(kUseExpandedLayout),
+               static_cast<int>(kAllowMultipleReduction),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileScaleupWaitCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileScaleupWaitEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileReduceCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileReduceEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileD2HCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileD2HEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileFinishD2HCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileFinishD2HEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileFinishWaitCycles]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileFinishWaitEvents]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRemotePuts]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileTransitions]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileSameDstTransitions]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileLocalContiguousTransitions]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRemoteContiguousTransitions]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileBothContiguousTransitions]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRuns]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin1]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin2]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin3To4]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin5To8]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin9To16]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBin17To32]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileRunBinGt32]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileBreakDst]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileBreakLocalGap]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileBreakRemoteGap]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileD2HMaxPacked]),
+               static_cast<unsigned long long>(c[uccl_gin::kCombineProfileFinishWaitMaxPacked]));
+    }
+#endif
 
     // No barrier at epilogue
 }

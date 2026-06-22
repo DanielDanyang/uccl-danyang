@@ -27,8 +27,8 @@
 - Python: 系统 Python `3.12.3`
 - 网络:
   - VPC/管理网卡: `enp71s0`
-  - `p5en_0`: `172.31.78.36/20`
-  - `p5en_1`: `172.31.72.96/20`
+  - `p5en_0`: `172.31.70.225/20`
+  - `p5en_1`: `172.31.71.140/20`
   - 每台有 16 个 AWS EFA PCI 设备，另有 1 个 ENA 设备
   - `ibv_devinfo` 可见 EFA RDMA 设备，端口状态 `PORT_ACTIVE`，`link_layer: Unspecified`
 - AWS 通信栈:

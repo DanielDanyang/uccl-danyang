@@ -150,14 +150,17 @@ static double run_nccl_gin(ncclComm_t comm, struct ncclDevComm devComm,
   nccl_gin_paired_kernel<<<NCCL_CTAS, NCCL_TPB, 0, stream>>>(sendwin, recvwin, bytes, peer, warmup, devComm);
   CUDA_OK(cudaStreamSynchronize(stream));
   MPI_Barrier(MPI_COMM_WORLD);
-  cudaEvent_t a, b; CUDA_OK(cudaEventCreate(&a)); CUDA_OK(cudaEventCreate(&b));
-  CUDA_OK(cudaEventRecord(a, stream));
+  // Timed region: identical wall-clock + MPI-barrier methodology as the UCCL
+  // path (apples-to-apples). The kernel streams `iters` puts then waitSignal()s
+  // for `iters` inbound from the pair, so stream-sync == full-round completion
+  // on this rank (matches UCCL's wait-for-peer-red_add completion).
+  MPI_Barrier(MPI_COMM_WORLD);
+  auto t0 = std::chrono::steady_clock::now();
   nccl_gin_paired_kernel<<<NCCL_CTAS, NCCL_TPB, 0, stream>>>(sendwin, recvwin, bytes, peer, iters, devComm);
-  CUDA_OK(cudaEventRecord(b, stream));
   CUDA_OK(cudaStreamSynchronize(stream));
-  float ms = 0; CUDA_OK(cudaEventElapsedTime(&ms, a, b));
-  CUDA_OK(cudaEventDestroy(a)); CUDA_OK(cudaEventDestroy(b));
-  return (double)ms;
+  auto t1 = std::chrono::steady_clock::now();
+  MPI_Barrier(MPI_COMM_WORLD);
+  return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 // ===========================================================================
@@ -174,12 +177,19 @@ static double run_nccl_gin(ncclComm_t comm, struct ncclDevComm devComm,
 // same gin.put<Rail>(...) / gin.red_add_rel<Rail>(...) shape, UCCL backend.
 __global__ void uccl_gin_paired_kernel(uccl_gin::UCCLGinResources res, int peer,
                                        void* send_ptr, void* recv_ptr, uint32_t bytes,
-                                       int iters, void* counter_ptr) {
+                                       int iters, void* counter_ptr, int num_lanes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   uccl_gin::UCCLGin gin(res);  // the exact handle DeepEP kernels will use
+  // Fan payload puts across ALL D2H lanes (round-robin) so the stream drives
+  // every bound NIC, not just lane 0's single NIC.
   for (int it = 0; it < iters; ++it)
-    gin.put<ncclTeamTagRail>(recv_ptr, send_ptr, (int)bytes, peer);
-  gin.red_add_rel<ncclTeamTagRail>(counter_ptr, /*delta=*/1, peer);
+    gin.put<ncclTeamTagRail>(recv_ptr, send_ptr, (int)bytes, peer, /*lane_hint=*/it);
+  // One ordered red_add per lane into a distinct counter slot. The proxy holds
+  // each lane's atomic until that lane's payload WRITEs complete (payload-before-
+  // tail), so the peer observing all `num_lanes` slots == every lane landed.
+  for (int L = 0; L < num_lanes; ++L)
+    gin.red_add_rel<ncclTeamTagRail>((char*)counter_ptr + (size_t)L * 8,
+                                     /*delta=*/1, peer, /*lane_hint=*/L);
 }
 
 struct UcclCtx {
@@ -289,42 +299,118 @@ static double run_uccl_gin(UcclCtx& c, size_t bytes, int peer, int iters, int wa
   void* send_ptr = c.d_window;
   void* recv_ptr = (char*)c.d_window + max_bytes;
   void* counter_ptr = (void*)c.res.atomic_tail_base;
-  auto* local_counter = reinterpret_cast<std::atomic<int64_t>*>(counter_ptr);
-  auto wait_counter = [&](int64_t target) {
+  const int num_lanes = c.num_queues;          // one completion slot per lane
+  auto* slots = reinterpret_cast<std::atomic<int64_t>*>(counter_ptr);
+  auto reset_slots = [&]() {
+    for (int L = 0; L < num_lanes; ++L) slots[L].store(0, std::memory_order_release);
+  };
+  auto wait_all = [&]() {
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
-    int spins = 0;
-    while (local_counter->load(std::memory_order_acquire) < target) {
-      if ((++spins & 0xFFFF) == 0) std::this_thread::yield();
-      if (clock::now() - start > std::chrono::seconds(30)) {
-        fprintf(stderr,
-                "[UCCL-GIN] timeout waiting local counter >= %ld (now=%ld)\n",
-                (long)target,
-                (long)local_counter->load(std::memory_order_relaxed));
-        std::abort();
+    for (int L = 0; L < num_lanes; ++L) {
+      int spins = 0;
+      while (slots[L].load(std::memory_order_acquire) < 1) {
+        if ((++spins & 0xFFFF) == 0) std::this_thread::yield();
+        if (clock::now() - start > std::chrono::seconds(30)) {
+          fprintf(stderr, "[UCCL-GIN] timeout waiting slot %d/%d (now=%ld)\n",
+                  L, num_lanes, (long)slots[L].load(std::memory_order_relaxed));
+          std::abort();
+        }
       }
     }
   };
 
   // warmup
-  local_counter->store(0, std::memory_order_release);
+  reset_slots();
   MPI_Barrier(MPI_COMM_WORLD);
   uccl_gin_paired_kernel<<<1, 32, 0, stream>>>(c.res, peer, send_ptr, recv_ptr,
-                                               (uint32_t)bytes, warmup, counter_ptr);
+                                               (uint32_t)bytes, warmup, counter_ptr, num_lanes);
   CUDA_OK(cudaStreamSynchronize(stream));
-  wait_counter(1);
+  wait_all();
   MPI_Barrier(MPI_COMM_WORLD);
 
-  local_counter->store(0, std::memory_order_release);
+  reset_slots();
   MPI_Barrier(MPI_COMM_WORLD);
   auto t0 = std::chrono::steady_clock::now();
   uccl_gin_paired_kernel<<<1, 32, 0, stream>>>(c.res, peer, send_ptr, recv_ptr,
-                                               (uint32_t)bytes, iters, counter_ptr);
+                                               (uint32_t)bytes, iters, counter_ptr, num_lanes);
   CUDA_OK(cudaStreamSynchronize(stream));
-  wait_counter(1);
+  wait_all();
   auto t1 = std::chrono::steady_clock::now();
   MPI_Barrier(MPI_COMM_WORLD);
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// ===========================================================================
+// Correctness + ordering (payload-before-tail) verification
+// ===========================================================================
+// Each rank fills its send region with a rank-tagged pattern word[i]=rank*P+i,
+// poisons its recv region, transfers, waits for the completion signal, then
+// checks recv == the PEER's pattern. Because recv is read only AFTER the
+// completion signal is observed, a payload-before-tail violation (tail seen
+// before data landed) would leave poison -> FAIL. So this validates both data
+// integrity and the ordering guarantee.
+__global__ void fill_pattern_kernel(int* p, size_t n, int rank) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = rank * 1000003 + (int)i;
+}
+
+static bool verify_recv(int* d_recv, size_t bytes, int peer) {
+  size_t n = bytes / sizeof(int);
+  std::vector<int> h(n);
+  CUDA_OK(cudaMemcpy(h.data(), d_recv, n * sizeof(int), cudaMemcpyDeviceToHost));
+  for (size_t i = 0; i < n; ++i)
+    if (h[i] != peer * 1000003 + (int)i) return false;
+  return true;
+}
+
+static bool verify_nccl(ncclComm_t comm, struct ncclDevComm devComm,
+                        ncclWindow_t sendwin, ncclWindow_t recvwin,
+                        void* d_send, void* d_recv, size_t bytes, int peer,
+                        int rank, cudaStream_t stream) {
+  (void)comm;
+  size_t n = bytes / sizeof(int);
+  fill_pattern_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>((int*)d_send, n, rank);
+  CUDA_OK(cudaMemset(d_recv, 0xFF, bytes));
+  CUDA_OK(cudaStreamSynchronize(stream));
+  MPI_Barrier(MPI_COMM_WORLD);
+  const int iters = 4;
+  nccl_gin_paired_kernel<<<NCCL_CTAS, NCCL_TPB, 0, stream>>>(sendwin, recvwin, bytes, peer, iters, devComm);
+  CUDA_OK(cudaStreamSynchronize(stream));  // kernel waitSignal => peer's iters landed
+  bool ok = verify_recv((int*)d_recv, bytes, peer);
+  MPI_Barrier(MPI_COMM_WORLD);
+  return ok;
+}
+
+static bool verify_uccl(UcclCtx& c, size_t bytes, int peer, int rank,
+                        cudaStream_t stream, size_t max_bytes) {
+  int* send = (int*)c.d_window;
+  int* recv = (int*)((char*)c.d_window + max_bytes);
+  size_t n = bytes / sizeof(int);
+  fill_pattern_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(send, n, rank);
+  CUDA_OK(cudaMemset(recv, 0xFF, bytes));
+  CUDA_OK(cudaStreamSynchronize(stream));
+  const int num_lanes = c.num_queues;
+  void* counter_ptr = (void*)c.res.atomic_tail_base;
+  auto* slots = reinterpret_cast<std::atomic<int64_t>*>(counter_ptr);
+  for (int L = 0; L < num_lanes; ++L) slots[L].store(0, std::memory_order_release);
+  MPI_Barrier(MPI_COMM_WORLD);
+  const int iters = num_lanes > 4 ? num_lanes : 4;  // exercise every lane
+  uccl_gin_paired_kernel<<<1, 32, 0, stream>>>(c.res, peer, send, recv,
+                                               (uint32_t)bytes, iters, counter_ptr, num_lanes);
+  CUDA_OK(cudaStreamSynchronize(stream));
+  using clock = std::chrono::steady_clock;
+  auto t0 = clock::now();
+  for (int L = 0; L < num_lanes; ++L)
+    while (slots[L].load(std::memory_order_acquire) < 1) {
+      if (clock::now() - t0 > std::chrono::seconds(30)) {
+        fprintf(stderr, "[verify] UCCL slot %d/%d timeout\n", L, num_lanes);
+        return false;
+      }
+    }
+  bool ok = verify_recv(recv, bytes, peer);  // checked AFTER completion => ordering
+  MPI_Barrier(MPI_COMM_WORLD);
+  return ok;
 }
 
 // ===========================================================================
@@ -374,6 +460,33 @@ int main(int argc, char** argv) {
   // -------- UCCL-GIN setup (once) --------
   UcclCtx uctx;
   if (args.run_uccl) uctx = uccl_setup(rank, world, local_world, max_bytes, args.ifname);
+
+  // -------- correctness + ordering pass (must pass before any BW number) -----
+  {
+    bool all_ok = true;
+    if (rank == 0) printf("=== correctness (data + payload-before-tail) ===\n%-12s %-8s %-8s\n",
+                          "bytes", "NCCL", "UCCL");
+    for (size_t bytes : args.sizes) {
+      int n_ok = 1, u_ok = 1;
+      if (args.run_nccl) n_ok = verify_nccl(comm, devComm, sendwin, recvwin, d_send, d_recv,
+                                            bytes, peer, rank, stream) ? 1 : 0;
+      if (args.run_uccl) u_ok = verify_uccl(uctx, bytes, peer, rank, stream, max_bytes) ? 1 : 0;
+      int gn = 1, gu = 1;
+      MPI_Allreduce(&n_ok, &gn, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&u_ok, &gu, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+      if (rank == 0) printf("%-12zu %-8s %-8s\n", bytes,
+                            args.run_nccl ? (gn ? "PASS" : "FAIL") : "-",
+                            args.run_uccl ? (gu ? "PASS" : "FAIL") : "-");
+      all_ok = all_ok && gn && gu;
+    }
+    if (!all_ok) {
+      if (rank == 0) printf("CORRECTNESS FAILED -- not reporting BW\n");
+      if (args.run_uccl) uccl_teardown(uctx);
+      MPI_Finalize();
+      return 2;
+    }
+    if (rank == 0) printf("all correctness PASS\n\n");
+  }
 
   // -------- sweep --------
   for (size_t bytes : args.sizes) {
